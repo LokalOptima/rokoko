@@ -1,0 +1,7 @@
+rokoko
+rokoko.bundle
+*.wav
+g2p_v8/
+voices/
+weights/
+
