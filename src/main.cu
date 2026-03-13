@@ -10,11 +10,16 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -376,6 +381,7 @@ int main(int argc, char** argv) {
             "  --voice <name>      Voice pack (default: af_heart)\n"
             "  -o <file>           Output WAV (default: output.wav, - for stdout)\n"
             "  --stdout            Write WAV to stdout\n"
+            "  --serve [port]      Start HTTP server (default port: 8080)\n"
             "  --host <addr>       Server bind address (default: 0.0.0.0)\n"
             "  --help              Show this help\n",
             argv[0], argv[0]);
@@ -422,22 +428,39 @@ int main(int argc, char** argv) {
     {
         struct stat st;
         if (stat(bundle_path.c_str(), &st) != 0) {
-            // Create parent directories
+            // Create parent directory
             std::string dir = bundle_path.substr(0, bundle_path.rfind('/'));
-            std::string mkdir_cmd = "mkdir -p " + dir;
-            if (system(mkdir_cmd.c_str()) != 0) {
-                fprintf(stderr, "Error: failed to create directory %s\n", dir.c_str());
-                return 1;
+            for (size_t p = 1; p < dir.size(); p++) {
+                if (dir[p] == '/') {
+                    dir[p] = '\0';
+                    mkdir(dir.c_str(), 0755);
+                    dir[p] = '/';
+                }
             }
+            mkdir(dir.c_str(), 0755);
 
             fprintf(stderr, "Bundle not found at %s — downloading...\n", bundle_path.c_str());
-            std::string curl_cmd =
-                "curl -L --progress-bar -o " + bundle_path +
-                " https://github.com/lfrati/rokoko/releases/download/v1.0.0/rokoko.bundle";
-            int ret = system(curl_cmd.c_str());
-            if (ret != 0) {
-                fprintf(stderr, "Error: download failed (exit code %d)\n", ret);
-                unlink(bundle_path.c_str()); // remove partial file
+
+            static const char* url =
+                "https://github.com/lfrati/rokoko/releases/download/v1.0.0/rokoko.bundle";
+
+            // Download to temp file, then rename atomically
+            std::string tmp_path = bundle_path + ".tmp";
+            pid_t pid = fork();
+            if (pid == 0) {
+                execlp("curl", "curl", "-L", "--progress-bar", "-o", tmp_path.c_str(), url, nullptr);
+                _exit(127);
+            }
+            int status;
+            waitpid(pid, &status, 0);
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                fprintf(stderr, "Error: download failed\n");
+                unlink(tmp_path.c_str());
+                return 1;
+            }
+            if (rename(tmp_path.c_str(), bundle_path.c_str()) != 0) {
+                fprintf(stderr, "Error: failed to move downloaded bundle\n");
+                unlink(tmp_path.c_str());
                 return 1;
             }
             fprintf(stderr, "Download complete.\n");
