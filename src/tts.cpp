@@ -821,21 +821,21 @@ size_t compute_decode_bytes(int T, int L) {
         off = a(off, (size_t)1024 * L * sizeof(float));
     off = a(off, (size_t)512 * L2 * sizeof(float));
 
-    // Generator: SineGen intermediates (not save/restored)
+    // Generator: d_gen_har persists, SineGen temps are save/restored and overlap
+    // with the generator pool that follows.
     off = a(off, (size_t)22 * har_frames * sizeof(float)); // d_gen_har
-    off = a(off, (size_t)L2 * 9 * sizeof(float));          // d_phase_low
-    off = a(off, (size_t)T_audio * sizeof(float));          // d_har_source
-    off = a(off, (size_t)9 * sizeof(float));                // d_rand_ini
+    size_t sinegen_off = off;
+    // SineGen temporaries (reclaimed via save/restore)
+    size_t sg = off;
+    sg = a(sg, (size_t)L2 * 9 * sizeof(float));            // d_phase_low
+    sg = a(sg, (size_t)T_audio * sizeof(float));            // d_har_source
+    sg = a(sg, (size_t)9 * sizeof(float));                  // d_rand_ini
 
-    // Generator working buffers (5 × 512 × har_frames — dominates total)
-    for (int i = 0; i < 5; i++)
-        off = a(off, (size_t)512 * har_frames * sizeof(float));
+    // Generator working pool: 5 slots of 128*har_frames (buffers reused via liveness)
+    // Overlaps with SineGen temps — take the max.
+    size_t gen_pool_end = a(sinegen_off, (size_t)5 * 128 * har_frames * sizeof(float));
+    off = (sg > gen_pool_end) ? sg : gen_pool_end;
     off = a(off, (size_t)512 * sizeof(float));              // d_gen_fc
-
-    // ResBlock averages: ups[0] → 256 × 10*L2, ups[1] → 128 × har_frames
-    int T_ups_0 = 10 * L2;  // (L2-1)*10 - 2*5 + 20 = 10*L2
-    off = a(off, (size_t)256 * T_ups_0 * sizeof(float));
-    off = a(off, (size_t)128 * har_frames * sizeof(float)); // = 128*(60*L2+1)
 
     // Final audio buffer
     off = a(off, (size_t)T_audio * sizeof(float));          // d_audio
@@ -1127,6 +1127,9 @@ std::vector<float> rokoko_infer(const Weights& w,
     float* d_gen_har = decode_arena.alloc<float>(22 * har_frames);
     {
         // GPU SineGen: F0 → harmonic source (no CPU sync, no memcpy)
+        // Temporaries (d_phase_low, d_har_source, d_rand_ini) are reclaimed
+        // after STFT completes — safe because all ops are on the same stream.
+        size_t sinegen_save = decode_arena.save();
         float* d_phase_low = decode_arena.alloc<float>(L2 * 9);
         float* d_har_source = decode_arena.alloc<float>(T_audio);
 
@@ -1151,19 +1154,24 @@ std::vector<float> rokoko_infer(const Weights& w,
         float* d_har_phase = d_gen_har + 11 * har_frames;
         stft_f32(d_har_source, d_har_spec, d_har_phase,
                  T_audio, n_fft_gen, hop_gen, stream);
+        decode_arena.restore(sinegen_save);
     }
 
-    // Generator working buffers
-    int max_gen_T = har_frames;
-    int max_gen_C = 512;
-    float* d_gen_x   = decode_arena.alloc<float>(max_gen_C * max_gen_T);
-    float* d_gen_xt  = decode_arena.alloc<float>(max_gen_C * max_gen_T);
-    float* d_gen_co  = decode_arena.alloc<float>(max_gen_C * max_gen_T);
-    float* d_gen_fc  = decode_arena.alloc<float>(512);
-    float* d_gen_src = decode_arena.alloc<float>(max_gen_C * max_gen_T);
-    float* d_gen_tmp = decode_arena.alloc<float>(max_gen_C * max_gen_T);
+    // Generator working pool: 5 slots of 128*har_frames each (4x smaller than
+    // the old 5 × 512*har_frames).  Buffers are reassigned per iteration based
+    // on liveness — dead buffers are reused by later steps.
+    size_t gen_slot = (size_t)128 * har_frames;
+    float* gen_pool = decode_arena.alloc<float>(5 * gen_slot);
+    float* d_gen_fc = decode_arena.alloc<float>(512);
 
-    // Copy generator input
+    float* slot0 = gen_pool;
+    float* slot1 = gen_pool + gen_slot;
+    float* slot2 = gen_pool + 2 * gen_slot;
+    float* slot3 = gen_pool + 3 * gen_slot;
+    float* slot4 = gen_pool + 4 * gen_slot;
+
+    // Copy generator input into slot0
+    float* d_gen_x = slot0;
     int T_gen = L2;
     cudaMemcpyAsync(d_gen_x, d_dec_x, 512 * T_gen * sizeof(float),
                     cudaMemcpyDeviceToDevice, stream);
@@ -1180,9 +1188,11 @@ std::vector<float> rokoko_infer(const Weights& w,
         int uk = upsample_kernels[i];
         int up = (uk - us) / 2;
 
+        // d_gen_x = slot0, size C_in * T_loop
         leaky_relu_f32(d_gen_x, d_gen_x, C_in * T_loop, 0.1f, stream);
 
-        // noise_convs[i] on har
+        // noise_convs[i]: gen_har → slot1 (gen_src)
+        float* d_gen_src = slot1;
         if (i == 0) {
             gemm_conv1d(cublas, d_gen_har, w.gen_noise_convs[i].w,
                          w.gen_noise_convs[i].b, d_gen_src,
@@ -1195,20 +1205,23 @@ std::vector<float> rokoko_infer(const Weights& w,
                          22, C_out, har_frames, 1, 1, 0, 1, stream);
         }
 
-        // noise_res[i]
+        // noise_res[i]: uses slot2 (xt), slot3 (co) as temporaries
+        float* d_gen_xt = slot2;
+        float* d_gen_co = slot3;
         int src_T = (i == 0) ? ((har_frames + 2*3 - 12) / 6 + 1) : har_frames;
         adain_resblock1_forward(d_gen_src, d_style_acoustic, w.gen_noise_res[i],
                                 d_gen_xt, d_gen_co, d_gen_fc,
                                 src_T, 128, cublas, stream,
                                 d_dec_workspace, dec_ws_bytes);
 
-        // ups[i]: ConvTranspose1d — wv has precomputed weight
+        // ups[i]: gen_x (slot0) → slot4 (gen_tmp)
+        float* d_gen_tmp = slot4;
         int T_ups = (T_loop - 1) * us - 2 * up + uk;
         gemm_conv_transpose1d(cublas, d_gen_x, w.gen_ups[i].wv, w.gen_ups[i].b,
                                d_gen_tmp, d_dec_workspace, dec_ws_bytes,
                                C_in, C_out, T_loop, uk, us, up, 0, stream);
 
-        // Reflection pad on last upsample
+        // Copy/pad tmp → gen_x.  gen_x transitions to C_out * T_ups.
         if (i == 1) {
             reflection_pad_1d_f32(d_gen_tmp, d_gen_x, C_out, T_ups, 1, 0, stream);
             T_ups += 1;
@@ -1217,11 +1230,11 @@ std::vector<float> rokoko_infer(const Weights& w,
                             cudaMemcpyDeviceToDevice, stream);
         }
 
-        // Merge: x = x + x_source
+        // Merge: x += src.  gen_src (slot1) is dead after this.
         add_f32(d_gen_x, d_gen_src, d_gen_x, C_out * T_ups, stream);
 
-        // ResBlocks: 3 blocks, average outputs
-        float* d_rb_avg = decode_arena.alloc<float>(C_out * T_ups);
+        // ResBlocks: reuse slot1 as rb_avg (gen_src is dead)
+        float* d_rb_avg = slot1;
         CUDA_CHECK(cudaMemsetAsync(d_rb_avg, 0, C_out * T_ups * sizeof(float), stream));
 
         for (int j = 0; j < 3; j++) {
@@ -1240,7 +1253,7 @@ std::vector<float> rokoko_infer(const Weights& w,
     }
 
     // Post: LeakyReLU(0.01) + conv_post(128→22, k=7)
-    // Post: LeakyReLU(0.01) + conv_post(128→22, k=7) — wv has precomputed weight
+    float* d_gen_tmp = slot4;
     leaky_relu_f32(d_gen_x, d_gen_x, 128 * T_loop, 0.01f, stream);
     gemm_conv1d(cublas, d_gen_x, w.gen_conv_post_wv, w.gen_conv_post_b, d_gen_tmp,
                  d_dec_workspace, dec_ws_bytes, 128, 22, T_loop, 7, 1, 3, 1, stream);

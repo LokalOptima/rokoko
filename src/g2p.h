@@ -119,15 +119,19 @@ __global__ void g2p_softmax_kernel(float* __restrict__ scores, int row_len, int 
         row[i] *= inv_sum;
 }
 
-// SwiGLU activation: out[i] = silu(gate[i]) * up[i]
-__global__ void g2p_swiglu_kernel(const float* __restrict__ gate,
-                                    const float* __restrict__ up,
-                                    float* __restrict__ out,
-                                    int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float g = gate[i];
-    out[i] = (g / (1.0f + expf(-g))) * up[i];
+// SwiGLU with fused bias on interleaved [2*ff, T] column-major layout.
+// Applies bias to both gate and up halves, then SwiGLU, storing result in gate half.
+__global__ void g2p_swiglu_bias_kernel(float* __restrict__ data,
+                                        const float* __restrict__ bias,
+                                        int ff, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= T * ff) return;
+    int t = idx / ff;
+    int i = idx % ff;
+    int base = t * 2 * ff;
+    float g = data[base + i] + bias[i];
+    float u = data[base + ff + i] + bias[ff + i];
+    data[base + i] = (g / (1.0f + expf(-g))) * u;
 }
 
 // Add bias to column-major matrix: data[M, N] += bias[M] (broadcast over columns)
@@ -141,6 +145,163 @@ __global__ void g2p_bias_kernel(float* __restrict__ data,
         col_data[i] += bias[i];
 }
 
+// Fused QKV bias + RoPE for Q and K.
+// QKV is column-major [3*d, T]. Adds bias[3*d] to each column, then applies
+// rotary position embeddings to the Q (rows 0..d-1) and K (rows d..2d-1) portions.
+__global__ void g2p_qkv_bias_rope_kernel(float* __restrict__ QKV,
+                                           const float* __restrict__ bias,
+                                           const float* __restrict__ cos_table,
+                                           const float* __restrict__ sin_table,
+                                           int T, int d3, int d, int heads, int head_dim) {
+    int t = blockIdx.x;
+    if (t >= T) return;
+    float* col = QKV + t * d3;
+
+    // Add bias to all 3*d elements
+    for (int i = threadIdx.x; i < d3; i += blockDim.x)
+        col[i] += bias[i];
+    __syncthreads();
+
+    // Apply RoPE to Q and K
+    int d2 = head_dim / 2;
+    const float* rc = cos_table + t * d2;
+    const float* rs = sin_table + t * d2;
+    for (int idx = threadIdx.x; idx < heads * d2; idx += blockDim.x) {
+        int h = idx / d2;
+        int i = idx % d2;
+        // Q
+        float* q = col + h * head_dim;
+        float qr = q[i], qi = q[d2 + i];
+        q[i]      = qr * rc[i] - qi * rs[i];
+        q[d2 + i] = qi * rc[i] + qr * rs[i];
+        // K
+        float* k = col + d + h * head_dim;
+        float kr = k[i], ki = k[d2 + i];
+        k[i]      = kr * rc[i] - ki * rs[i];
+        k[d2 + i] = ki * rc[i] + kr * rs[i];
+    }
+}
+
+// Fused bias-add + RMSNorm: adds bias to x in-place, then computes RMSNorm.
+// Used to fuse output projection bias with the FFN layer norm.
+__global__ void g2p_bias_rms_norm_kernel(float* __restrict__ x,
+                                           const float* __restrict__ bias,
+                                           const float* __restrict__ weight,
+                                           float* __restrict__ out,
+                                           int T, int d, float eps) {
+    int t = blockIdx.x;
+    if (t >= T) return;
+    float* xt = x + t * d;
+    float* ot = out + t * d;
+
+    extern __shared__ float sdata[];
+
+    // Add bias in-place, accumulate sum of squares
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float v = xt[i] + bias[i];
+        xt[i] = v;
+        local_sum += v * v;
+    }
+    sdata[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+
+    float inv = rsqrtf(sdata[0] / d + eps);
+    for (int i = threadIdx.x; i < d; i += blockDim.x)
+        ot[i] = weight[i] * xt[i] * inv;
+}
+
+// Fused FFN block: out_bias + RMSNorm + gate_up_GEMV + bias_SwiGLU + down_GEMV + bias + residual.
+// One thread block per column of T. Replaces 5 separate kernel launches per layer.
+// Shared memory: (d + 2*ff) * sizeof(float) bytes.
+__global__ void g2p_fused_ffn_kernel(
+    float* __restrict__ X,
+    const float* __restrict__ out_b,
+    const float* __restrict__ n2_w,
+    const float* __restrict__ gate_up_w,
+    const float* __restrict__ gate_up_b,
+    const float* __restrict__ down_w,
+    const float* __restrict__ down_b,
+    int T, int d, int ff, float eps)
+{
+    int t = blockIdx.x;
+    if (t >= T) return;
+
+    extern __shared__ float smem[];
+    float* s_x   = smem;          // [d] — biased X, then normed
+    float* s_ffn = smem + d;      // [2*ff] — GEMV output, then SwiGLU result
+
+    float* x_col = X + t * d;
+
+    // ── Bias add: X[:, t] += out_b[:] ──
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float v = x_col[i] + out_b[i];
+        s_x[i] = v;
+        x_col[i] = v;  // write back for residual in final phase
+    }
+    __syncthreads();
+
+    // ── RMSNorm: s_x → normed (in-place) ──
+    float local_sum = 0;
+    for (int i = threadIdx.x; i < d; i += blockDim.x)
+        local_sum += s_x[i] * s_x[i];
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    if (lane == 0) s_ffn[warp_id] = local_sum;  // reuse s_ffn as scratch
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float v = (lane < blockDim.x / 32) ? s_ffn[lane] : 0;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            v += __shfl_down_sync(0xffffffff, v, offset);
+        if (lane == 0) s_ffn[0] = v;
+    }
+    __syncthreads();
+
+    float inv = rsqrtf(s_ffn[0] / d + eps);
+    for (int i = threadIdx.x; i < d; i += blockDim.x)
+        s_x[i] = n2_w[i] * s_x[i] * inv;
+    __syncthreads();
+
+    // ── Gate+Up GEMV: s_ffn[j] = dot(gate_up_w[:, j], s_x[:]) ──
+    // gate_up_w is transposed to [d, 2*ff] row-major: row k at offset k*2*ff
+    // Adjacent threads (adjacent j) read adjacent memory addresses → coalesced
+    for (int j = threadIdx.x; j < 2 * ff; j += blockDim.x) {
+        float sum = 0;
+        for (int k = 0; k < d; k++)
+            sum += gate_up_w[k * 2 * ff + j] * s_x[k];
+        s_ffn[j] = sum;
+    }
+    __syncthreads();
+
+    // ── Bias + SwiGLU: in-place on s_ffn ──
+    for (int i = threadIdx.x; i < ff; i += blockDim.x) {
+        float g = s_ffn[i] + gate_up_b[i];
+        float u = s_ffn[ff + i] + gate_up_b[ff + i];
+        s_ffn[i] = (g / (1.0f + expf(-g))) * u;
+    }
+    __syncthreads();
+
+    // ── Down GEMV + bias + residual: X[:, t] += down_w^T × s_ffn[0:ff] + down_b ──
+    // down_w is transposed to [ff, d] row-major: row k at offset k*d
+    // Adjacent threads (adjacent j) read adjacent memory addresses → coalesced
+    for (int j = threadIdx.x; j < d; j += blockDim.x) {
+        float sum = 0;
+        for (int k = 0; k < ff; k++)
+            sum += down_w[k * d + j] * s_ffn[k];
+        x_col[j] += sum + down_b[j];
+    }
+}
+
 // Embedding lookup: out[t, :] = emb[ids[t], :]
 __global__ void g2p_embed_kernel(const int* __restrict__ ids, const float* __restrict__ emb,
                                    float* __restrict__ out, int T, int d) {
@@ -152,31 +313,35 @@ __global__ void g2p_embed_kernel(const int* __restrict__ ids, const float* __res
         dst[i] = src[i];
 }
 
-// Reshape upsample: column-major proj[d*up, T] → column-major X_up[d, T*up]
-__global__ void g2p_upsample_reshape_kernel(const float* __restrict__ proj,
-                                              float* __restrict__ X_up,
-                                              int T, int d, int up) {
+// Fused bias + reshape upsample: adds bias to proj[d*up, T], then reshapes to X_up[d, T*up]
+__global__ void g2p_upsample_bias_reshape_kernel(const float* __restrict__ proj,
+                                                    const float* __restrict__ bias,
+                                                    float* __restrict__ X_up,
+                                                    int T, int d, int up) {
     int idx = blockIdx.x;
     if (idx >= T * up) return;
     int t = idx / up;
     int u = idx % up;
     const float* src = proj + t * (d * up) + u * d;
     float* dst = X_up + idx * d;
+    const float* b = bias + u * d;
     for (int i = threadIdx.x; i < d; i += blockDim.x)
-        dst[i] = src[i];
+        dst[i] = src[i] + b[i];
 }
 
-// CTC argmax per timestep: out[t] = argmax(logits[t, :])
-__global__ void g2p_ctc_argmax_kernel(const float* __restrict__ logits,
-                                        int* __restrict__ out,
-                                        int T, int n_phones) {
+// Fused bias + CTC argmax per timestep: out[t] = argmax(logits[t, :] + bias[:])
+__global__ void g2p_bias_ctc_argmax_kernel(const float* __restrict__ logits,
+                                             const float* __restrict__ bias,
+                                             int* __restrict__ out,
+                                             int T, int n_phones) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= T) return;
     const float* row = logits + t * n_phones;
     int best = 0;
-    float best_v = row[0];
+    float best_v = row[0] + bias[0];
     for (int c = 1; c < n_phones; c++) {
-        if (row[c] > best_v) { best_v = row[c]; best = c; }
+        float v = row[c] + bias[c];
+        if (v > best_v) { best_v = v; best = c; }
     }
     out[t] = best;
 }
@@ -221,8 +386,8 @@ private:
         float* qkv_w, *qkv_b;     // [3d, d], [3d]
         float* out_w, *out_b;      // [d, d], [d]
         float* n2_w;               // [d]
-        float* gate_w, *gate_b;    // [ff, d], [ff]
-        float* up_w, *up_b;        // [ff, d], [ff]
+        float* gate_up_w;          // [2*ff, d] (gate and up concatenated)
+        float* gate_up_b;          // [2*ff]
         float* down_w, *down_b;    // [d, ff], [d]
     };
     std::vector<Layer> layers_;
@@ -235,6 +400,17 @@ private:
     // Cached workspace (avoids cudaMalloc per call)
     mutable float* workspace_ = nullptr;
     mutable size_t workspace_bytes_ = 0;
+
+    // CUDA graph cache: keyed by input length T for zero-overhead replay.
+    // Eliminates ~150 kernel dispatch overheads per inference call.
+    mutable std::unordered_map<int, cudaGraphExec_t> graph_cache_;
+
+    // cuBLAS workspace for CUDA graph capture (cuBLAS can't malloc during capture)
+    float* cublas_ws_ = nullptr;
+    static constexpr size_t CUBLAS_WS_BYTES = 4 * 1024 * 1024;
+
+    // Persistent scalars for cuBLAS (pointers captured in graphs must outlive capture)
+    float one_ = 1.0f, zero_ = 0.0f, attn_scale_ = 0.0f;
 
     bool load_from_file_(FILE* f, const char* label, cudaStream_t stream);
 };
@@ -401,21 +577,44 @@ inline bool G2PModelCuda::load_from_file_(FILE* f, const char* label, cudaStream
     rope_cos_ = upload(rope_cos_cpu, max_pos_ * d2);
     rope_sin_ = upload(rope_sin_cpu, max_pos_ * d2);
 
+    // Transpose gate_w[ff,d] + up_w[ff,d] → gate_up_wt[d, 2*ff] row-major
+    // and down_w[d,ff] col-major → down_wt[ff, d] row-major
+    // so that adjacent threads read adjacent memory in the fused FFN kernel.
+    std::vector<float> gate_up_transposed(2 * ff_ * d_);
+    std::vector<float> down_transposed(d_ * ff_);
+
     layers_.resize(n_layers_);
     for (int i = 0; i < n_layers_; i++) {
         auto& L = layers_[i];
         auto& C = layers_cpu[i];
-        L.n1_w   = upload(C.n1_w,   d_);
-        L.qkv_w  = upload(C.qkv_w,  3 * d_ * d_);
-        L.qkv_b  = upload(C.qkv_b,  3 * d_);
-        L.out_w  = upload(C.out_w,   d_ * d_);
-        L.out_b  = upload(C.out_b,   d_);
-        L.n2_w   = upload(C.n2_w,    d_);
-        L.gate_w = upload(C.gate_w,  ff_ * d_);
-        L.gate_b = upload(C.gate_b,  ff_);
-        L.up_w   = upload(C.up_w,    ff_ * d_);
-        L.up_b   = upload(C.up_b,    ff_);
-        L.down_w = upload(C.down_w,  d_ * ff_);
+        L.n1_w      = upload(C.n1_w,   d_);
+        L.qkv_w     = upload(C.qkv_w,  3 * d_ * d_);
+        L.qkv_b     = upload(C.qkv_b,  3 * d_);
+        L.out_w     = upload(C.out_w,   d_ * d_);
+        L.out_b     = upload(C.out_b,   d_);
+        L.n2_w      = upload(C.n2_w,    d_);
+        // Transpose gate_w[ff,d] and up_w[ff,d] into gate_up_wt[d, 2*ff] row-major.
+        // Original col-major: gate_w[j*d + k] = weight at row k, col j.
+        // Transposed row-major: gate_up_wt[k*2*ff + j] = same weight.
+        for (int k = 0; k < d_; k++) {
+            for (int j = 0; j < ff_; j++) {
+                gate_up_transposed[k * 2 * ff_ + j]      = C.gate_w[j * d_ + k];
+                gate_up_transposed[k * 2 * ff_ + ff_ + j] = C.up_w[j * d_ + k];
+            }
+        }
+        L.gate_up_w = upload(gate_up_transposed.data(), 2 * ff_ * d_);
+        // Upload gate_b then up_b contiguously → gate_up_b[2*ff]
+        L.gate_up_b = upload(C.gate_b,  ff_);
+                      upload(C.up_b,    ff_);
+        // Transpose down_w[d,ff] col-major → down_wt[ff, d] row-major.
+        // Original col-major: down_w[j*ff + k] = weight at row k, col j.
+        // Transposed row-major: down_wt[k*d + j] = same weight.
+        for (int k = 0; k < ff_; k++) {
+            for (int j = 0; j < d_; j++) {
+                down_transposed[k * d_ + j] = C.down_w[j * ff_ + k];
+            }
+        }
+        L.down_w    = upload(down_transposed.data(),  d_ * ff_);
         L.down_b = upload(C.down_b,  d_);
     }
     up_w_   = upload(up_w_cpu,   d_ * up_ * d_);
@@ -426,17 +625,50 @@ inline bool G2PModelCuda::load_from_file_(FILE* f, const char* label, cudaStream
     // Create cuBLAS handle
     cublasCreate(&cublas_);
     cublasSetMathMode(cublas_, CUBLAS_TF32_TENSOR_OP_MATH);
+    attn_scale_ = 1.0f / std::sqrt((float)head_dim_);
+    cudaMalloc(&cublas_ws_, CUBLAS_WS_BYTES);
+    cublasSetWorkspace(cublas_, cublas_ws_, CUBLAS_WS_BYTES);
+
+    // Pre-allocate workspace at max_pos_ size so that CUDA graphs are never
+    // invalidated by a larger T arriving later.
+    {
+        int Tm = max_pos_;
+        int Tm_up = Tm * up_;
+        workspace_bytes_ =
+            Tm * sizeof(int) +
+            Tm * d_ * sizeof(float) +
+            Tm * 3 * d_ * sizeof(float) +
+            heads_ * Tm * Tm * sizeof(float) +
+            Tm * d_ * sizeof(float) +
+            Tm * d_ * sizeof(float) +
+            Tm * 2 * ff_ * sizeof(float) +
+            Tm * d_ * up_ * sizeof(float) +
+            Tm_up * d_ * sizeof(float) +
+            Tm_up * n_phones_ * sizeof(float) +
+            Tm_up * sizeof(int);
+        auto ws_err = cudaMalloc(&workspace_, workspace_bytes_);
+        if (ws_err != cudaSuccess) {
+            fprintf(stderr, "g2p_cuda: workspace alloc failed (%zu bytes): %s\n",
+                    workspace_bytes_, cudaGetErrorString(ws_err));
+            workspace_ = nullptr; workspace_bytes_ = 0;
+            return false;
+        }
+    }
 
     cudaStreamSynchronize(stream);
 
-    fprintf(stderr, "g2p_cuda: loaded %s (d=%d, %d layers, %d heads, %d ff, %dx up, %.1f MB)\n",
-            label, d_, n_layers_, heads_, ff_, up_, total_bytes_ / (1024.0f * 1024.0f));
+    fprintf(stderr, "g2p_cuda: loaded %s (d=%d, %d layers, %d heads, %d ff, %dx up, %.1f MB, ws=%.1f MB)\n",
+            label, d_, n_layers_, heads_, ff_, up_, total_bytes_ / (1024.0f * 1024.0f),
+            workspace_bytes_ / (1024.0f * 1024.0f));
     return true;
 }
 
 inline void G2PModelCuda::free() {
+    for (auto& [t, exec] : graph_cache_) cudaGraphExecDestroy(exec);
+    graph_cache_.clear();
     if (weights_gpu_) { cudaFree(weights_gpu_); weights_gpu_ = nullptr; }
     if (workspace_) { cudaFree(workspace_); workspace_ = nullptr; workspace_bytes_ = 0; }
+    if (cublas_ws_) { cudaFree(cublas_ws_); cublas_ws_ = nullptr; }
     if (cublas_) { cublasDestroy(cublas_); cublas_ = nullptr; }
     d_ = 0;
 }
@@ -464,10 +696,10 @@ inline std::string G2PModelCuda::infer(const std::string& text, cublasLtHandle_t
     int d = d_, h = heads_, dk = head_dim_, ff = ff_;
     int T_up = T * up_;
 
-    // Workspace layout (no ffn_out needed — residual fused into GEMM):
+    // Workspace layout:
     //   ids_gpu[T] | X[d,T] | QKV[3d,T] | attn_scores[h,T,T] | attn_out[d,T] |
-    //   normed[d,T] | ffn_gate[ff,T] | ffn_up[ff,T] |
-    //   X_up_proj[d*up,T] | X_up[d,T_up] | logits[n_phones,T_up] | argmax[T_up]
+    //   normed[d,T] | ffn_out[2*ff,T] | X_up_proj[d*up,T] | X_up[d,T_up] |
+    //   logits[n_phones,T_up] | argmax[T_up]
     size_t ws_bytes =
         T * sizeof(int) +                              // ids_gpu
         T * d * sizeof(float) +                        // X
@@ -475,23 +707,17 @@ inline std::string G2PModelCuda::infer(const std::string& text, cublasLtHandle_t
         h * T * T * sizeof(float) +                    // attn_scores
         T * d * sizeof(float) +                        // attn_out
         T * d * sizeof(float) +                        // normed
-        T * ff * sizeof(float) +                       // ffn_gate
-        T * ff * sizeof(float) +                       // ffn_up
+        T * 2 * ff * sizeof(float) +                   // ffn_out
         T * d * up_ * sizeof(float) +                  // X_up_proj
         T_up * d * sizeof(float) +                     // X_up
         T_up * n_phones_ * sizeof(float) +             // logits
         T_up * sizeof(int);                            // argmax
 
     if (ws_bytes > workspace_bytes_) {
-        if (workspace_) cudaFree(workspace_);
-        auto ws_err = cudaMalloc(&workspace_, ws_bytes);
-        if (ws_err != cudaSuccess) {
-            fprintf(stderr, "g2p_cuda: workspace alloc failed (%zu bytes): %s\n",
-                    ws_bytes, cudaGetErrorString(ws_err));
-            workspace_ = nullptr; workspace_bytes_ = 0;
-            return "";
-        }
-        workspace_bytes_ = ws_bytes;
+        // Should never happen — workspace is pre-allocated at max_pos_ size
+        fprintf(stderr, "g2p_cuda: BUG: ws_bytes %zu > workspace_bytes_ %zu (T=%d)\n",
+                ws_bytes, workspace_bytes_, T);
+        return "";
     }
 
     // Assign pointers
@@ -499,129 +725,128 @@ inline std::string G2PModelCuda::infer(const std::string& text, cublasLtHandle_t
     auto wallocf = [&](size_t n) -> float* { float* p = (float*)wp; wp += n * sizeof(float); return p; };
     auto walloci = [&](size_t n) -> int*   { int* p = (int*)wp; wp += n * sizeof(int); return p; };
 
-    int* ids_gpu       = walloci(T);
-    float* X           = wallocf(T * d);
-    float* QKV         = wallocf(T * 3 * d);
-    float* attn_scores = wallocf(h * T * T);
-    float* attn_out    = wallocf(T * d);
-    float* normed      = wallocf(T * d);
-    float* ffn_gate    = wallocf(T * ff);
-    float* ffn_up      = wallocf(T * ff);
-    float* X_up_proj   = wallocf(T * d * up_);
-    float* X_up        = wallocf(T_up * d);
-    float* logits      = wallocf(T_up * n_phones_);
-    int* argmax        = walloci(T_up);
+    int* ids_gpu         = walloci(T);
+    float* X             = wallocf(T * d);
+    float* QKV           = wallocf(T * 3 * d);
+    float* attn_scores   = wallocf(h * T * T);
+    float* attn_out      = wallocf(T * d);
+    float* normed        = wallocf(T * d);
+    float* ffn_out       = wallocf(T * 2 * ff);
+    float* X_up_proj     = wallocf(T * d * up_);
+    float* X_up          = wallocf(T_up * d);
+    float* logits        = wallocf(T_up * n_phones_);
+    int* argmax          = walloci(T_up);
 
     // Set stream on cublas handle
     cublasSetStream(cublas_, stream);
 
-    // Upload input IDs
+    // Upload input IDs (before graph — stream ordering guarantees completion)
     cudaMemcpyAsync(ids_gpu, ids.data(), T * sizeof(int), cudaMemcpyHostToDevice, stream);
 
-    // Embedding lookup
-    g2p_embed_kernel<<<T, 128, 0, stream>>>(ids_gpu, char_emb_, X, T, d);
+    // CUDA graph: capture all kernel launches on first call per T,
+    // replay as single graph launch on subsequent calls.
+    auto git = graph_cache_.find(T);
+    if (git == graph_cache_.end()) {
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
 
-    int block = 128;
-    float one = 1.0f, zero = 0.0f;
-    float scale = 1.0f / std::sqrt((float)dk);
+        g2p_embed_kernel<<<T, 128, 0, stream>>>(ids_gpu, char_emb_, X, T, d);
 
-    // Transformer layers
-    for (int li = 0; li < n_layers_; li++) {
-        const auto& L = layers_[li];
+        int block = 128;
+        for (int li = 0; li < n_layers_; li++) {
+            const auto& L = layers_[li];
 
-        // ── Self-attention ──
-        // 1. RMSNorm
-        g2p_rms_norm_kernel<<<T, block, block * sizeof(float), stream>>>(
-            X, L.n1_w, normed, T, d, 1e-6f);
+            // 1. RMSNorm (attn)
+            g2p_rms_norm_kernel<<<T, block, block * sizeof(float), stream>>>(
+                X, L.n1_w, normed, T, d, 1e-6f);
 
-        // 2. QKV projection: QKV[3d, T] = W_qkv^T * normed + bias
-        //    W stored as row-major [3d, d] = col-major [d, 3d], use OP_T
-        cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                    3 * d, T, d, &one, L.qkv_w, d, normed, d, &zero, QKV, 3 * d);
-        g2p_bias_kernel<<<T, 256, 0, stream>>>(QKV, L.qkv_b, 3 * d, T);
+            // 2. QKV projection
+            cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
+                        3 * d, T, d, &one_, L.qkv_w, d, normed, d, &zero_, QKV, 3 * d);
 
-        // 3. Apply RoPE to Q and K
-        if (use_rope_) {
-            dim3 rope_grid(T, h);
-            g2p_rope_kernel<<<rope_grid, 64, 0, stream>>>(QKV,     rope_cos_, rope_sin_, T, 3 * d, h, dk);
-            g2p_rope_kernel<<<rope_grid, 64, 0, stream>>>(QKV + d, rope_cos_, rope_sin_, T, 3 * d, h, dk);
+            // 3. Fused QKV bias + RoPE Q&K
+            if (use_rope_) {
+                g2p_qkv_bias_rope_kernel<<<T, 256, 0, stream>>>(
+                    QKV, L.qkv_b, rope_cos_, rope_sin_, T, 3 * d, d, h, dk);
+            } else {
+                g2p_bias_kernel<<<T, 256, 0, stream>>>(QKV, L.qkv_b, 3 * d, T);
+            }
+
+            // 4. Batched attention scores
+            cublasSgemmStridedBatched(cublas_,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                T, T, dk,
+                &attn_scale_,
+                QKV + d, 3 * d, (long long)dk,
+                QKV,     3 * d, (long long)dk,
+                &zero_,
+                attn_scores, T, (long long)T * T,
+                h);
+
+            // 5. Softmax
+            g2p_softmax_kernel<<<h * T, block, block * sizeof(float), stream>>>(
+                attn_scores, T, h * T);
+
+            // 6. Batched value weighted sum
+            cublasSgemmStridedBatched(cublas_,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                dk, T, T,
+                &one_,
+                QKV + 2 * d, 3 * d, (long long)dk,
+                attn_scores, T,     (long long)T * T,
+                &zero_,
+                attn_out, d, (long long)dk,
+                h);
+
+            // 7. Output projection with fused residual
+            cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
+                        d, T, d, &one_, L.out_w, d, attn_out, d, &one_, X, d);
+
+            // 8a. Fused out_bias + RMSNorm
+            g2p_bias_rms_norm_kernel<<<T, block, block * sizeof(float), stream>>>(
+                X, L.out_b, L.n2_w, normed, T, d, 1e-6f);
+
+            // 8b. Gate+Up GEMM: ffn_out[2*ff, T] = gate_up_w[2*ff, d] × normed[d, T]
+            cublasSgemm(cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
+                        2 * ff, T, d, &one_, L.gate_up_w, 2 * ff, normed, d, &zero_, ffn_out, 2 * ff);
+
+            // 8c. Fused bias + SwiGLU
+            g2p_swiglu_bias_kernel<<<(T * ff + 255) / 256, 256, 0, stream>>>(
+                ffn_out, L.gate_up_b, ff, T);
+
+            // 8d. Down GEMM with fused residual: X += down_w[d, ff] × ffn_out[ff, T]
+            cublasSgemm(cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
+                        d, T, ff, &one_, L.down_w, d, ffn_out, 2 * ff, &one_, X, d);
+
+            // 8e. Down bias
+            g2p_bias_kernel<<<T, 256, 0, stream>>>(X, L.down_b, d, T);
         }
 
-        // 4. Batched attention scores: S_h[T,T] = scale * K_h^T * Q_h (all heads at once)
-        //    K_h for head h starts at QKV + d + h*dk, stride between columns = 3*d
-        //    Q_h for head h starts at QKV + h*dk, stride between columns = 3*d
-        //    Stride between heads = dk
-        cublasSgemmStridedBatched(cublas_,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            T, T, dk,
-            &scale,
-            QKV + d, 3 * d, (long long)dk,     // K (head 0), lda, strideA
-            QKV,     3 * d, (long long)dk,     // Q (head 0), ldb, strideB
-            &zero,
-            attn_scores, T, (long long)T * T,  // S, ldc, strideC
-            h);
-
-        // 5. Batched softmax across all heads (h*T rows of length T)
-        g2p_softmax_kernel<<<h * T, block, block * sizeof(float), stream>>>(
-            attn_scores, T, h * T);
-
-        // 6. Batched value weighted sum: O_h[dk,T] = V_h[dk,T] * S_h[T,T]
-        //    V_h for head h starts at QKV + 2*d + h*dk, stride between columns = 3*d
-        //    O_h for head h starts at attn_out + h*dk, stride between columns = d
-        cublasSgemmStridedBatched(cublas_,
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            dk, T, T,
-            &one,
-            QKV + 2 * d, 3 * d, (long long)dk,     // V (head 0), lda, strideA
-            attn_scores, T,     (long long)T * T,   // S (head 0), ldb, strideB
-            &zero,
-            attn_out, d, (long long)dk,              // O (head 0), ldc, strideC
-            h);
-
-        // 7. Output projection with fused residual: X = W_out^T * attn_out + X + bias
+        // Upsample projection (no bias — fused into reshape)
         cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                    d, T, d, &one, L.out_w, d, attn_out, d, &one, X, d);
-        g2p_bias_kernel<<<T, 256, 0, stream>>>(X, L.out_b, d, T);
+                    d * up_, T, d, &one_, up_w_, d, X, d, &zero_, X_up_proj, d * up_);
 
-        // ── SwiGLU FFN ──
-        // 8. RMSNorm
-        g2p_rms_norm_kernel<<<T, block, block * sizeof(float), stream>>>(
-            X, L.n2_w, normed, T, d, 1e-6f);
+        // Fused upsample bias + reshape
+        g2p_upsample_bias_reshape_kernel<<<T_up, 128, 0, stream>>>(
+            X_up_proj, up_b_, X_up, T, d, up_);
 
-        // 9. Gate and Up projections
+        // Output head (no bias — fused into CTC argmax)
         cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                    ff, T, d, &one, L.gate_w, d, normed, d, &zero, ffn_gate, ff);
-        g2p_bias_kernel<<<T, 256, 0, stream>>>(ffn_gate, L.gate_b, ff, T);
+                    n_phones_, T_up, d, &one_, head_w_, d, X_up, d, &zero_, logits, n_phones_);
 
-        cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                    ff, T, d, &one, L.up_w, d, normed, d, &zero, ffn_up, ff);
-        g2p_bias_kernel<<<T, 256, 0, stream>>>(ffn_up, L.up_b, ff, T);
+        // Fused head bias + CTC argmax
+        g2p_bias_ctc_argmax_kernel<<<(T_up + 255) / 256, 256, 0, stream>>>(
+            logits, head_b_, argmax, T_up, n_phones_);
 
-        // 10. SwiGLU activation
-        g2p_swiglu_kernel<<<(T * ff + 255) / 256, 256, 0, stream>>>(
-            ffn_gate, ffn_up, ffn_gate, T * ff);
-
-        // 11. Down projection with fused residual: X = W_down^T * ffn_gate + X + bias
-        cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                    d, T, ff, &one, L.down_w, ff, ffn_gate, ff, &one, X, d);
-        g2p_bias_kernel<<<T, 256, 0, stream>>>(X, L.down_b, d, T);
+        cudaGraph_t graph;
+        cudaStreamEndCapture(stream, &graph);
+        cudaGraphExec_t exec;
+        cudaGraphInstantiateWithFlags(&exec, graph, 0);
+        cudaGraphDestroy(graph);
+        graph_cache_[T] = exec;
+        cudaGraphLaunch(exec, stream);
+    } else {
+        cudaGraphLaunch(git->second, stream);
     }
-
-    // Upsample: proj[d*up, T] = W_up^T * X + bias
-    cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                d * up_, T, d, &one, up_w_, d, X, d, &zero, X_up_proj, d * up_);
-    g2p_bias_kernel<<<T, 256, 0, stream>>>(X_up_proj, up_b_, d * up_, T);
-
-    // Reshape: X_up_proj[d*up, T] → X_up[d, T*up]
-    g2p_upsample_reshape_kernel<<<T_up, 128, 0, stream>>>(X_up_proj, X_up, T, d, up_);
-
-    // Output head: logits[n_phones, T_up] = W_head^T * X_up + bias
-    cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                n_phones_, T_up, d, &one, head_w_, d, X_up, d, &zero, logits, n_phones_);
-    g2p_bias_kernel<<<T_up, 256, 0, stream>>>(logits, head_b_, n_phones_, T_up);
-
-    // CTC argmax
-    g2p_ctc_argmax_kernel<<<(T_up + 255) / 256, 256, 0, stream>>>(logits, argmax, T_up, n_phones_);
 
     // Copy argmax back to CPU
     std::vector<int> argmax_cpu(T_up);
