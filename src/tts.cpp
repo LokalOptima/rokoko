@@ -130,9 +130,10 @@ static void gemm_conv1d(cublasHandle_t cublas,
     int T_out = (T_in + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
     int CK = C_in * K;
 
-    // Try Cutlass implicit GEMM for large convolutions (needs NHWC weights, K>1)
-    // Only beneficial when the problem is large enough to amortize launch overhead.
-    if (K > 1) {
+    // Cutlass SIMT implicit GEMM: ncu shows AlignedArray<float,1> (scalar loads),
+    // inherent to OpClassSimt+FP32. cuBLAS im2col+SGEMM is faster.
+    // TODO: revisit with TF32 TensorOp or custom vectorized kernel.
+    if (false && K > 1) {
         auto it = s_w_nhwc.find(w);
         if (it != s_w_nhwc.end()) {
             int rc = cutlass_conv1d_fprop(x, it->second, bias, y,
