@@ -480,7 +480,7 @@ static void bilstm_gpu(const float* d_input, float* d_output,
 
 static void adain_1d_forward(const float* x, const float* style,
                               const Weights::AdaIN1dWeights& ain_w,
-                              float* y, float* fc_buf,
+                              float* y, float* fc_buf, float* norm_ws,
                               int C, int T, int style_dim,
                               cublasHandle_t cublas, cudaStream_t stream) {
     // Step 1: fc(style) -> [2*C] = [gamma, beta]
@@ -489,11 +489,12 @@ static void adain_1d_forward(const float* x, const float* style,
           ain_w.fc_w, style_dim, style, style_dim, fc_buf, 2*C);
     bias_add_f32(fc_buf, ain_w.fc_b, fc_buf, 1, 2*C, stream);
 
-    // Step 2: Fused InstanceNorm + StyleAffine (single kernel pass)
+    // Step 2: Fused InstanceNorm + StyleAffine (two-pass coalesced)
     // gamma = fc_buf[0..C-1], beta = fc_buf[C..2C-1]
+    // norm_ws must be >= 2*C floats (reduction buffer)
     instance_norm_style_affine_f32(x, ain_w.norm_w, ain_w.norm_b,
                                     fc_buf, fc_buf + C, y,
-                                    C, T, 1e-5f, stream);
+                                    norm_ws, C, T, 1e-5f, stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -514,7 +515,9 @@ static void adain_resblk1d_forward(const float* x, const float* style,
     int T_out = blk.has_upsample ? 2 * T : T;
 
     // ---- Residual path ----
-    adain_1d_forward(x, style, blk.norm1, residual_buf, fc_buf,
+    // fc_buf layout: [0..2C) = gamma/beta from FC, [2C..4C) = norm reduction workspace
+    float* norm_ws = fc_buf + 2 * dim_in;
+    adain_1d_forward(x, style, blk.norm1, residual_buf, fc_buf, norm_ws,
                      dim_in, T, style_dim, cublas, stream);
     leaky_relu_f32(residual_buf, residual_buf, dim_in * T, 0.2f, stream);
 
@@ -531,7 +534,8 @@ static void adain_resblk1d_forward(const float* x, const float* style,
     cudaMemcpyAsync(residual_buf, y, dim_out * T_out * sizeof(float),
                     cudaMemcpyDeviceToDevice, stream);
 
-    adain_1d_forward(residual_buf, style, blk.norm2, residual_buf, fc_buf,
+    norm_ws = fc_buf + 2 * dim_out;
+    adain_1d_forward(residual_buf, style, blk.norm2, residual_buf, fc_buf, norm_ws,
                      dim_out, T_out, style_dim, cublas, stream);
     leaky_relu_f32(residual_buf, residual_buf, dim_out * T_out, 0.2f, stream);
 
@@ -703,8 +707,9 @@ static void adain_resblock1_forward(float* x, const float* style,
     int K = rb.kernel_size;
     int dilations[] = {1, 3, 5};
 
+    float* norm_ws = fc_buf + 2 * C;
     for (int j = 0; j < 3; j++) {
-        adain_1d_forward(x, style, rb.adain1[j], xt_buf, fc_buf,
+        adain_1d_forward(x, style, rb.adain1[j], xt_buf, fc_buf, norm_ws,
                          C, T, style_dim, cublas, stream);
         snake_f32(xt_buf, rb.alpha1[j], xt_buf, C, T, stream);
 
@@ -713,7 +718,7 @@ static void adain_resblock1_forward(float* x, const float* style,
         gemm_conv1d(cublas, xt_buf, rb.convs1[j].wv, rb.convs1[j].b, conv_out_buf,
                      workspace, workspace_bytes, C, C, T, K, 1, pad, d, stream);
 
-        adain_1d_forward(conv_out_buf, style, rb.adain2[j], xt_buf, fc_buf,
+        adain_1d_forward(conv_out_buf, style, rb.adain2[j], xt_buf, fc_buf, norm_ws,
                          C, T, style_dim, cublas, stream);
         snake_f32(xt_buf, rb.alpha2[j], xt_buf, C, T, stream);
 
@@ -811,7 +816,7 @@ size_t compute_decode_bytes(int T, int L) {
     // F0/N working buffers (shared across both chains)
     off = a(off, (size_t)512 * L2 * sizeof(float));      // d_res_buf
     off = a(off, (size_t)512 * L2 * sizeof(float));      // d_sc_buf
-    off = a(off, (size_t)1024 * sizeof(float));           // d_fc_buf
+    off = a(off, (size_t)2048 * sizeof(float));           // d_fc_buf (2*C + 2*C norm ws)
 
     // F0/N predictions
     off = a(off, (size_t)L2 * sizeof(float));             // d_f0_pred
@@ -827,7 +832,7 @@ size_t compute_decode_bytes(int T, int L) {
     int max_ch = 1090;
     off = a(off, (size_t)max_ch * L2 * sizeof(float));   // d_dec_res
     off = a(off, (size_t)max_ch * L2 * sizeof(float));   // d_dec_sc
-    off = a(off, (size_t)2 * max_ch * sizeof(float));    // d_dec_fc
+    off = a(off, (size_t)4 * max_ch * sizeof(float));    // d_dec_fc (2*C + 2*C norm ws)
 
     // Decoder blocks
     off = a(off, (size_t)L * 1024 * sizeof(float));       // d_dec_out [L, 1024]
@@ -1037,7 +1042,7 @@ std::vector<float> rokoko_infer(const Weights& w,
     // Both: [L, 512] → 3 AdainResBlk1d → Conv1d proj → [2L, 1]
     float* d_res_buf = decode_arena.alloc<float>(512 * L2);
     float* d_sc_buf  = decode_arena.alloc<float>(512 * L2);
-    float* d_fc_buf  = decode_arena.alloc<float>(1024);
+    float* d_fc_buf  = decode_arena.alloc<float>(2048);  // 2*C for gamma/beta + 2*C for norm reduction
 
     auto run_f0n_chain = [&](const Weights::AdainResBlk1dWeights blocks[3],
                               const float* proj_w, const float* proj_b,
@@ -1103,7 +1108,7 @@ std::vector<float> rokoko_infer(const Weights& w,
     int max_ch = 1090;
     float* d_dec_res = decode_arena.alloc<float>(max_ch * L2);
     float* d_dec_sc  = decode_arena.alloc<float>(max_ch * L2);
-    float* d_dec_fc  = decode_arena.alloc<float>(2 * max_ch);
+    float* d_dec_fc  = decode_arena.alloc<float>(4 * max_ch);  // 2*C gamma/beta + 2*C norm reduction
 
     // Encode: AdainResBlk1d(514→1024) [L, 514] → [L, 1024]
     float* d_dec_out = decode_arena.alloc<float>(L * 1024);

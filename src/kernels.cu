@@ -435,47 +435,79 @@ void cast_i64_to_i32(const int64_t* src, int* dst, int N,
 }
 
 // ---------------------------------------------------------------------------
-// Instance Normalization 1D: normalize each channel across time
-//   x, y: [T, C], weight, bias: [C]
-//   For each c: y[t,c] = weight[c] * (x[t,c] - mean_c) / sqrt(var_c + eps) + bias[c]
-//   One warp per channel. Data is strided by C.
+// Coalesced per-channel sum + sum_sq accumulation kernel
+//   Used by both instance_norm_1d and instance_norm_style_affine.
+//   Grid(blocks_x, blocks_y): x covers C, y tiles over T for parallelism.
+//   Adjacent threads read adjacent channels → coalesced memory access.
 // ---------------------------------------------------------------------------
 
-__global__ void instance_norm_1d_kernel(const float* x, const float* weight,
-                                         const float* bias, float* y,
-                                         int C, int T, float eps) {
-    int c = blockIdx.x;
+__global__ void instnorm_sum_kernel(
+        const float* __restrict__ x,
+        float* __restrict__ red_sum,    // [C]
+        float* __restrict__ red_sum_sq, // [C]
+        int C, int T) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
 
-    // Mean across T (strided access: x[t*C+c])
-    float sum = 0.0f;
-    for (int t = threadIdx.x; t < T; t += 32)
-        sum += x[t * C + c];
-    for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
-    float mean = __shfl_sync(0xFFFFFFFF, sum, 0) / T;
-
-    // Variance across T
-    float var_sum = 0.0f;
-    for (int t = threadIdx.x; t < T; t += 32) {
-        float diff = x[t * C + c] - mean;
-        var_sum += diff * diff;
+    float s = 0.0f, sq = 0.0f;
+    for (int t = blockIdx.y; t < T; t += gridDim.y) {
+        float v = x[t * C + c];
+        s += v;
+        sq += v * v;
     }
-    for (int offset = 16; offset > 0; offset >>= 1)
-        var_sum += __shfl_down_sync(0xFFFFFFFF, var_sum, offset);
-    float inv_std = rsqrtf(__shfl_sync(0xFFFFFFFF, var_sum, 0) / T + eps);
+    atomicAdd(&red_sum[c], s);
+    atomicAdd(&red_sum_sq[c], sq);
+}
 
-    // Normalize with per-channel affine
+// ---------------------------------------------------------------------------
+// Instance Normalization 1D: normalize each channel across time
+//   x, y: [T, C], weight, bias: [C]
+//   Two-pass coalesced: same approach as fused instance_norm_style_affine.
+// ---------------------------------------------------------------------------
+
+// Pass 1: reuses instnorm_sum_kernel (defined below in fused version)
+
+// Pass 2 (standalone, without style affine)
+__global__ void instnorm_norm_kernel(
+        const float* __restrict__ x,
+        const float* __restrict__ red_sum,
+        const float* __restrict__ red_sum_sq,
+        const float* __restrict__ weight, const float* __restrict__ bias,
+        float* __restrict__ y,
+        int C, int T, float eps) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+
+    float mean = red_sum[c] / T;
+    float var = red_sum_sq[c] / T - mean * mean;
+    float inv_std = rsqrtf(var + eps);
     float w = weight[c], b = bias[c];
-    for (int t = threadIdx.x; t < T; t += 32) {
+
+    for (int t = blockIdx.y; t < T; t += gridDim.y) {
         y[t * C + c] = w * (x[t * C + c] - mean) * inv_std + b;
     }
 }
 
 void instance_norm_1d_f32(const float* x, const float* weight, const float* bias,
-                           float* y, int C, int T, float eps,
+                           float* y, float* workspace,
+                           int C, int T, float eps,
                            cudaStream_t stream) {
-    instance_norm_1d_kernel<<<C, 32, 0, stream>>>(x, weight, bias, y, C, T, eps);
+    float* red_sum = workspace;
+    float* red_sum_sq = workspace + C;
+    cudaMemsetAsync(workspace, 0, 2 * C * sizeof(float), stream);
+
+    int threads = (C < 256) ? C : 256;
+    int blocks_x = (C + threads - 1) / threads;
+    int blocks_y = (T < 256) ? T : 256;
+    dim3 grid(blocks_x, blocks_y);
+
+    // Forward declaration: instnorm_sum_kernel is defined below
+    // but works identically for standalone instance norm
+    instnorm_sum_kernel<<<grid, threads, 0, stream>>>(
+        x, red_sum, red_sum_sq, C, T);
+
+    instnorm_norm_kernel<<<grid, threads, 0, stream>>>(
+        x, red_sum, red_sum_sq, weight, bias, y, C, T, eps);
 }
 
 // ---------------------------------------------------------------------------
@@ -503,42 +535,39 @@ void style_affine_1d_f32(const float* x, const float* gamma, const float* beta,
 }
 
 // ---------------------------------------------------------------------------
-// Fused InstanceNorm + StyleAffine: single-pass AdaIN
+// Fused InstanceNorm + StyleAffine: two-pass coalesced AdaIN
 //   y[t,c] = (1+gamma[c]) * (norm_w[c] * (x[t,c]-mean)/sqrt(var+eps) + norm_b[c]) + beta[c]
-//   x, y: [T, C]. One block per channel, 32 threads (warp). Strided access by C.
+//   x, y: [T, C].
+//
+//   Pass 1: coalesced reads along C, accumulate per-channel sum + sum_sq.
+//   Pass 2: normalize + style affine with coalesced reads and writes.
+//   All memory accesses are coalesced (adjacent threads access adjacent C positions).
 // ---------------------------------------------------------------------------
 
-__global__ void instance_norm_style_affine_kernel(
-        const float* x, const float* norm_w, const float* norm_b,
-        const float* gamma, const float* beta, float* y,
+// Pass 2: compute mean/var from reduction buffer, normalize + style affine
+__global__ void instnorm_style_norm_kernel(
+        const float* __restrict__ x,
+        const float* __restrict__ red_sum,
+        const float* __restrict__ red_sum_sq,
+        const float* __restrict__ norm_w, const float* __restrict__ norm_b,
+        const float* __restrict__ gamma, const float* __restrict__ beta,
+        float* __restrict__ y,
         int C, int T, float eps) {
-    int c = blockIdx.x;
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
 
-    // Mean across T (strided)
-    float sum = 0.0f;
-    for (int t = threadIdx.x; t < T; t += 32)
-        sum += x[t * C + c];
-    for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
-    float mean = __shfl_sync(0xFFFFFFFF, sum, 0) / T;
+    // Compute mean and inv_std from reduction buffer
+    float mean = red_sum[c] / T;
+    float var = red_sum_sq[c] / T - mean * mean;
+    float inv_std = rsqrtf(var + eps);
 
-    // Variance across T
-    float var_sum = 0.0f;
-    for (int t = threadIdx.x; t < T; t += 32) {
-        float diff = x[t * C + c] - mean;
-        var_sum += diff * diff;
-    }
-    for (int offset = 16; offset > 0; offset >>= 1)
-        var_sum += __shfl_down_sync(0xFFFFFFFF, var_sum, offset);
-    float inv_std = rsqrtf(__shfl_sync(0xFFFFFFFF, var_sum, 0) / T + eps);
-
-    // Fused: inst_norm + style affine
+    // Precompute fused scale and bias
     float g = 1.0f + gamma[c];
     float combined_scale = g * norm_w[c] * inv_std;
     float combined_bias = g * (norm_b[c] - norm_w[c] * mean * inv_std) + beta[c];
 
-    for (int t = threadIdx.x; t < T; t += 32) {
+    // Normalize with coalesced reads/writes
+    for (int t = blockIdx.y; t < T; t += gridDim.y) {
         y[t * C + c] = combined_scale * x[t * C + c] + combined_bias;
     }
 }
@@ -546,10 +575,25 @@ __global__ void instance_norm_style_affine_kernel(
 void instance_norm_style_affine_f32(const float* x, const float* norm_w,
                                       const float* norm_b, const float* gamma,
                                       const float* beta, float* y,
+                                      float* workspace,
                                       int C, int T, float eps,
                                       cudaStream_t stream) {
-    instance_norm_style_affine_kernel<<<C, 32, 0, stream>>>(
-        x, norm_w, norm_b, gamma, beta, y, C, T, eps);
+    float* red_sum = workspace;
+    float* red_sum_sq = workspace + C;
+    cudaMemsetAsync(workspace, 0, 2 * C * sizeof(float), stream);
+
+    // Grid: x-dim covers C, y-dim covers T tiles for parallelism
+    int threads = (C < 256) ? C : 256;
+    int blocks_x = (C + threads - 1) / threads;
+    // Use enough y-blocks to saturate the GPU (target ~2048 total blocks)
+    int blocks_y = (T < 256) ? T : 256;
+    dim3 grid(blocks_x, blocks_y);
+
+    instnorm_sum_kernel<<<grid, threads, 0, stream>>>(
+        x, red_sum, red_sum_sq, C, T);
+
+    instnorm_style_norm_kernel<<<grid, threads, 0, stream>>>(
+        x, red_sum, red_sum_sq, norm_w, norm_b, gamma, beta, y, C, T, eps);
 }
 
 // ---------------------------------------------------------------------------

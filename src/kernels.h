@@ -113,7 +113,8 @@ void cast_i64_to_i32(const int64_t* src, int* dst, int N,
 //   For each c: y[t,c] = weight[c] * (x[t,c] - mean_c) / sqrt(var_c + eps) + bias[c]
 // ---------------------------------------------------------------------------
 void instance_norm_1d_f32(const float* x, const float* weight, const float* bias,
-                           float* y, int C, int T, float eps,
+                           float* y, float* workspace,  // [2*C] reduction buffer
+                           int C, int T, float eps,
                            cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
@@ -131,6 +132,7 @@ void style_affine_1d_f32(const float* x, const float* gamma, const float* beta,
 void instance_norm_style_affine_f32(const float* x, const float* norm_w,
                                       const float* norm_b, const float* gamma,
                                       const float* beta, float* y,
+                                      float* workspace,  // [2*C] reduction buffer
                                       int C, int T, float eps,
                                       cudaStream_t stream);
 
