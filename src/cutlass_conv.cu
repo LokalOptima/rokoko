@@ -1,12 +1,12 @@
 // cutlass_conv.cu — Cutlass implicit GEMM Conv1d (via Conv2d with H=1)
 //
 // Replaces im2col + cuBLAS SGEMM with a single Cutlass kernel launch.
-// Uses FP32 SIMT (CUDA cores) with NHWC layout = [T, C] for 1D.
+// Uses TF32 TensorOp (tensor cores) with NHWC layout = [T, C] for 1D.
+// Falls back to SIMT (CUDA cores) when alignment requirements aren't met.
 // Fuses per-channel bias into the GEMM epilogue.
 //
-// Operator caching: each unique problem shape (C_in, C_out, T_in, K,
-// stride, padding, dilation) gets initialize() once. Subsequent calls
-// with the same shape use update() (pointer swap only) + operator().
+// Operator caching: each unique problem shape gets initialize() once.
+// Subsequent calls use update() (pointer swap only) + operator().
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -19,7 +19,7 @@
 #include "cutlass/epilogue/thread/linear_combination.h"
 
 // ---------------------------------------------------------------------------
-// Cutlass Conv2d implicit GEMM type (FP32 SIMT, NHWC, SM80-compatible)
+// Common types
 // ---------------------------------------------------------------------------
 
 using ElementInput       = float;
@@ -28,31 +28,62 @@ using ElementAccumulator = float;
 using ElementCompute     = float;
 using LayoutNHWC         = cutlass::layout::TensorNHWC;
 
-using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
+// ---------------------------------------------------------------------------
+// TF32 TensorOp path (requires C_in and C_out divisible by 4)
+// Uses tensor cores with 128-bit (float4) aligned loads.
+// ---------------------------------------------------------------------------
+
+using EpilogueOpTF32 = cutlass::epilogue::thread::LinearCombination<
+    ElementOutput, 4, ElementAccumulator, ElementCompute>;
+
+using Conv2dKernelTF32 = typename cutlass::conv::kernel::DefaultConv2dFprop<
+    ElementInput, LayoutNHWC,
+    ElementInput, LayoutNHWC,
+    ElementOutput, LayoutNHWC,
+    ElementAccumulator,
+    cutlass::arch::OpClassTensorOp,           // Tensor cores
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 128, 16>,   // Threadblock
+    cutlass::gemm::GemmShape<64, 64, 16>,     // Warp
+    cutlass::gemm::GemmShape<16, 8, 8>,       // TF32 MMA instruction
+    EpilogueOpTF32,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+    3,                                        // Pipeline stages
+    cutlass::arch::OpMultiplyAdd,             // 1xTF32
+    cutlass::conv::IteratorAlgorithm::kOptimized
+>::Kernel;
+
+using ImplicitGemmTF32 = cutlass::conv::device::ImplicitGemmConvolution<Conv2dKernelTF32>;
+
+// ---------------------------------------------------------------------------
+// SIMT fallback path (no alignment requirements)
+// For convolutions with C_in or C_out not divisible by 4.
+// ---------------------------------------------------------------------------
+
+using EpilogueOpSIMT = cutlass::epilogue::thread::LinearCombination<
     ElementOutput, 1, ElementAccumulator, ElementCompute>;
 
-using Conv2dKernel = typename cutlass::conv::kernel::DefaultConv2dFprop<
-    ElementInput, LayoutNHWC,         // Activation
-    ElementInput, LayoutNHWC,         // Filter
-    ElementOutput, LayoutNHWC,        // Output
+using Conv2dKernelSIMT = typename cutlass::conv::kernel::DefaultConv2dFprop<
+    ElementInput, LayoutNHWC,
+    ElementInput, LayoutNHWC,
+    ElementOutput, LayoutNHWC,
     ElementAccumulator,
-    cutlass::arch::OpClassSimt,       // CUDA cores (SIMT)
-    cutlass::arch::Sm80,              // Forward-compatible with SM120
-    cutlass::gemm::GemmShape<128, 128, 8>,  // Threadblock
-    cutlass::gemm::GemmShape<32, 64, 8>,    // Warp
-    cutlass::gemm::GemmShape<1, 1, 1>,      // Instruction (scalar for SIMT)
-    EpilogueOp,
+    cutlass::arch::OpClassSimt,               // CUDA cores
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 128, 8>,    // Threadblock
+    cutlass::gemm::GemmShape<32, 64, 8>,      // Warp
+    cutlass::gemm::GemmShape<1, 1, 1>,        // Scalar instruction
+    EpilogueOpSIMT,
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-    4,                                // Pipeline stages
+    4,                                        // Pipeline stages
     cutlass::arch::OpMultiplyAdd,
     cutlass::conv::IteratorAlgorithm::kOptimized
 >::Kernel;
 
-using ImplicitGemm = cutlass::conv::device::ImplicitGemmConvolution<Conv2dKernel>;
+using ImplicitGemmSIMT = cutlass::conv::device::ImplicitGemmConvolution<Conv2dKernelSIMT>;
 
 // ---------------------------------------------------------------------------
-// Operator cache: one initialized operator per unique problem shape.
-// First call: initialize() + operator(). Subsequent: update() + operator().
+// Operator caches: one per kernel variant, keyed by problem shape.
 // ---------------------------------------------------------------------------
 
 struct ConvKey {
@@ -74,11 +105,11 @@ struct ConvKeyHash {
     }
 };
 
-static std::unordered_map<ConvKey, ImplicitGemm, ConvKeyHash> s_op_cache;
+static std::unordered_map<ConvKey, ImplicitGemmTF32, ConvKeyHash> s_tf32_cache;
+static std::unordered_map<ConvKey, ImplicitGemmSIMT, ConvKeyHash> s_simt_cache;
 
 // ---------------------------------------------------------------------------
 // Reshape weights: [C_out, C_in, K] → [C_out, K, C_in] (NHWC filter layout)
-// One-time operation during weight precomputation.
 // ---------------------------------------------------------------------------
 
 __global__ void reshape_weights_kernel(const float* __restrict__ src,
@@ -92,7 +123,6 @@ __global__ void reshape_weights_kernel(const float* __restrict__ src,
         int rem = idx % (C_in * K);
         int ci = rem / K;
         int k = rem % K;
-        // src[co, ci, k] → dst[co, k, ci]
         dst[co * K * C_in + k * C_in + ci] = src[idx];
     }
 }
@@ -108,12 +138,73 @@ void cutlass_reshape_weights(const float* src, float* dst,
 }
 
 // ---------------------------------------------------------------------------
+// Helper: build Arguments struct for a conv1d problem
+// ---------------------------------------------------------------------------
+
+static cutlass::conv::Conv2dProblemSize make_problem(
+    int C_in, int C_out, int T_in, int K,
+    int stride, int padding, int dilation) {
+    return cutlass::conv::Conv2dProblemSize(
+        {1, 1, T_in, C_in},
+        {C_out, 1, K, C_in},
+        {0, 0, padding, padding},
+        {1, stride},
+        {1, dilation},
+        cutlass::conv::Mode::kCrossCorrelation,
+        1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Templated dispatch: try cache hit → update, else initialize → cache
+// ---------------------------------------------------------------------------
+
+template <typename GemmOp, typename CacheMap>
+static int dispatch_conv(CacheMap& cache,
+                          const ConvKey& key,
+                          const cutlass::conv::Conv2dProblemSize& problem,
+                          float* x, float* w, float* bias_ptr,
+                          float* y, float* workspace, size_t workspace_bytes,
+                          int C_in, int C_out, int T_in, int T_out, int K,
+                          float alpha, float beta,
+                          const LayoutNHWC& layout_x, const LayoutNHWC& layout_w,
+                          const LayoutNHWC& layout_y, const LayoutNHWC& layout_bias,
+                          cudaStream_t stream) {
+    typename GemmOp::Arguments arguments;
+    arguments.problem_size = problem;
+    arguments.ref_A = {x, layout_x};
+    arguments.ref_B = {w, layout_w};
+    arguments.ref_C = {bias_ptr, layout_bias};
+    arguments.ref_D = {y, layout_y};
+    arguments.output_op = {alpha, beta};
+
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        it->second.update(arguments, workspace);
+        cutlass::Status status = it->second(stream);
+        return (status == cutlass::Status::kSuccess) ? 0 : -4;
+    }
+
+    GemmOp conv_op;
+    cutlass::Status status = conv_op.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) return -1;
+
+    size_t needed = conv_op.get_workspace_size(arguments);
+    if (needed > workspace_bytes) return -2;
+
+    status = conv_op.initialize(arguments, workspace, stream);
+    if (status != cutlass::Status::kSuccess) return -3;
+
+    status = conv_op(stream);
+    if (status != cutlass::Status::kSuccess) return -4;
+
+    cache[key] = conv_op;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // cutlass_conv1d_fprop: Conv1d forward via Cutlass Conv2d (H=1)
-//   x: [T_in, C_in] (NHWC with N=1, H=1, W=T_in)
-//   w: [C_out, C_in, K] stored as [C_out, 1, K, C_in] in NHWC
-//   bias: [C_out] or nullptr
-//   y: [T_out, C_out]
-//   workspace: pre-allocated workspace buffer
+//   Tries TF32 TensorOp first (C_in, C_out must be ÷4), falls back to SIMT.
 // ---------------------------------------------------------------------------
 
 extern "C"
@@ -135,51 +226,25 @@ int cutlass_conv1d_fprop(const float* x, const float* w, const float* bias,
     LayoutNHWC layout_y = LayoutNHWC::packed({1, 1, T_out, C_out});
     LayoutNHWC layout_bias = bias ? LayoutNHWC(LayoutNHWC::Stride(0)) : layout_y;
 
-    typename ImplicitGemm::Arguments arguments;
-    arguments.problem_size = cutlass::conv::Conv2dProblemSize(
-        {1, 1, T_in, C_in},
-        {C_out, 1, K, C_in},
-        {0, 0, padding, padding},
-        {1, stride},
-        {1, dilation},
-        cutlass::conv::Mode::kCrossCorrelation,
-        1
-    );
-    arguments.ref_A = {x_nc, layout_x};
-    arguments.ref_B = {w_nc, layout_w};
-    arguments.ref_C = {bias_ptr, layout_bias};
-    arguments.ref_D = {y, layout_y};
-    arguments.output_op = {alpha, beta};
-
-    // Look up cached operator for this problem shape
+    auto problem = make_problem(C_in, C_out, T_in, K, stride, padding, dilation);
     ConvKey key{C_in, C_out, T_in, K, stride, padding, dilation};
-    auto it = s_op_cache.find(key);
 
-    if (it != s_op_cache.end()) {
-        // Cache hit: update pointers only, skip initialize()
-        it->second.update(arguments, workspace);
-        cutlass::Status status = it->second(stream);
-        return (status == cutlass::Status::kSuccess) ? 0 : -4;
+    // Try TF32 TensorOp for aligned channels (÷4)
+    if ((C_in % 4 == 0) && (C_out % 4 == 0)) {
+        int rc = dispatch_conv<ImplicitGemmTF32>(
+            s_tf32_cache, key, problem,
+            x_nc, w_nc, bias_ptr, y, workspace, workspace_bytes,
+            C_in, C_out, T_in, T_out, K, alpha, beta,
+            layout_x, layout_w, layout_y, layout_bias, stream);
+        if (rc == 0) return 0;
     }
 
-    // Cache miss: full initialization
-    ImplicitGemm conv_op;
-
-    cutlass::Status status = conv_op.can_implement(arguments);
-    if (status != cutlass::Status::kSuccess) return -1;
-
-    size_t needed = conv_op.get_workspace_size(arguments);
-    if (needed > workspace_bytes) return -2;
-
-    status = conv_op.initialize(arguments, workspace, stream);
-    if (status != cutlass::Status::kSuccess) return -3;
-
-    status = conv_op(stream);
-    if (status != cutlass::Status::kSuccess) return -4;
-
-    // Cache the initialized operator
-    s_op_cache[key] = conv_op;
-    return 0;
+    // SIMT fallback
+    return dispatch_conv<ImplicitGemmSIMT>(
+        s_simt_cache, key, problem,
+        x_nc, w_nc, bias_ptr, y, workspace, workspace_bytes,
+        C_in, C_out, T_in, T_out, K, alpha, beta,
+        layout_x, layout_w, layout_y, layout_bias, stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -191,26 +256,33 @@ size_t cutlass_conv1d_workspace_bytes(int C_in, int C_out, int T_in, int K,
                                        int stride, int padding, int dilation) {
     int T_out = (T_in + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
 
-    cutlass::conv::Conv2dProblemSize problem_size(
-        {1, 1, T_in, C_in},
-        {C_out, 1, K, C_in},
-        {0, 0, padding, padding},
-        {1, stride},
-        {1, dilation},
-        cutlass::conv::Mode::kCrossCorrelation,
-        1
-    );
+    auto problem = make_problem(C_in, C_out, T_in, K, stride, padding, dilation);
 
     float* np = nullptr;
-    typename ImplicitGemm::Arguments arguments(
-        problem_size,
-        {np, LayoutNHWC::packed({1, 1, T_in, C_in})},
-        {np, LayoutNHWC::packed({C_out, 1, K, C_in})},
-        {np, LayoutNHWC::Stride(0)},
-        {np, LayoutNHWC::packed({1, 1, T_out, C_out})},
-        {1.0f, 0.0f}
-    );
+    LayoutNHWC layout_x = LayoutNHWC::packed({1, 1, T_in, C_in});
+    LayoutNHWC layout_w = LayoutNHWC::packed({C_out, 1, K, C_in});
+    LayoutNHWC layout_y = LayoutNHWC::packed({1, 1, T_out, C_out});
 
-    ImplicitGemm tmp;
-    return tmp.get_workspace_size(arguments);
+    // TF32 and SIMT may need different workspace sizes — return the max
+    size_t ws = 0;
+    if ((C_in % 4 == 0) && (C_out % 4 == 0)) {
+        typename ImplicitGemmTF32::Arguments args(
+            problem,
+            {np, layout_x}, {np, layout_w},
+            {np, LayoutNHWC::Stride(0)}, {np, layout_y},
+            {1.0f, 0.0f});
+        ImplicitGemmTF32 tmp;
+        ws = tmp.get_workspace_size(args);
+    }
+    {
+        typename ImplicitGemmSIMT::Arguments args(
+            problem,
+            {np, layout_x}, {np, layout_w},
+            {np, LayoutNHWC::Stride(0)}, {np, layout_y},
+            {1.0f, 0.0f});
+        ImplicitGemmSIMT tmp;
+        size_t ws2 = tmp.get_workspace_size(args);
+        if (ws2 > ws) ws = ws2;
+    }
+    return ws;
 }
