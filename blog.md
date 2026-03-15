@@ -3,1021 +3,6 @@
 A log of our journey reimplementing Kokoro-82M TTS inference in C++/CUDA.
 
 ---
-
-## Optimization Round 3: G2P Pre-alloc + WMMA TF32 + SineGen Cleanup + TTS Profile (2026-03-14)
-
-Four optimizations in one round: eliminating CUDA graph invalidation, tensor core acceleration for the fused FFN, memory reclamation for SineGen, and profiling TTS to find next bottlenecks.
-
-### Item 1: Pre-allocate G2P workspace at max T
-
-**Problem**: When a text longer than any previous input arrived, the G2P workspace grew via `cudaFree` + `cudaMalloc`. This changed the base pointer, invalidating all cached CUDA graphs (whose pointers were baked in during capture). Every cached graph had to be re-captured.
-
-**Fix**: Allocate workspace at `max_pos_` (2048) size during `load_from_file_()`. The workspace is 89.7 MB (dominated by `h*T*T` attention scores at 64 MB for T=2048). Trivial next to TTS's 327 MB. The grow-and-invalidate block in `infer()` becomes a simple bounds check that should never fire.
-
-**Result**: Graphs are never invalidated regardless of input sequence. Cached replay confirmed at 2.7ms.
-
-### Item 2: WMMA TF32 GEMV in fused FFN kernel (reverted — no improvement)
-
-**Problem**: The fused FFN kernel's scalar GEMV (gate+up and down projections) was suspected to be slower than cuBLAS tensor cores (1.1ms vs 0.3ms in earlier testing — 3.7x gap).
-
-**Approach**: Replace scalar dot-product loops with WMMA 16x16x8 TF32 matrix-multiply fragments. Each warp processes 16-wide output tiles, accumulating over the input dimension in chunks of 8.
-
-**Challenge — Opaque fragment layout**: The WMMA API treats fragment element mappings as opaque. Can't manually fill `b_frag.x[i]` — `i % 8` doesn't map to row index. First attempt also tried `store_matrix_sync` to thread-local arrays (a warp-cooperative op that requires shared memory). Rewrote using per-warp shared memory broadcast buffers (128 floats per warp for B fragment, 256 floats for accumulator store).
-
-**A/B benchmark result**: Both scalar and WMMA achieve **1.1ms cached replay**. WMMA wasted 15/16 of tensor core compute broadcasting the input vector across 16 columns of the B fragment. The broadcast buffer fill (128 floats per warp per k-chunk) and accumulator store/extract added overhead that negated any tensor core throughput advantage. The scalar version with coalesced memory access (from the weight transpose) was already memory-bandwidth-limited, not compute-limited — tensor cores couldn't help.
-
-**Decision**: Reverted WMMA. Kept scalar FFN kernel (simpler, same speed, full FP32 precision). The `-arch=native` Makefile change was kept since it generates correct code for our Blackwell GPU regardless.
-
-**Lesson**: WMMA is designed for GEMM, not GEMV. For matrix-vector products, the 16-wide N dimension is pure waste. The earlier "cuBLAS 0.3ms" measurement was likely a batched GEMM (multiple columns), not a single-column GEMV. For true GEMV on small matrices (256×2048), scalar with coalesced access is hard to beat.
-
-### Item 3: TTS nsys profile
-
-**Approach**: Profile-only, no code changes. Run nsys to identify where time actually goes.
-
-**Key findings** (49 tokens, T=49, medium-length text, 28.2ms total):
-
-| Kernel Category | Time (ms) | % | Instances | Avg (us) |
-|---|---|---|---|---|
-| im2col + simt SGEMM (conv) | 6.2 | 31% | 150 | 41 |
-| Cutlass tensorop GEMM | 4.7 | 23% | 42 | 112 |
-| Instance norm (AdaIN) | 2.3 | 11% | 70 | 32 |
-| cuBLAS GEMV | 1.6 | 8% | 765 | 2.1 |
-| LSTM gates | 1.1 | 5% | 754 | 1.4 |
-| Weight norm | 0.8 | 4% | 89 | 8.7 |
-| Channel bias add | 0.5 | 3% | 76 | 7.1 |
-| Snake activation | 0.4 | 2% | 48 | 9.3 |
-| Everything else | 2.6 | 13% | — | — |
-
-**Observations**:
-- **im2col + simt SGEMM (31%)**: Convolutions using `im2col` unfold + non-tensor-core SGEMM (`align1`). The `align1` variant means weight layout doesn't meet tensor core alignment requirements. Aligning weights to 4-float boundaries would unlock tensor core GEMM and potentially 3-4x speedup for these ops.
-- **LSTM gates (754 instances!)**: Tiny kernels (1.4 us each) with massive launch count. Each bidirectional LSTM timestep is a separate kernel. Fusing all timesteps or using CUDA graphs for the LSTM section could eliminate launch overhead.
-- **cuBLAS GEMV (765 instances)**: Similarly tiny. These are the LSTM matrix-vector products.
-- **Launch overhead**: Total kernel time ~20ms, total wall time 28ms → ~8ms in launch overhead + CPU work. This is ~29% overhead, confirming that kernel fusion / CUDA graphs would help significantly.
-- **Encode-phase graph** is feasible: ~100 kernels before the L sync point. Cache per-T like G2P.
-
-### Item 4: SineGen save/restore
-
-**Problem**: SineGen allocated `d_phase_low` (L2*9 floats), `d_har_source` (T_audio floats), and `d_rand_ini` (9 floats) from `decode_arena` but never reclaimed them. Wasted ~0.5-2.5 MB depending on text length.
-
-**Fix**: Wrap in `decode_arena.save()` / `decode_arena.restore()` around the SineGen temporaries (keeping `d_gen_har` outside since it must persist). Updated `compute_decode_bytes()` to take `max(sinegen_temps, generator_pool)` instead of summing both, since they now overlap.
-
-**Safety**: All ops are on the same CUDA stream — stream ordering guarantees SineGen kernels complete before any subsequent kernel writes to the reclaimed region. Same pattern used for F0/N chains at line 995.
-
-### Summary
-
-| Change | Effect |
-|---|---|
-| G2P workspace pre-alloc | Graphs never invalidated, 89.7 MB upfront |
-| WMMA TF32 FFN | No improvement — reverted. Scalar GEMV already at 1.1ms |
-| SineGen save/restore | ~0.5-2.5 MB reclaimed per inference |
-| TTS profile | Identified im2col+SGEMM (31%) and LSTM launch overhead (13%) as top targets |
-
-### Files changed
-
-| File | Changes |
-|---|---|
-| `src/g2p.h` | Pre-allocate workspace at max_pos_ in `load_from_file_()`, replace grow-and-invalidate with bounds check in `infer()` |
-| `src/tts.cpp` | SineGen save/restore around temporaries, updated `compute_decode_bytes()` to overlap SineGen temps with generator pool |
-| `Makefile` | Added `-arch=native` to NVFLAGS |
-
----
-
-## The DATE regression saga (2026-03-11 to 2026-03-12)
-
-This is the full story of the Wv8 DATE regression, three failed attempts to fix it, and what we learned.
-
-### The regression
-
-Wv8 DATE accuracy collapsed from 99.3% (Wv7) to 8.8%. Everything else improved — PLAIN went from 83.3% to 96.4%. The problem was specific to dates.
-
-### Root cause
-
-Commit ef833a9 ("Unified preprocess_text()") changed the training data loader from `normalize_text()` (unicode→ASCII only) to `preprocess_text()` (expands numbers, dates, money to words). This created a mismatch between what the model sees and what phoneme targets expect:
-
-```
-Data loader input:   preprocess_text("in 1996")  →  "in one thousand nine hundred ninety six"
-Phoneme target:      Misaki("in 1996")            →  phonemes for "nineteen ninety six"
-```
-
-The phoneme targets in Dv4 (`g2p_train_v4.tsv`, 745K lines) were generated by Misaki on **raw** text. Misaki handles "1996" as a year in context. But `preprocess_text()` has no context and always expands as a cardinal number. This affected ~87K training pairs (~12%). The 8-layer model memorized the conflicting signal, producing garbled output for any number-adjacent text.
-
-### Why we can't just remove preprocess_text()
-
-The CTC model uses upsample factor 3: each input character gets 3 output time slots. Input "1996" = 4 chars → 12 slots. The phoneme sequence for "nineteen ninety six" needs ~20 slots. The model physically cannot produce enough phonemes for unexpanded numbers. This was confirmed empirically. `preprocess_text()` must stay.
-
-### Fix attempt 1: Wv9 — regenerate all phoneme targets (FAILED)
-
-**Idea**: Run Misaki on `preprocess_text(raw)` output instead of raw text, so input and targets agree.
-
-**What went wrong**: Misaki produces ❓ for proper nouns (Clarkson, Vedder, Macklin, etc.). The original data pipeline (generate_data_parallel.py line 219) filtered ❓ lines out. We didn't know this. We re-ran Misaki on all 745K lines. **315K lines (42%) came back with ❓.** We trained Wv9 on this corrupted data without checking.
-
-**Result**: PLAIN collapsed from 96.4% → 47.8%. Grand total 53.1%. Completely useless model. Wasted 2+ hours of GPU time.
-
-**What we should have done**: `grep -c '❓' data.tsv` before training. Would have taken 1 second.
-
-### Fix attempt 2: Wv10 — selective re-phonemization (FAILED)
-
-**Idea**: Only re-phonemize lines where `preprocess_text()` actually changes the text (~33% of lines). Keep original phonemes for unchanged lines. Drop lines where Misaki produces ❓.
-
-**Script**: `scripts/g2p/rephonemize.py` — three cases:
-- Text unchanged → keep original phonemes (497K lines kept)
-- Text changed, Misaki succeeds → use new phonemes (116K lines re-phonemized)
-- Text changed, Misaki produces ❓ → drop line (130K lines dropped)
-
-**Result (Dv5)**: 614K lines, 0 ❓ tokens. Clean data. But trained model scored:
-- PLAIN: 72.8% (was 96.4% in Wv8) — **massive regression**
-- DATE: 4.7% (was 8.8%) — **even worse**
-- CARDINAL: 100% (was 92.4%) — improved
-- MONEY: 100% (was 97.2%) — improved
-- Grand total: 72.5% (was 92.7%)
-
-**Why it failed**: Two reasons:
-1. Lost 130K training lines (18% of data) — those lines had useful general G2P examples
-2. PLAIN eval uses Dv3 phonemes as reference, but Wv10 was trained on Dv5 phonemes. For the 116K re-phonemized lines, the targets diverge from the eval reference.
-
-### Fix attempt 3: "Just fix preprocess_text()" (NOT ATTEMPTED — dead end identified)
-
-**Idea**: Fix `preprocess_text()` to expand standalone years as years (not cardinals), e.g. "1996" → "nineteen ninety six". No retraining needed — just a preprocessing change.
-
-**Why it's a dead end**: We tested preprocess_text() against the DATE gold data. It already produces correct output for 144/148 cases (97%). The 4 failures are decade patterns ("1990s" → "the nineteen nineties"). Fixing those 4 would only help 2.7% of DATE cases.
-
-The real problem: the Wv8 model produces **garbled phonemes** for the expanded text:
-
-```
-"first"     → model: fˈɜɹsθ      expected: fˈɜɹst     (θ instead of t)
-"thousand"  → model: ʤ θˈWzᵊnd    expected: θˈWzᵊnd     (extra ʤ inserted)
-"fourth"    → model: fˈɔv θˈ      expected: fˈɔɹθ       (completely wrong)
-"seventeen" → model: sˌɛv ntˈin   expected: sˌɛvəntˈin  (missing ən)
-```
-
-The preprocessing is correct. The model is broken for these inputs because it was trained on mismatched data. Fixing preprocessing doesn't fix the model.
-
-### Current status
-
-Wv8 remains the best model (96.4% PLAIN, 92.7% grand total) with the DATE regression unresolved (8.8%). All three fix attempts failed. The core tension:
-
-1. `preprocess_text()` must expand numbers (CTC constraint)
-2. Expanding numbers changes the text the model sees
-3. Phoneme targets were generated from raw text (before expansion)
-4. Re-generating targets with Misaki loses 130K lines (Misaki can't handle proper nouns)
-5. The model trained on mismatched data produces garbled phonemes for expanded numbers
-
-Resolving this likely requires either:
-- A better phonemizer that doesn't fail on proper nouns (so we can re-generate all targets)
-- Fixing preprocess_text() year handling AND retraining on aligned data
-- A completely different approach to number handling in the G2P pipeline
-
-### What we can't reproduce
-
-We don't know exactly what data Wv8 was trained on. The blog said "same 750K dataset" but no file combination matches 750K. Batch count analysis suggests ~940K total pairs, which matches either:
-- Candidate A: `data/g2p_train_v3.tsv` + `augment_v3:5` + `llm_clean:5` = 937K
-- Candidate B: `data/g2p_train_v4.tsv` + `augment_v5:5` = 946K
-
-Both candidate configurations are recorded in `data/g2p_v8/data_manifest.json`. We added `train_setup.json` logging (commit 3ebe9e8) to prevent this from happening again.
-
-### Lessons
-
-See `LESSONS.md` for detailed rules. The short version:
-1. Log exact data files for every training run (now automated via train_setup.json)
-2. `grep -c '❓' data.tsv` before every training run
-3. Any change to data loading is a data change — diff check before committing
-4. Don't regenerate data without testing on 100 lines first
-5. When investigating a regression, trace examples through the FULL pipeline before proposing fixes
-6. Never say "double-checked" without inspecting actual output data
-
----
-
-## V8 Evaluation + HTTP Server Mode (2026-03-11)
-
-### G2P V8: 8 layers, full evaluation with Strict/Lenient metrics
-
-V8 doubles the transformer depth from 4 to 8 layers (all else unchanged: d=256, 4 heads, ff=1024, RoPE, RMSNorm, no conv/QK-norm). Trained 50 epochs on the same 750K dataset.
-
-Full evaluation on 5,000 plain text + 1,484 normalization gold test cases:
-
-| Category | N | Strict% | Lenient% | PER |
-|----------|---|---------|----------|-----|
-| **PLAIN** | **5,000** | **96.4%** | **98.2%** | **0.08%** |
-| | | | | |
-| ABBREVIATION | 60 | 83.3% | 83.3% | 1.62% |
-| ADDRESS | 100 | 0.0% | 75.0% | 5.34% |
-| CARDINAL | 131 | 97.7% | 98.5% | 0.19% |
-| CONNECTOR | 8 | 75.0% | 87.5% | 4.66% |
-| DATE | 148 | 8.8% | 8.8% | 26.88% |
-| DECIMAL | 6 | 66.7% | 66.7% | 7.03% |
-| FRACTION | 63 | 100.0% | 100.0% | 0.00% |
-| LETTERS | 20 | 65.0% | 65.0% | 11.14% |
-| MEASURE | 216 | 97.2% | 97.2% | 0.17% |
-| MIXED | 7 | 0.0% | 14.3% | 14.03% |
-| MONEY | 144 | 100.0% | 100.0% | 0.00% |
-| ORDINAL | 56 | 100.0% | 100.0% | 0.00% |
-| RANGE | 17 | 76.5% | 76.5% | 5.89% |
-| ROMAN | 141 | 100.0% | 100.0% | 0.00% |
-| SCORE | 16 | 68.8% | 68.8% | 2.61% |
-| SYMBOL | 17 | 35.3% | 35.3% | 16.50% |
-| TELEPHONE | 100 | 100.0% | 100.0% | 0.00% |
-| TIME | 234 | 99.6% | 99.6% | 0.03% |
-| **NORM TOTAL** | **1,484** | **80.3%** | **85.5%** | **3.71%** |
-| **GRAND TOTAL** | **6,484** | **92.7%** | **95.3%** | **0.91%** |
-
-### V7 → V8 comparison
-
-| Metric | V7 (4 layers) | V8 (8 layers) |
-|--------|---------------|---------------|
-| Plain text strict | 83.3% | **96.4%** (+13.1) |
-| Plain text PER | 0.49% | **0.08%** |
-| Norm strict | **84.4%** | 80.3% (-4.1) |
-| Norm lenient | — | **85.5%** |
-| Grand total strict | 83.6% | **92.7%** (+9.1) |
-
-Doubling depth dramatically improved plain text (96.4% exact, 0.08% PER — the model gets >99.9% of phoneme characters right). Five normalization classes hit 100% (MONEY, TELEPHONE, ORDINAL, ROMAN, FRACTION). But DATE collapsed to 8.8% — caused by a training data mismatch where `preprocess_text()` expands years as cardinals ("one thousand nine hundred ninety six") but phoneme targets were generated by Misaki from raw text ("nineteen ninety six"). See the section above for full analysis. SYMBOL regressed (64.7% → 35.3%) — the model is doubling "percent" in outputs like "fifteen percent percent".
-
-### HTTP server mode
-
-Added `--serve [port]` to `rokoko_v2`. Loads TTS weights + G2P model once, pre-allocates arena (512MB) + workspace (256MB), and serves synthesis over HTTP with mutex-serialized GPU access. Uses cpp-httplib (header-only).
-
-- `GET /health` → `{"status":"ok"}`
-- `POST /synthesize` → JSON `{"text":"...","voice":"af_heart"}` → WAV bytes
-
-Eliminates ~230ms init overhead per request. Second request onwards: ~20ms for short text (vs 250ms+ cold start).
-
-### Files changed
-
-| File | Changes |
-|------|---------|
-| `src/rokoko_v2.cu` | `--serve [port]` mode, `TtsPipeline` struct, pre-allocated arena |
-| `src/server.h` | New: HTTP server (header-only, templated) |
-| `src/cpp-httplib/httplib.h` | New: cpp-httplib v0.18.7 |
-| `src/rokoko_cuda.cpp` | `write_wav_to_()` made non-static |
-| `src/rokoko.h` | Added `write_wav_to_()` declaration |
-| `Makefile` | Updated rokoko_v2 deps |
-
----
-
-## Fix G2P eval methodology + NaN guard (2026-03-11)
-
-### Lenient eval for phoneme comparison
-
-The eval script (`eval_full.py`) was comparing model output against Misaki reference character-by-character, penalizing differences in stress marks (ˈ vs ˌ), schwa variants (ᵊ vs ə), and punctuation. This is eval noise, not real errors — e.g., ADDRESS showed 0% exact match when the pronunciations were actually ~75% correct.
-
-Added `normalize_phonemes()` that strips stress marks, normalizes schwa variants, and removes punctuation before comparison. The report now shows **both Strict% and Lenient%** columns side by side (standard G2P eval practice per CMU Sphinx, Reichel & Pfitzinger 2008):
-
-```
-Category              N   Strict%  Lenient%    PER
-----------------------------------------------------
-PLAIN              5000    96.4%     98.2%   0.08%
-----------------------------------------------------
-ADDRESS             100     0.0%     75.0%   5.34%
-DATE                148     8.8%      8.8%  26.88%
-```
-
-The lenient metric lets us distinguish "real errors" (wrong phonemes) from "style differences" (stress placement, schwa reduction) that don't affect intelligibility.
-
-### NaN guard in training
-
-Added a NaN/Inf check after loss computation in `train.py`. When a bad batch produces NaN loss, the training loop now skips it (zeroes gradients, updates the AMP scaler to reduce scale) instead of corrupting all model weights. This prevents training collapse from rare degenerate batches.
-
-### Files changed
-
-| File | Changes |
-|------|---------|
-| `scripts/g2p/eval_full.py` | Added `normalize_phonemes()`, dual Strict/Lenient columns in report and JSON output |
-| `scripts/g2p/train.py` | Added NaN/Inf loss guard before optimizer step |
-
----
-
-## Day 12: rokoko_v2 + CUDA G2P optimization (2024-03-11)
-
-### rokoko_v2: Neural G2P + TTS in one binary
-
-Created `rokoko_v2` — a new binary that replaces the 3000-line dictionary phonemizer with the neural G2P model. The pipeline is dead simple: text → preprocess → G2P forward pass → tokenize → TTS infer → WAV.
-
-Data files reduced from 6+ (gold dict, silver dict, POS tagger, espeak fallback, G2P model, CMU extra) to just 2 (weights.bin + g2p_v8_model.bin).
-
-The key trick was copying only the VOCAB table (90 entries) and `to_tokens()` function (~15 lines) from phonemize.cpp, avoiding linking the full phonemizer. The `.cu` file is compiled by nvcc (for G2P CUDA kernels), while `rokoko_cuda.cpp` is compiled by g++ (for AVX2 headers in phonemize.h), then linked together.
-
-### CUDA G2P: 2.24x speedup (now 1.55x faster than torch.compile)
-
-Profiled the CUDA G2P inference and found the bottleneck: **massive per-operation overhead from cublasLt descriptors and per-head attention loops**.
-
-The original code had ~200 GPU operations per inference (8 layers × 25 ops/layer):
-- 13 cublasLt calls per layer, each creating/destroying 4 descriptors (matmul desc + 3 matrix layouts) = **52 descriptor API calls per layer**
-- 4 separate per-head GEMMs for attention scores + 4 for value weighted sums = 8 tiny GEMMs on [64×T] matrices
-- Separate scale kernel and per-head softmax launches
-
-**Optimizations applied:**
-
-| Change | Ops eliminated per layer |
-|--------|------------------------|
-| cublasSgemm instead of cublasLt | -52 descriptor create/destroy API calls |
-| cublasSgemmStridedBatched for attention | 8 GEMM calls → 2 batched |
-| Scale folded into GEMM alpha | -1 scale kernel |
-| Batched softmax across heads | 4 launches → 1 |
-| Fused residual add via beta=1 | -2 add kernels |
-
-**Challenge**: The attention matrices in the QKV buffer have a non-trivial strided layout. QKV is column-major [3d, T] where each head h occupies rows [h*dk, (h+1)*dk). The stride between heads is just `dk` (=64), which maps perfectly to cublasSgemmStridedBatched's strideA/strideB. The output buffer `attn_out[d, T]` also has stride `dk` between heads. The critical insight was computing K^T*Q (not Q^T*K) so softmax operates on contiguous rows — this layout is preserved naturally in the batched version.
-
-**Challenge**: Replacing cublasLt loses the EPILOGUE_BIAS fusion (bias add inside the GEMM). Solution: a simple `g2p_bias_kernel` that adds bias to each column of a column-major matrix — one block per column, cheap to launch.
-
-**Results:**
-
-| Implementation | µs/word | Speedup vs torch.compile |
-|---------------|---------|--------------------------|
-| PyTorch CUDA (eager) | 2078 | 0.47x |
-| **torch.compile** | **980** | **1.0x** |
-| C++ CUDA (old, cublasLt) | 1414 | 0.69x |
-| **C++ CUDA (optimized)** | **632** | **1.55x** |
-
-### Files changed
-
-| File | Changes |
-|------|---------|
-| `src/rokoko_v2.cu` | New: neural G2P + TTS pipeline in one binary |
-| `src/g2p_model_cuda.h` | Replaced cublasLt with cublasSgemm, batched attention, fused residuals |
-| `Makefile` | Added rokoko_v2 build target |
-
----
-
-## 2026-03-10: Text Normalization — C++ Port of preprocess_text()
-
-### The problem
-
-The G2P model was trained on text preprocessed by Python's `preprocess_text()` — a 5-stage pipeline that expands money ($12.50 → "twelve dollars and fifty cents"), dates (1/15/2024 → "January fifteenth, twenty twenty four"), numbers (1234 → "one thousand two hundred thirty four"), and folds Unicode to ASCII (café → cafe). The C++ test binaries (`test_g2p`, `test_g2p_cuda`) were feeding raw text directly, causing ~203/1000 mismatches vs Python on inputs containing numbers, dates, and currency.
-
-This is separate from the main phonemizer (`phonemize.cpp`), which has its own number/currency pipeline that converts directly to phonemes. `preprocess_text()` is only needed for standalone G2P inference and the three-way verification script.
-
-### The implementation
-
-Single-header C++17 in `src/text_normalize.h` (~300 lines). Four stages matching Python exactly:
-
-1. **Money expansion** — hand-rolled UTF-8 scanner for $€£¥, avoids regex for multi-byte currency symbols. Parses `\d[\d,]*(\.\d+)?` amounts, generates "twelve dollars and fifty cents" style output with full currency table (dollars/cents, euros/cents, pounds/pence, yen).
-
-2. **Date expansion** — three `std::regex` patterns (US `M/D/YYYY`, ISO `YYYY-MM-DD`, textual `Month DD, YYYY`). Day ordinals ("first"..."thirty first"), year-to-words ("twenty twenty four", "nineteen oh five").
-
-3. **Number expansion** — hand-rolled digit scanner with letter-adjacency check. Skips numbers attached to letters (70s, 3G, MP3, 5kg). Range 0–999,999,999.
-
-4. **Unicode → ASCII** — UTF-8 codepoint decoder + lookup tables covering Latin-1 Supplement (U+00A0–U+00FF, 96 entries), Latin Extended-A (U+0100–U+017F, 128 entries), and common punctuation (curly quotes, em/en dash, ellipsis, euro sign, trademark). Strips anything outside printable ASCII (32–126).
-
-### Challenges and solutions
-
-**UTF-8 currency symbols in regex**: The Python regex `([$€£¥])\s*(\d[\d,]*)` works because Python's regex engine is Unicode-aware. C++ `std::regex` operates on bytes, so multi-byte UTF-8 characters in character classes would fail. Solution: hand-rolled byte-level scanner that checks for the exact UTF-8 byte sequences of each currency symbol (e.g., € = `0xE2 0x82 0xAC`).
-
-**Letter adjacency for number expansion**: Python's `str.isalpha()` returns True for accented Unicode letters (é, ñ), but C++ `isalpha()` only handles ASCII. If an accented letter preceded a number, C++ would expand it while Python wouldn't. Solution: treat any byte ≥ 0x80 as "alpha" for the adjacency check — valid since any non-ASCII byte in UTF-8 is part of a multi-byte character, which is almost always a letter in practice.
-
-**NFC normalization**: Python does `unicodedata.normalize("NFC", text)` before `unidecode()`. Full NFC in C++ is complex (combining character composition). In practice, input text is already NFC, and the unidecode table handles the same characters either way — a decomposed sequence (base letter + combining mark) would keep the ASCII base letter and strip the combining mark, giving the same result as NFC→unidecode. Skipped NFC entirely.
-
-**unidecode coverage**: The Python `unidecode` library covers the entire Unicode range. Rather than porting its full 70KB dataset, we cover only the codepoints that actually appear in the training data: Latin-1 Supplement (accented letters, common symbols), Latin Extended-A (Eastern European characters), and a handful of punctuation marks. Unknown codepoints are simply stripped (same as unidecode returning empty for exotic scripts).
-
-### Verification
-
-Tested against Python on the full training dataset:
-- **708,968 samples**: 0 differences (exact byte-for-byte match)
-- **193 samples with actual changes** (numbers, dates, money, Unicode): all match
-- **Targeted edge cases**: $0.50, ¥5000, café, 2024-03-10, MP3 — all match
-
-### Files changed
-
-| File | Changes |
-|------|---------|
-| `src/text_normalize.h` | New: complete preprocess_text() port (~300 lines) |
-| `src/test_preprocess.cpp` | New: standalone preprocessing test binary |
-| `src/test_g2p.cpp` | Added `#include "text_normalize.h"`, preprocess before infer |
-| `src/test_g2p_cuda.cu` | Same |
-| `Makefile` | Added `test_preprocess` target, updated deps for test_g2p/test_g2p_cuda |
-
----
-
-## 2026-03-10: V7 — Full Evaluation (Plain Text + Normalization)
-
-### What changed in V7
-
-Added targeted training data for the zero-example classes identified in the V5+ error analysis:
-- **DECIMAL**: 821 pairs ("3.14" → "three point one four")
-- **CONNECTOR**: 137 pairs ("w/", "w/o", "24/7", "4x4")
-- **SYMBOL**: 389 pairs (feet/inches, #, @, +, degree)
-- **Dollar singular**: 175 pairs ($1.xx → "one dollar and...")
-- **Currencies**: Expanded euro coverage to match dollar density, added ¥, CHF, ₹, and named currencies (yen, yuan, won, peso, ruble, krona, etc.)
-
-Total augmentation: 41,312 pairs (up from 35,306), oversampled 5x. Training: 50 epochs on 967K total pairs.
-
-Also added `best_exact.pt` checkpoint saving — the best val_loss checkpoint is dominated by plain text and doesn't optimize for normalization accuracy. V6 showed this clearly: best val_loss (epoch 26) = 74.4% on gold tests, while epoch 42 had 82.2% exact match on validation.
-
-### Full evaluation: plain text + all normalization classes
-
-Built `eval_full.py` to test both plain text pronunciation (5,000 samples from the val split of g2p_train_v3.tsv) and normalization (1,484 gold test cases) in one run. This is the first time we measured plain text accuracy alongside normalization.
-
-| Category | N | Exact% | PER |
-|----------|---|--------|-----|
-| **PLAIN** | **5,000** | **83.3%** | **0.49%** |
-| | | | |
-| TIME | 234 | 100.0% | 0.00% |
-| DATE | 148 | 99.3% | 0.06% |
-| FRACTION | 63 | 93.7% | 0.41% |
-| MEASURE | 216 | 91.2% | 0.41% |
-| ROMAN | 141 | 90.1% | 0.84% |
-| CARDINAL | 131 | 86.3% | 1.38% |
-| ORDINAL | 56 | 85.7% | 0.73% |
-| DECIMAL | 6 | 83.3% | 1.60% |
-| ABBREVIATION | 60 | 73.3% | 2.86% |
-| ADDRESS | 100 | 70.0% | 2.96% |
-| MONEY | 144 | 68.8% | 3.30% |
-| TELEPHONE | 100 | 66.0% | 2.27% |
-| RANGE | 17 | 64.7% | 3.15% |
-| SYMBOL | 17 | 64.7% | 1.35% |
-| CONNECTOR | 8 | 62.5% | 6.66% |
-| SCORE | 16 | 50.0% | 8.96% |
-| LETTERS | 20 | 35.0% | 9.83% |
-| MIXED | 7 | 14.3% | 14.18% |
-| **NORM TOTAL** | **1,484** | **84.4%** | **1.49%** |
-| **GRAND TOTAL** | **6,484** | **83.6%** | **0.72%** |
-
-### Normalization: targeted augmentation worked but caused regressions
-
-| Class | V5+ | V7 | Delta |
-|-------|------|------|-------|
-| **DECIMAL** | 16.7% | **83.3%** | **+66.7** |
-| **CONNECTOR** | 12.5% | **62.5%** | **+50.0** |
-| **SYMBOL** | 35.3% | **64.7%** | **+29.4** |
-| **RANGE** | 47.1% | **64.7%** | **+17.6** |
-| SCORE | 75.0% | 50.0% | **-25.0** |
-| ADDRESS | 84.0% | 70.0% | **-14.0** |
-| ROMAN | 100.0% | 90.1% | **-9.9** |
-
-Gains in small classes (31 cases gained) offset by losses in larger ones (28 cases lost). Classic distribution shift / catastrophic forgetting from adding new augmentation data.
-
-### Plain text: 83.3% exact, 0.49% PER
-
-The 0.49% PER means the model gets >99.5% of phoneme characters right on plain English text. The 83.3% exact match is lower than V3 baseline's 87.8% — that's the cost of the normalization augmentation (the model traded some plain text precision for normalization ability).
-
-Typical plain text errors:
-- **Long sequences with multiple numbers**: ISBNs, "617 Dam Busters Squadron", dates + numbers in same sentence
-- **CTC stuttering on 4-digit cardinals**: "1234" sometimes garbles ("wˈθn θˈnd" instead of "wˈʌn θˈWzᵊnd")
-- **Wikipedia formatting artifacts**: Georgian characters, technical identifiers like "kfreebsd-i386"
-
-### Checkpoint selection confirmed critical
-
-The val_loss checkpoint (best.pt, epoch 33) scored 79.0% on normalization — 5.4 points worse than best_exact (epoch 42, 84.4%). The `best_exact.pt` addition was essential.
-
-### Where this leaves us
-
-The model does raw text → phonemes end-to-end at 83.6% exact / 0.72% PER across all categories. For context, the current C++ pipeline (`phonemize.cpp`, 3,051 lines) uses a 7-stage fallback chain: dictionary lookups → POS disambiguation → morphological stemming → number expansion → CMU/eSpeak fallback → neural G2P → letter spelling. It loads 6 data files and handles dozens of edge cases.
-
-The neural model replaces all of that with a single forward pass, but at 83.6% exact match it's not yet reliable enough to be a drop-in replacement — dictionary lookup is ~100% precise for known words. The realistic deployment path is hybrid: neural text normalization (expanding numbers/dates/money to words) feeding into the existing dictionary pipeline for word pronunciation.
-
-### The journey so far
-
-| Version | Plain | Norm | What changed |
-|---------|-------|------|-------------|
-| V3 | 87.8% | 10.3% | Wikipedia/LibriTTS only |
-| V4 | — | 42.0% | +8.7K augmentation |
-| V4b | — | 56.9% | 5× oversampling |
-| V5 | — | 76.1% | +LLM data, label smoothing |
-| V5+ | — | 84.6% | +rule-based date preprocessing |
-| **V7** | **83.3%** | **84.4%** | +DECIMAL/CONNECTOR/SYMBOL/currencies |
-
----
-
-## 2026-03-10: V5+ Error Analysis — Exact Match is Misleading
-
-### The Scores Look Awful. Are They?
-
-After reaching 84.6% overall exact match, the remaining weak classes looked terrible:
-
-| Class | Exact% | N | Looks like... |
-|-------|--------|---|---------------|
-| CONNECTOR | 12.5% | 8 | catastrophic |
-| DECIMAL | 16.7% | 6 | catastrophic |
-| LETTERS | 35.0% | 20 | bad |
-| SYMBOL | 35.3% | 17 | bad |
-| RANGE | 47.1% | 17 | mediocre |
-| MONEY | 63.2% | 144 | mediocre |
-| TELEPHONE | 65.0% | 100 | mediocre |
-
-Deep dive into actual error patterns reveals **three distinct failure modes**:
-
-### 1. "Almost correct" — functionally working (MONEY, TELEPHONE, RANGE)
-
-PER distribution analysis showed most "errors" are 1-2 character differences:
-
-| Class | Exact | PER<5% | Avg PER | Typical Error |
-|-------|-------|--------|---------|---------------|
-| MONEY | 63.2% | **84.7%** | 3.1% | "dollarˈ**z**" vs "dollar" (singular/plural) |
-| TELEPHONE | 65% | **83%** | 2.1% | Missing space between digit phonemes |
-| RANGE | 47.1% | **76.5%** | 3.0% | Dropped stress mark on one syllable |
-
-These classes work. A TTS engine would produce identical audio for the model's output vs the expected. The MONEY error is systematic: the model defaults to "dollars" (plural) even for $1.xx amounts, because plural examples vastly outnumber singular in training data.
-
-### 2. Test methodology issue (LETTERS)
-
-Every LETTERS "error" is a spacing difference:
-```
-Expected (Misaki on "F B I"):  ˈɛf bˈi ˌI    ← spaces between letters
-Model (on "FBI"):              ˌɛfbˌiˈI      ← same phonemes, no spaces
-```
-
-The eval pipeline phonemizes the spoken form "F B I" (with spaces between letters) → naturally gets spaces in output. But the model processes "FBI" as one token → no spaces. Both produce identical TTS audio.
-
-### 3. Zero training data (DECIMAL, CONNECTOR, SYMBOL)
-
-| Class | Training examples | Root cause |
-|-------|-------------------|------------|
-| DECIMAL | **0** "point" patterns | "3.14" → confused with dates/money |
-| CONNECTOR | **0** "w/", "w/o", "24/7" | Never seen these patterns |
-| SYMBOL | partial (@ works, 6'2" doesn't) | Missing feet/inches, +, degree |
-
-You can't learn from zero examples regardless of model size. A 100M parameter model would fail just as badly — this is pure data coverage.
-
-### Would a bigger model help?
-
-**No.** The 4.45M param model already achieves:
-- TIME: 99.1% (234 cases)
-- DATE: 100% (with preprocessing)
-- ROMAN: 100%
-- FRACTION: 93.7%
-- MEASURE: 92.1%
-
-The model has plenty of capacity. The remaining errors come from missing training data (can't learn from nothing) and CTC alignment precision (1-2 phoneme boundary artifacts that more parameters won't fix). The ROI is in data, not architecture.
-
-### Fix plan
-
-1. Add DECIMAL/CONNECTOR augmentation to `augment_data.py` (zero→hundreds of examples)
-2. Fix LETTERS test evaluation (strip spaces before comparison)
-3. Oversample "dollar" singular for MONEY
-4. Retrain V6
-
----
-
-## 2026-03-09: G2P V4 — Neural Text Normalization
-
-### The Problem
-
-The G2P V3 model (4.45M param Conformer CTC) was trained only on Wikipedia/LibriTTS text. It handles plain English words well (87.6% exact match on general text) but completely fails on semiotic classes: times ("3:45 PM"), dates ("March 9, 2026"), money ("$12.50"), telephone numbers, measurements, Roman numerals, etc.
-
-Evaluated on 1,484 gold test cases across 18 normalization classes:
-- **V3 model: 10.3% exact match**
-- **Misaki baseline: 23.7% exact match**
-- TIME, TELEPHONE, ROMAN, RANGE, SCORE, ADDRESS: 0% for both
-
-### Solution: Augmentation + Label Smoothing
-
-**Scaled augmentation data from 8.7K to 31.8K pairs** covering all 13 semiotic classes programmatically. Each critical class now has 3K-8K training examples with diverse sentence frames and value ranges. Key expansions:
-- DATE (1.5K → 7.8K): Added abbreviated months, dot-separated dates, month-day only
-- MONEY (1.5K → 5.1K): Dense dollar/cents, comma-formatted, pounds, euros
-- MEASURE (1K → 4.3K): Added 10+ new units (dB, cal, psi, rpm), decimals, percentages
-- TIME (1.6K → 3.6K): Multiple templates per time, am/pm variants, bare times
-- TELEPHONE (0.6K → 3.4K): Dot-separated format, 1-800 toll-free numbers
-
-**Fixed a critical bug in eval_normalization.py**: The `NeuralG2P` class used wrong checkpoint key names (`model_state_dict` instead of `model`, wrong constructor parameter names). It would have failed to load any model.
-
-**Added CTC label smoothing** to train.py: `loss = (1-α)*CTC + α*(-mean(log_probs))` with α=0.1. Prevents overconfident predictions and should help with normalization patterns where multiple outputs are plausible.
-
-### Training Config
-- Data: 745K pairs (713K V3 + 32K augmentation)
-- Dropout: 0.15 (up from 0.1), label smoothing: 0.1
-- Same architecture: 4.45M Conformer, RoPE + RMSNorm, no conv/QK-norm
-- Muon + AdamW, 50 epochs, max_tokens=115,632
-
-### V3 Baseline (for comparison)
-
-| Class | V3 | Misaki | N |
-|-------|-----|--------|---|
-| ORDINAL | 87.5% | 96.4% | 56 |
-| CARDINAL | 56.5% | 85.5% | 131 |
-| ABBREVIATION | 15.0% | 18.3% | 60 |
-| MEASURE | 3.2% | 0.0% | 216 |
-| DATE | 2.7% | 2.7% | 148 |
-| MONEY | 0.0% | 100.0% | 144 |
-| TIME | 0.0% | 0.0% | 234 |
-| TELEPHONE | 0.0% | 0.0% | 100 |
-| **OVERALL** | **10.3%** | **23.7%** | **1484** |
-
-### V4 Results (1x augmentation)
-
-First attempt with 32K augmentation mixed 1:1 into 713K training data.
-
-| Class | V3 | V4 | Misaki | N |
-|-------|-----|-----|--------|---|
-| TIME | 0.0% | **97.0%** | 0.0% | 234 |
-| ORDINAL | 87.5% | **92.9%** | 96.4% | 56 |
-| MEASURE | 3.2% | **72.7%** | 0.0% | 216 |
-| FRACTION | 1.6% | **76.2%** | 0.0% | 63 |
-| CARDINAL | 56.5% | 59.5% | 85.5% | 131 |
-| ABBREVIATION | 15.0% | **48.3%** | 18.3% | 60 |
-| TELEPHONE | 0.0% | **17.0%** | 0.0% | 100 |
-| DATE | 2.7% | 2.0% | 2.7% | 148 |
-| MONEY | 0.0% | 2.1% | **100.0%** | 144 |
-| ROMAN | 0.0% | 0.7% | 0.0% | 141 |
-| **OVERALL** | **10.3%** | **42.0%** | **23.7%** | **1484** |
-
-**Problem**: MONEY/DATE/ROMAN still terrible. CTC stuttering on $ sign, model ignoring Roman numerals (only 463 examples in 745K = 0.06%).
-
-**Diagnosis**: 32K augmentation was only 4.3% of total data — not enough signal for the model to learn rare patterns. Also missing bare formats (e.g. "1/1/2000" without sentence wrapper).
-
-### V4b Results (5x oversampled augmentation + bare formats)
-
-Added bare patterns (no sentence wrapper) for DATE, MONEY, TIME, TELEPHONE, ROMAN.
-Oversampled augmentation 5x: 713K + 5×35K = 890K total, augmentation at ~20%.
-
-| Class | V3 | V4 | V4b | Misaki | N |
-|-------|-----|-----|------|--------|---|
-| TIME | 0.0% | 97.0% | **98.3%** | 0.0% | 234 |
-| ORDINAL | 87.5% | 92.9% | **94.6%** | 96.4% | 56 |
-| MEASURE | 3.2% | 72.7% | **88.9%** | 0.0% | 216 |
-| FRACTION | 1.6% | 76.2% | **79.4%** | 0.0% | 63 |
-| CARDINAL | 56.5% | 59.5% | **77.9%** | 85.5% | 131 |
-| ABBREVIATION | 15.0% | 48.3% | **63.3%** | 18.3% | 60 |
-| ROMAN | 0.0% | 0.7% | **44.7%** | 0.0% | 141 |
-| MONEY | 0.0% | 2.1% | **34.7%** | **100.0%** | 144 |
-| TELEPHONE | 0.0% | 17.0% | **24.0%** | 0.0% | 100 |
-| RANGE | 0.0% | 11.8% | **23.5%** | 0.0% | 17 |
-| DATE | 2.7% | 2.0% | **12.8%** | 2.7% | 148 |
-| ADDRESS | 0.0% | 0.0% | **9.0%** | 0.0% | 100 |
-| SCORE | 0.0% | 6.2% | 6.2% | 0.0% | 16 |
-| SYMBOL | 5.9% | 0.0% | 5.9% | 76.5% | 17 |
-| LETTERS | 35.0% | 30.0% | 35.0% | 40.0% | 20 |
-| CONNECTOR | 12.5% | 0.0% | 12.5% | 62.5% | 8 |
-| DECIMAL | 0.0% | 0.0% | 0.0% | 0.0% | 6 |
-| MIXED | 0.0% | 0.0% | 0.0% | 0.0% | 7 |
-| **OVERALL** | **10.3%** | **42.0%** | **56.9%** | **23.7%** | **1484** |
-
-### V5+: Rule-Based Date Preprocessing (84.6% overall)
-
-After V5 training revealed that the CTC model fundamentally can't learn month-number→month-name lookup tables, added `preprocess_text()` to the inference pipeline. This function expands date patterns to fully spoken form *before* the neural model sees them:
-
-- `1/1/2000` → `January first, two thousand`
-- `2000-01-01` → `January first, two thousand`
-- `January 1, 2000` → `January first, two thousand` (day ordinal + year expansion)
-
-Implementation: ~60 lines in `train.py` with pure-Python ordinal and year-to-words functions (no num2words dependency). Handles years 1000-2099, days 1-31.
-
-Also fixed ADDRESS test data: spoken forms now include trailing period (raw text "She lives at 8080 Elm St." ends with period, so spoken form should too).
-
-| Class | V5 (before) | V5+ (after) | Delta |
-|-------|-------------|-------------|-------|
-| DATE | 14.9% | **100.0%** | +85.1 |
-| ADDRESS | 0.0% (strict) | **84.0%** | +84.0 |
-| **OVERALL** | **70.4%** | **84.6%** | **+14.2** |
-
-All other classes unchanged. The 84.6% overall exceeds the plan.md target of 80%.
-
-**Key insight**: A hybrid approach (rule-based preprocessing for structured patterns + neural model for everything else) is far more effective than trying to make the neural model learn lookup tables. The CTC model excels at sequence-to-sequence mappings with natural alignment (words → phonemes), but fails at arbitrary code lookups (month number → month name).
-
-### V5 Results (LLM augmentation + quality filtering)
-
-#### LLM data pipeline
-
-Built `augment_with_llm.py`: uses Qwen3.5-9B via llama.cpp `/completion` endpoint (NOT `/v1/chat/completions` — Qwen3.5's thinking mode consumes all tokens on reasoning otherwise).
-
-Pipeline: LLM generates diverse (written, spoken) pairs → quality filter (remove pairs with digits in spoken form, hallucinations) → Misaki phonemizes spoken forms.
-
-- Generated 16,404 raw pairs across 14 semiotic classes in ~55 minutes
-- After dedup: 9,662 unique pairs
-- After quality filtering (digits in spoken form, length mismatches): 9,502 clean pairs
-- 0 Misaki phonemization failures
-
-Also fixed a `to_roman()` bug in `augment_data.py` (early `return` inside `for` loop).
-
-#### Training data
-
-| Source | Pairs | Notes |
-|--------|-------|-------|
-| g2p_train_v3.tsv | 713,500 | Base Wikipedia/LibriTTS |
-| g2p_augment_v3.tsv × 5 | 176,530 | Programmatic augmentation (fixed to_roman) |
-| g2p_augment_llm_clean.tsv × 5 | 47,510 | LLM-generated diverse data |
-| **Total** | **937,540** | Augmentation at 23.9% of total |
-
-Training: 50 epochs, dropout=0.15, label_smoothing=0.1, Muon+AdamW. Best val loss at epoch 43.
-
-#### Results (V5+: with date preprocessing + fixed ADDRESS test data)
-
-| Class | V4b | V5+ | Misaki | N | Delta |
-|-------|------|------|--------|---|-------|
-| DATE | 12.8% | **100.0%** | 2.7% | 148 | +87.2 |
-| ROMAN | 44.7% | **100.0%** | 0.0% | 141 | +55.3 |
-| TIME | 98.3% | **99.1%** | 0.0% | 234 | +0.8 |
-| FRACTION | 79.4% | **93.7%** | 0.0% | 63 | +14.3 |
-| MEASURE | 88.9% | **92.1%** | 0.0% | 216 | +3.2 |
-| CARDINAL | 77.9% | **84.7%** | 85.5% | 131 | +6.8 |
-| ADDRESS | 9.0% | **84.0%** | 0.0% | 100 | +75.0 |
-| ORDINAL | 94.6% | 82.1% | 96.4% | 56 | -12.5 |
-| SCORE | 6.2% | **75.0%** | 0.0% | 16 | +68.8 |
-| ABBREVIATION | 63.3% | **71.7%** | 18.3% | 60 | +8.4 |
-| TELEPHONE | 24.0% | **65.0%** | 0.0% | 100 | +41.0 |
-| MONEY | 34.7% | **63.2%** | **100.0%** | 144 | +28.5 |
-| RANGE | 23.5% | **47.1%** | 0.0% | 17 | +23.6 |
-| SYMBOL | 5.9% | **35.3%** | 76.5% | 17 | +29.4 |
-| **OVERALL** | **56.9%** | **84.6%** | **23.7%** | **1484** | **+27.7** |
-
-Minor regression: ORDINAL dropped from 94.6% → 82.1%. May be due to competition with new augmentation data.
-
-#### Still failing: numeric dates → SOLVED by preprocessing
-
-The model produced **garbage** for numeric date formats: `12/25/2025` → gibberish phonemes. Textual dates (`December 25, 2025`) mostly worked. The CTC model can't learn the slash→month-name mapping — essentially a lookup table (1→January, 2→February... 12→December) — from training data alone.
-
-**Fix**: Added `preprocess_text()` to expand dates to fully spoken English before the neural model sees them. Result: **DATE 14.9% → 100%**, overall **70.4% → 84.6%**.
-
-#### Key insights
-
-1. **LLM augmentation works**: Adding 9.5K diverse LLM-generated pairs (on top of 35K programmatic) pushed overall from 56.9% → 76.1%.
-2. **Quality filtering matters**: 1.3% of LLM pairs had digits in spoken form. Filtering these prevented training on bad data.
-3. **Qwen3.5 thinking trap**: The chat completions endpoint wastes all tokens on internal reasoning. Must use raw `/completion` endpoint to bypass thinking mode.
-4. **to_roman bug impact**: The early-return bug meant Roman numerals > first matching value were wrong. Fixing this + LLM data → 100% ROMAN accuracy.
-5. **Hybrid approach wins**: Rule-based preprocessing for structured patterns (dates) + neural model for everything else is far more effective than pure neural. The CTC model excels at natural sequence-to-sequence mappings but fails at arbitrary code lookups.
-
-### Remaining weak spots
-
-1. **MONEY (63.2%)**: Still 37% error rate. Model sometimes stutters on $ sign.
-2. **ORDINAL regression (82.1%)**: Down from 94.6% in V4b. May need to oversample ordinals to compensate for augmentation competition.
-3. **TELEPHONE (65.0%)**: Digit-by-digit reading has some failure modes.
-4. **SYMBOL/CONNECTOR/LETTERS**: Small test sets but consistently weak. Need targeted augmentation or rule-based expansion.
-
-### Key technical insights
-
-1. **Oversampling is critical**: 5x augmentation improved overall from 42% → 57%. The model needs normalization patterns to be ~20% of training data, not 4%.
-2. **Bare formats matter**: Adding "1/1/2000" without sentence wrappers helped DATE jump from 2% → 13%.
-3. **CTC label smoothing**: At α=0.1, helped with generalization but wasn't the main driver of improvement.
-4. **Docker /dev/shm limit**: 64MB shm caused multi-worker dataloading to crash. Auto-detection fix: limit to 2 workers when shm < 512MB.
-5. **LLM data diversity**: Template-based augmentation creates repetitive patterns. LLM-generated sentences have natural variety in vocabulary, sentence structure, and context.
-
----
-
-## 2026-03-08: Embedding-Based Fitness for Teacher
-
-### The Problem
-
-The teacher's evolutionary search scored candidates by: synthesize audio → Wav2Vec2 → CTC argmax → phoneme strings → weighted edit distance. But CTC argmax collapses the rich 1024-dimensional transformer embeddings down to a single phoneme ID per timestep, then collapses repeats further. Two sequences that sound nearly identical can differ by a phoneme or two due to argmax boundary effects.
-
-### Solution: DTW on Wav2Vec2 Embeddings
-
-The Wav2Vec2 transformer already produces `[T, 1024]` embedding vectors (`d_final_ln`) that capture vowel quality, formant structure, and prosody — far richer than any discrete phoneme representation. We just needed to *stop throwing them away*.
-
-**Refactored `wav2vec2.cu`**: Extracted the forward pass (audio normalization → CNN → feature projection → positional conv → 24-layer transformer → final LayerNorm) into a shared `wav2vec2_forward()` helper returning `{d_final_ln, T, D}` as GPU pointers. Then:
-- `wav2vec2_extract_phonemes()` = forward + CTC head + argmax decode (unchanged behavior)
-- `wav2vec2_extract_embeddings()` = forward + D2H copy of `d_final_ln` (new)
-
-No code duplication — both functions call the same ~200 line forward pass.
-
-**DTW with cosine distance** (`embedding_dtw_distance()` in teacher.cpp): Standard Dynamic Time Warping handles the different sequence lengths between original recording and Kokoro synthesis (e.g., 50 vs 70 timesteps for the same word). Local cost is cosine distance: `1 - (a·b)/(|a|·|b|)`. Uses two-row DP (O(T) memory instead of O(T^2)). Normalized by path length for comparability across words.
-
-**Combined fitness**: `-(0.7 × dtw_dist + 0.3 × edit_dist)`. Embeddings dominate (capture fine acoustic detail) while edit distance acts as a regularizer (more robust across different speakers/voices).
-
-### Test Results
-
-Ran the same tests as before (`vieques`, `kubernetes`) with `--generations 15 --population 30`:
-
-| Word | Seed | Best candidate | Fitness | Early stop |
-|------|------|----------------|---------|------------|
-| vieques | biaki | biakæ | -0.367 | Gen 5 |
-| kubernetes | kjuːbɚniːdz | kjuːbɚnniːds | -0.201 | Gen 5 |
-
-Key observation: convergence is dramatically faster. Both tests early-stop at generation 5 (out of 15). The embedding DTW provides a much smoother fitness landscape than discrete phoneme edit distance — small phoneme changes produce proportional fitness changes instead of all-or-nothing phoneme mismatches. The top-3 candidates are extremely close in fitness (within 0.001), suggesting the search is finding a genuine optimum rather than random exploration.
-
-Tradeoff: the smoother landscape means faster convergence but potentially getting stuck in local optima sooner. The old edit-distance approach explored more because its fitness was noisier. Could increase patience if more exploration is needed.
-
-### Challenges
-
-The main design choice was *not* doing something more complex. We considered:
-- Averaging embeddings and comparing means (loses temporal structure)
-- Euclidean distance instead of cosine (sensitive to magnitude, not just direction)
-- Full O(T^2) DTW matrix (unnecessary — two-row DP works fine since we only need the final cost)
-- A learned metric (overkill for this use case)
-
-Memory is trivial: ~400 KB for 1-second embeddings, ~160 KB for the DTW working set, vs 1.2 GB model weights.
-
-### Files Changed
-
-| File | Change |
-|------|--------|
-| `src/wav2vec2.h` | Added `Wav2Vec2Embeddings` struct + `wav2vec2_extract_embeddings()` |
-| `src/wav2vec2.cu` | Extracted `wav2vec2_forward()` helper; new `wav2vec2_extract_embeddings()` |
-| `src/teacher.cpp` | Added `embedding_dtw_distance()`; combined fitness in eval loop |
-
----
-
-## 2026-03-08: Pronunciation-by-Example Teacher
-
-### Design
-
-Implemented a `./teacher` binary that lets users teach Kokoro custom pronunciations. The workflow: user records a word → Wav2Vec2 extracts seed phonemes → evolutionary search finds the phoneme sequence that makes Kokoro reproduce the original pronunciation → saves to user dictionary.
-
-### Synthesis API Refactoring (Phase 4)
-
-Moved `GpuArena` from `rokoko_cuda.cpp` to `rokoko.h` so it can be shared between binaries. Removed `static` from `rokoko_infer()`, `write_wav()`, and `precompute_weight_norms()`, adding declarations to `rokoko.h`. Guarded `main()` in `rokoko_cuda.cpp` with `#ifndef ROKOKO_NO_MAIN` so the teacher binary can link against it without symbol conflicts. Both `rokoko` and `teacher` compile cleanly from the same source files.
-
-### User Dictionary (Phase 6)
-
-Added JSON user dictionary support — highest priority in the lookup chain, checked before gold dict. Minimal JSON parser (~60 lines) handles flat `{"word": "phonemes"}` objects with UTF-8 escapes. Case variants (lowercase, capitalized) are auto-generated. The `load_user_dict()` call was added to `Phonemizer::load()` and also inserted into `lookup_with_pos()` (which has its own dictionary cascade independent of `lookup()`).
-
-Key learning: the phonemize pipeline has *two* independent lookup paths — `lookup()` (basic) and `lookup_with_pos()` (POS-aware, used when POS tagger is loaded). Both needed the user dict check.
-
-### Wav2Vec2 Custom CUDA (Phase 3)
-
-Wrote a complete CUDA implementation of `facebook/wav2vec2-lv-60-espeak-cv-ft`:
-
-- **CNN feature extractor**: 7 strided Conv1d layers. Reused `conv1d_general_f32` from existing `kernels.cu`.
-- **Group norm**: New CUDA kernel for the first CNN layer (512 groups). Shared-memory warp reduction for mean/variance.
-- **Positional conv**: Group Conv1d (groups=16, K=128) with weight norm. New kernel for group convolution.
-- **Transformer encoder**: 24 layers, 16 heads, d=1024. Reused `layer_norm_f32`, `softmax_f32`, `residual_layer_norm_f32` from existing kernels. Used `cublasSgemmStridedBatched` for multi-head attention.
-- **Exact GELU**: Wav2Vec2 uses exact GELU (`erf`-based), not the tanh approximation Kokoro uses. New kernel.
-- **CTC decode**: Simple CPU argmax → collapse repeats → remove blanks.
-
-The weight loading uses the same pattern as Kokoro: binary file with config header → contiguous GPU allocation → pointer arithmetic for tensor assignment.
-
-### Evolutionary Search (Phase 5)
-
-Population-based search with four mutation operators:
-1. **Substitute**: Replace phoneme with articulatorily nearby one (weighted by PanPhon distance matrix)
-2. **Delete**: Remove one phoneme (handles over-segmentation)
-3. **Insert**: Add phoneme near a neighbor (handles under-segmentation)
-4. **Swap**: Transpose adjacent phonemes
-
-Each candidate is: phonemize → tokenize → Kokoro synthesize → resample 24k→16k → Wav2Vec2 extract → weighted edit distance against original recording's phonemes.
-
-Crossover uses uniform selection from two parent sequences. Elitism preserves top-k and always keeps the original seed.
-
-### Build System (Phase 7)
-
-New Makefile targets:
-- `teacher`: Links teacher.cpp + rokoko_cuda.cpp (with `-DROKOKO_NO_MAIN`) + wav2vec2.o
-- `src/wav2vec2.o`: NVCC compile of wav2vec2.cu
-- `teacher-data`: Generates `data/phoneme_distances.bin` and `data/wav2vec2.bin`
-
-### New Files
-
-| File | Lines | Purpose |
-|------|-------|---------|
-| `src/teacher.cpp` | ~430 | CLI + evolutionary search |
-| `src/teacher.h` | ~25 | Config/candidate structs |
-| `src/wav2vec2.h` | ~140 | Wav2Vec2 weight struct + API |
-| `src/wav2vec2.cu` | ~430 | CUDA kernels + forward pass |
-| `src/wav_io.h` | ~220 | WAV reader + sinc resampler |
-| `src/phoneme_distance.h` | ~120 | Distance matrix + weighted Levenshtein |
-| `scripts/export/phoneme_distances.py` | ~170 | PanPhon → binary |
-| `scripts/export/wav2vec2_weights.py` | ~260 | HuggingFace → binary |
-
----
-
-## 2026-03-08: Embedded Voice Pack & README Overhaul
-
-### Embedded voice via objcopy
-
-The af_heart voice pack (510×256 float32 matrix, ~510KB) is now linked directly into the `rokoko` binary. The Makefile uses `objcopy` to convert `voices/af_heart.bin` into a `.o` with the data in `.rodata`, and the C++ code references it via linker symbols (`_binary_voices_af_heart_bin_start/end`). No external voice file needed at runtime.
-
-Moved voice packs from `data/voices/` to a top-level `voices/` directory so they're tracked in git (the `/data/` directory is gitignored for large generated files).
-
-### README rewrite
-
-The README was still describing the Python-first workflow (`kokoro_speak.py`, spacy setup, ONNX). Rewrote it to lead with the C++/CUDA pipeline:
-
-```
-make rokoko
-./rokoko --text "Hello world." -o output.wav
-```
-
-Python scripts are documented as reference/comparison tools, not the primary workflow. Added sections for data export and the standalone phonemizer.
-
----
-
-## 2026-03-07: G2P V3 — Data Expansion & Training Infrastructure
-
-### Data Pipeline
-
-Built a reproducible data pipeline for adding new text sources. All data is phonemized through Misaki only — no external G2P dictionaries.
-
-**Pipeline structure:**
-```
-data/sources/{source}/00_raw/        → untouched downloads
-data/sources/{source}/01_clean/      → cleaned text, 1 sentence/line
-data/sources/{source}/02_phonemized/ → Misaki TSV (text\tphonemes)
-```
-
-**New data sources added:**
-
-| Source | Raw utterances | Unique after dedup | Notes |
-|--------|---------------|-------------------|-------|
-| WikiText-103 | 576K | 575,719 | existing, cleaned |
-| LibriTTS train-clean-100 | 30,078 | 30,077 | audiobook prose, CC BY 4.0 |
-| LJ Speech | 13,005 | 3,242 | most overlapped with WikiText |
-| **Total** | | **609,038** | +5.8% over previous 576K |
-
-LibriTTS train-clean-360 (~200K+ more sentences) is available but not yet downloaded. Would bring total to ~800K+.
-
-**Quality verification on merged data (609K pairs):**
-- `@-@` artifacts: 0
-- `ætæt` phonemes: 0
-- Letter-spelling fallback: 0
-- Non-Latin script: 0
-- `❓` unknown markers: 0
-- NUL bytes: 0
-- Duplicate texts: 0
-
-Scripts: `scripts/data/download_libritts.py`, `scripts/data/download_ljspeech.py`, `scripts/data/merge_all.py`.
-
-### Length-Sorted Batching
-
-Added `LengthSortedSampler` to `train.py`. Instead of random batching (where a 10-char and 200-char sentence in the same batch wastes 95% on padding), it:
-
-1. Sorts all training examples by text length
-2. Batches adjacent (similar-length) sequences together
-3. Shuffles batch order each epoch (not within batches)
-
-Standard technique from fairseq/ESPnet. Should reduce wasted compute from padding significantly.
-
-### OOV Analysis
-
-Ran Misaki without eSpeak fallback on a 2K sample of the 576K WikiText data to measure how many words are truly out-of-vocabulary:
-
-- 55.8% of sentences had "OOV" — but almost all were contractions (`'ve`, `'re`) and abbreviations (`St.`, `Jr.`)
-- **Only 0.3% of sentences had truly unknown words** (apostrophe-prefixed names like `'Malley`)
-- Foreign names (Tchaikovsky, etc.) are in Misaki's lexicon, not OOV
-- Conclusion: OOV is a non-issue. No filtering needed.
-
----
-
-## 2026-03-07: G2P V3 — Data Quality Crisis
-
-### Ablation Study
-
-We ran a 6-config ablation (10K samples, 10 epochs) to test the V3 architecture changes:
-
-| Config | Params | Best Val Loss | PER | Exact |
-|--------|--------|--------------|-----|-------|
-| baseline (v2-style) | 4.75M | 0.1646 | 4.1% | 13.8% |
-| **RoPE only** | **4.49M** | **0.0873** | **1.6%** | **38.4%** |
-| RMSNorm only | 4.75M | 0.1599 | 3.9% | 14.6% |
-| QK-Norm only | 4.75M | 0.1686 | 4.1% | 13.6% |
-| Conv only | 5.58M | 0.1168 | 1.9% | 33.2% |
-| full V3 | 5.31M | 0.1116 | 1.7% | 37.2% |
-
-**RoPE** was the clear winner — 47% lower val loss, fewer params, no overfitting. Surprisingly, the full V3 config (everything on) was *worse* than RoPE alone, meaning the features interfere. ConvModule overfits after epoch 6. QK-Norm didn't help at all. RMSNorm is neutral (simpler than LayerNorm, worth keeping).
-
-**Decision:** Keep RoPE + RMSNorm, drop QK-Norm + Conv.
-
-### The Data Problem
-
-We started a full 200-epoch training run, then decided to audit the data while it trained. What we found was ugly.
-
-Our 742K training pairs come from WikiText-103 sentences phonemized by Misaki. Three contamination sources:
-
-**1. WikiText `@-@` artifacts (16% of data, ~120K lines)**
-
-WikiText-103 uses `@-@`, `@.@`, `@,@` as token-level separators. These aren't real text. Misaki phonemizes them literally:
-
-```
-"five @-@ star"  →  fˈIv ætæt stˈɑɹ   (should be: "five-star" → fˈIv stˈɑɹ)
-"1 @.@ 4 billion" →  wˈʌn ætæt fˈɔɹ bˈɪljən  (should be: "1.4 billion")
-```
-
-The nonsense phoneme `ætæt` was the **9th most common token** in the dataset (216K occurrences). The model was spending significant capacity learning a sound that doesn't exist.
-
-**2. Letter-spelling fallback (~2,748 lines)**
-
-When Misaki can't phonemize a character (CJK, Cyrillic), it spells it out:
-```
-"いつだって" → "ʤˈæpənizlˌɛTəɹ" repeated 5 times
-(literally "Japanese letter Japanese letter Japanese letter...")
-```
-
-**3. Non-Latin script (~1,900 lines)**
-
-Sentences with CJK/Cyrillic/Arabic/Devanagari where Misaki applies English rules to non-English text. Pure noise.
-
-### The Fix
-
-We killed the running training and wrote `scripts/clean_g2p_data.py`:
-
-1. Read all existing TSV data
-2. Clean text: `@-@` → `-`, `@.@` → `.`, `@,@` → `,`
-3. Filter: non-Latin script, letter-spelling fallback
-4. Re-phonemize only the ~109K changed sentences (18 workers, 42s)
-5. Keep ~468K clean sentences unchanged
-
-Also patched `scripts/generate_g2p_parallel.py` to clean text during extraction, so this can't happen again.
-
-**Result:** 742K → 576K pairs. Lost 22%, all garbage.
-
-```
-ætæt remaining: 0
-Letter-spelling remaining: 0
-Non-Latin remaining: 0
-```
-
-### Additional Data Sources
-
-While cleaning, we researched what other text-to-IPA data we're missing:
-
-- **LibriTTS** — 281K clean audiobook sentences designed for TTS. Phonemize with Misaki.
-- **Common Voice English** — 2,500+ hours of diverse spoken text transcripts.
-- **OLaPh** (2025) — 2.5M English G2P pairs from FineWeb corpus.
-
-The low-hanging fruit is phonemizing LibriTTS/Common Voice transcripts with our existing pipeline. Better source text than Wikipedia, no tokenization artifacts.
-
-### Restarting Training
-
-Restarted from scratch on clean 576K data: `--no-qk-norm --no-conv --muon --compile --epochs 200`.
-
----
-
 ## 2026-03-02: Phase 1 — PyTorch Reference Setup
 
 ### Context
@@ -2226,6 +1211,146 @@ For comparison, v1 took ~200 epochs to reach 0.4% PER / 80% exact on its smaller
 
 ---
 
+## 2026-03-07: G2P V3 — Data Quality Crisis
+
+### Ablation Study
+
+We ran a 6-config ablation (10K samples, 10 epochs) to test the V3 architecture changes:
+
+| Config | Params | Best Val Loss | PER | Exact |
+|--------|--------|--------------|-----|-------|
+| baseline (v2-style) | 4.75M | 0.1646 | 4.1% | 13.8% |
+| **RoPE only** | **4.49M** | **0.0873** | **1.6%** | **38.4%** |
+| RMSNorm only | 4.75M | 0.1599 | 3.9% | 14.6% |
+| QK-Norm only | 4.75M | 0.1686 | 4.1% | 13.6% |
+| Conv only | 5.58M | 0.1168 | 1.9% | 33.2% |
+| full V3 | 5.31M | 0.1116 | 1.7% | 37.2% |
+
+**RoPE** was the clear winner — 47% lower val loss, fewer params, no overfitting. Surprisingly, the full V3 config (everything on) was *worse* than RoPE alone, meaning the features interfere. ConvModule overfits after epoch 6. QK-Norm didn't help at all. RMSNorm is neutral (simpler than LayerNorm, worth keeping).
+
+**Decision:** Keep RoPE + RMSNorm, drop QK-Norm + Conv.
+
+### The Data Problem
+
+We started a full 200-epoch training run, then decided to audit the data while it trained. What we found was ugly.
+
+Our 742K training pairs come from WikiText-103 sentences phonemized by Misaki. Three contamination sources:
+
+**1. WikiText `@-@` artifacts (16% of data, ~120K lines)**
+
+WikiText-103 uses `@-@`, `@.@`, `@,@` as token-level separators. These aren't real text. Misaki phonemizes them literally:
+
+```
+"five @-@ star"  →  fˈIv ætæt stˈɑɹ   (should be: "five-star" → fˈIv stˈɑɹ)
+"1 @.@ 4 billion" →  wˈʌn ætæt fˈɔɹ bˈɪljən  (should be: "1.4 billion")
+```
+
+The nonsense phoneme `ætæt` was the **9th most common token** in the dataset (216K occurrences). The model was spending significant capacity learning a sound that doesn't exist.
+
+**2. Letter-spelling fallback (~2,748 lines)**
+
+When Misaki can't phonemize a character (CJK, Cyrillic), it spells it out:
+```
+"いつだって" → "ʤˈæpənizlˌɛTəɹ" repeated 5 times
+(literally "Japanese letter Japanese letter Japanese letter...")
+```
+
+**3. Non-Latin script (~1,900 lines)**
+
+Sentences with CJK/Cyrillic/Arabic/Devanagari where Misaki applies English rules to non-English text. Pure noise.
+
+### The Fix
+
+We killed the running training and wrote `scripts/clean_g2p_data.py`:
+
+1. Read all existing TSV data
+2. Clean text: `@-@` → `-`, `@.@` → `.`, `@,@` → `,`
+3. Filter: non-Latin script, letter-spelling fallback
+4. Re-phonemize only the ~109K changed sentences (18 workers, 42s)
+5. Keep ~468K clean sentences unchanged
+
+Also patched `scripts/generate_g2p_parallel.py` to clean text during extraction, so this can't happen again.
+
+**Result:** 742K → 576K pairs. Lost 22%, all garbage.
+
+```
+ætæt remaining: 0
+Letter-spelling remaining: 0
+Non-Latin remaining: 0
+```
+
+### Additional Data Sources
+
+While cleaning, we researched what other text-to-IPA data we're missing:
+
+- **LibriTTS** — 281K clean audiobook sentences designed for TTS. Phonemize with Misaki.
+- **Common Voice English** — 2,500+ hours of diverse spoken text transcripts.
+- **OLaPh** (2025) — 2.5M English G2P pairs from FineWeb corpus.
+
+The low-hanging fruit is phonemizing LibriTTS/Common Voice transcripts with our existing pipeline. Better source text than Wikipedia, no tokenization artifacts.
+
+### Restarting Training
+
+Restarted from scratch on clean 576K data: `--no-qk-norm --no-conv --muon --compile --epochs 200`.
+
+---
+
+## 2026-03-07: G2P V3 — Data Expansion & Training Infrastructure
+
+### Data Pipeline
+
+Built a reproducible data pipeline for adding new text sources. All data is phonemized through Misaki only — no external G2P dictionaries.
+
+**Pipeline structure:**
+```
+data/sources/{source}/00_raw/        → untouched downloads
+data/sources/{source}/01_clean/      → cleaned text, 1 sentence/line
+data/sources/{source}/02_phonemized/ → Misaki TSV (text\tphonemes)
+```
+
+**New data sources added:**
+
+| Source | Raw utterances | Unique after dedup | Notes |
+|--------|---------------|-------------------|-------|
+| WikiText-103 | 576K | 575,719 | existing, cleaned |
+| LibriTTS train-clean-100 | 30,078 | 30,077 | audiobook prose, CC BY 4.0 |
+| LJ Speech | 13,005 | 3,242 | most overlapped with WikiText |
+| **Total** | | **609,038** | +5.8% over previous 576K |
+
+LibriTTS train-clean-360 (~200K+ more sentences) is available but not yet downloaded. Would bring total to ~800K+.
+
+**Quality verification on merged data (609K pairs):**
+- `@-@` artifacts: 0
+- `ætæt` phonemes: 0
+- Letter-spelling fallback: 0
+- Non-Latin script: 0
+- `❓` unknown markers: 0
+- NUL bytes: 0
+- Duplicate texts: 0
+
+Scripts: `scripts/data/download_libritts.py`, `scripts/data/download_ljspeech.py`, `scripts/data/merge_all.py`.
+
+### Length-Sorted Batching
+
+Added `LengthSortedSampler` to `train.py`. Instead of random batching (where a 10-char and 200-char sentence in the same batch wastes 95% on padding), it:
+
+1. Sorts all training examples by text length
+2. Batches adjacent (similar-length) sequences together
+3. Shuffles batch order each epoch (not within batches)
+
+Standard technique from fairseq/ESPnet. Should reduce wasted compute from padding significantly.
+
+### OOV Analysis
+
+Ran Misaki without eSpeak fallback on a 2K sample of the 576K WikiText data to measure how many words are truly out-of-vocabulary:
+
+- 55.8% of sentences had "OOV" — but almost all were contractions (`'ve`, `'re`) and abbreviations (`St.`, `Jr.`)
+- **Only 0.3% of sentences had truly unknown words** (apostrophe-prefixed names like `'Malley`)
+- Foreign names (Tchaikovsky, etc.) are in Misaki's lexicon, not OOV
+- Conclusion: OOV is a non-issue. No filtering needed.
+
+---
+
 ## 2026-03-08: G2P V3 — Token Batching & Training Infrastructure
 
 ### Token Batching
@@ -2272,6 +1397,8 @@ The `tune_dataloader.py` and `bench_dataloader.py` scripts were reading `ckpt.ge
 | `scripts/g2p/tune_dataloader.py` | New — finds optimal `max_tokens` and `num_workers` |
 | `scripts/g2p/bench_dataloader.py` | New — benchmarks dataloader throughput with token batching |
 
+---
+
 ## 2026-03-08: G2P — Input Charset Normalization & Data Cleanup
 
 ### The problem: 589-character input vocabulary
@@ -2312,6 +1439,145 @@ Deleted ~750 MB of intermediate/legacy data files. Renamed `g2p_train_v3_plus.ts
 | Phone vocab | 77 (IPA) |
 | Avg sentence length | 121 chars / 23 words |
 | File size | 203 MB |
+
+---
+
+## 2026-03-08: Embedded Voice Pack & README Overhaul
+
+### Embedded voice via objcopy
+
+The af_heart voice pack (510×256 float32 matrix, ~510KB) is now linked directly into the `rokoko` binary. The Makefile uses `objcopy` to convert `voices/af_heart.bin` into a `.o` with the data in `.rodata`, and the C++ code references it via linker symbols (`_binary_voices_af_heart_bin_start/end`). No external voice file needed at runtime.
+
+Moved voice packs from `data/voices/` to a top-level `voices/` directory so they're tracked in git (the `/data/` directory is gitignored for large generated files).
+
+### README rewrite
+
+The README was still describing the Python-first workflow (`kokoro_speak.py`, spacy setup, ONNX). Rewrote it to lead with the C++/CUDA pipeline:
+
+```
+make rokoko
+./rokoko --text "Hello world." -o output.wav
+```
+
+Python scripts are documented as reference/comparison tools, not the primary workflow. Added sections for data export and the standalone phonemizer.
+
+---
+
+## 2026-03-08: Pronunciation-by-Example Teacher
+
+### Design
+
+Implemented a `./teacher` binary that lets users teach Kokoro custom pronunciations. The workflow: user records a word → Wav2Vec2 extracts seed phonemes → evolutionary search finds the phoneme sequence that makes Kokoro reproduce the original pronunciation → saves to user dictionary.
+
+### Synthesis API Refactoring (Phase 4)
+
+Moved `GpuArena` from `rokoko_cuda.cpp` to `rokoko.h` so it can be shared between binaries. Removed `static` from `rokoko_infer()`, `write_wav()`, and `precompute_weight_norms()`, adding declarations to `rokoko.h`. Guarded `main()` in `rokoko_cuda.cpp` with `#ifndef ROKOKO_NO_MAIN` so the teacher binary can link against it without symbol conflicts. Both `rokoko` and `teacher` compile cleanly from the same source files.
+
+### User Dictionary (Phase 6)
+
+Added JSON user dictionary support — highest priority in the lookup chain, checked before gold dict. Minimal JSON parser (~60 lines) handles flat `{"word": "phonemes"}` objects with UTF-8 escapes. Case variants (lowercase, capitalized) are auto-generated. The `load_user_dict()` call was added to `Phonemizer::load()` and also inserted into `lookup_with_pos()` (which has its own dictionary cascade independent of `lookup()`).
+
+Key learning: the phonemize pipeline has *two* independent lookup paths — `lookup()` (basic) and `lookup_with_pos()` (POS-aware, used when POS tagger is loaded). Both needed the user dict check.
+
+### Wav2Vec2 Custom CUDA (Phase 3)
+
+Wrote a complete CUDA implementation of `facebook/wav2vec2-lv-60-espeak-cv-ft`:
+
+- **CNN feature extractor**: 7 strided Conv1d layers. Reused `conv1d_general_f32` from existing `kernels.cu`.
+- **Group norm**: New CUDA kernel for the first CNN layer (512 groups). Shared-memory warp reduction for mean/variance.
+- **Positional conv**: Group Conv1d (groups=16, K=128) with weight norm. New kernel for group convolution.
+- **Transformer encoder**: 24 layers, 16 heads, d=1024. Reused `layer_norm_f32`, `softmax_f32`, `residual_layer_norm_f32` from existing kernels. Used `cublasSgemmStridedBatched` for multi-head attention.
+- **Exact GELU**: Wav2Vec2 uses exact GELU (`erf`-based), not the tanh approximation Kokoro uses. New kernel.
+- **CTC decode**: Simple CPU argmax → collapse repeats → remove blanks.
+
+The weight loading uses the same pattern as Kokoro: binary file with config header → contiguous GPU allocation → pointer arithmetic for tensor assignment.
+
+### Evolutionary Search (Phase 5)
+
+Population-based search with four mutation operators:
+1. **Substitute**: Replace phoneme with articulatorily nearby one (weighted by PanPhon distance matrix)
+2. **Delete**: Remove one phoneme (handles over-segmentation)
+3. **Insert**: Add phoneme near a neighbor (handles under-segmentation)
+4. **Swap**: Transpose adjacent phonemes
+
+Each candidate is: phonemize → tokenize → Kokoro synthesize → resample 24k→16k → Wav2Vec2 extract → weighted edit distance against original recording's phonemes.
+
+Crossover uses uniform selection from two parent sequences. Elitism preserves top-k and always keeps the original seed.
+
+### Build System (Phase 7)
+
+New Makefile targets:
+- `teacher`: Links teacher.cpp + rokoko_cuda.cpp (with `-DROKOKO_NO_MAIN`) + wav2vec2.o
+- `src/wav2vec2.o`: NVCC compile of wav2vec2.cu
+- `teacher-data`: Generates `data/phoneme_distances.bin` and `data/wav2vec2.bin`
+
+### New Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `src/teacher.cpp` | ~430 | CLI + evolutionary search |
+| `src/teacher.h` | ~25 | Config/candidate structs |
+| `src/wav2vec2.h` | ~140 | Wav2Vec2 weight struct + API |
+| `src/wav2vec2.cu` | ~430 | CUDA kernels + forward pass |
+| `src/wav_io.h` | ~220 | WAV reader + sinc resampler |
+| `src/phoneme_distance.h` | ~120 | Distance matrix + weighted Levenshtein |
+| `scripts/export/phoneme_distances.py` | ~170 | PanPhon → binary |
+| `scripts/export/wav2vec2_weights.py` | ~260 | HuggingFace → binary |
+
+---
+
+## 2026-03-08: Embedding-Based Fitness for Teacher
+
+### The Problem
+
+The teacher's evolutionary search scored candidates by: synthesize audio → Wav2Vec2 → CTC argmax → phoneme strings → weighted edit distance. But CTC argmax collapses the rich 1024-dimensional transformer embeddings down to a single phoneme ID per timestep, then collapses repeats further. Two sequences that sound nearly identical can differ by a phoneme or two due to argmax boundary effects.
+
+### Solution: DTW on Wav2Vec2 Embeddings
+
+The Wav2Vec2 transformer already produces `[T, 1024]` embedding vectors (`d_final_ln`) that capture vowel quality, formant structure, and prosody — far richer than any discrete phoneme representation. We just needed to *stop throwing them away*.
+
+**Refactored `wav2vec2.cu`**: Extracted the forward pass (audio normalization → CNN → feature projection → positional conv → 24-layer transformer → final LayerNorm) into a shared `wav2vec2_forward()` helper returning `{d_final_ln, T, D}` as GPU pointers. Then:
+- `wav2vec2_extract_phonemes()` = forward + CTC head + argmax decode (unchanged behavior)
+- `wav2vec2_extract_embeddings()` = forward + D2H copy of `d_final_ln` (new)
+
+No code duplication — both functions call the same ~200 line forward pass.
+
+**DTW with cosine distance** (`embedding_dtw_distance()` in teacher.cpp): Standard Dynamic Time Warping handles the different sequence lengths between original recording and Kokoro synthesis (e.g., 50 vs 70 timesteps for the same word). Local cost is cosine distance: `1 - (a·b)/(|a|·|b|)`. Uses two-row DP (O(T) memory instead of O(T^2)). Normalized by path length for comparability across words.
+
+**Combined fitness**: `-(0.7 × dtw_dist + 0.3 × edit_dist)`. Embeddings dominate (capture fine acoustic detail) while edit distance acts as a regularizer (more robust across different speakers/voices).
+
+### Test Results
+
+Ran the same tests as before (`vieques`, `kubernetes`) with `--generations 15 --population 30`:
+
+| Word | Seed | Best candidate | Fitness | Early stop |
+|------|------|----------------|---------|------------|
+| vieques | biaki | biakæ | -0.367 | Gen 5 |
+| kubernetes | kjuːbɚniːdz | kjuːbɚnniːds | -0.201 | Gen 5 |
+
+Key observation: convergence is dramatically faster. Both tests early-stop at generation 5 (out of 15). The embedding DTW provides a much smoother fitness landscape than discrete phoneme edit distance — small phoneme changes produce proportional fitness changes instead of all-or-nothing phoneme mismatches. The top-3 candidates are extremely close in fitness (within 0.001), suggesting the search is finding a genuine optimum rather than random exploration.
+
+Tradeoff: the smoother landscape means faster convergence but potentially getting stuck in local optima sooner. The old edit-distance approach explored more because its fitness was noisier. Could increase patience if more exploration is needed.
+
+### Challenges
+
+The main design choice was *not* doing something more complex. We considered:
+- Averaging embeddings and comparing means (loses temporal structure)
+- Euclidean distance instead of cosine (sensitive to magnitude, not just direction)
+- Full O(T^2) DTW matrix (unnecessary — two-row DP works fine since we only need the final cost)
+- A learned metric (overkill for this use case)
+
+Memory is trivial: ~400 KB for 1-second embeddings, ~160 KB for the DTW working set, vs 1.2 GB model weights.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/wav2vec2.h` | Added `Wav2Vec2Embeddings` struct + `wav2vec2_extract_embeddings()` |
+| `src/wav2vec2.cu` | Extracted `wav2vec2_forward()` helper; new `wav2vec2_extract_embeddings()` |
+| `src/teacher.cpp` | Added `embedding_dtw_distance()`; combined fitness in eval loop |
+
+---
 
 ## 2026-03-09: G2P V3 — Training Run & Production Readiness
 
@@ -2740,3 +2006,826 @@ Generator is still 62% of total. Practical ceiling analysis puts the target at ~
 | `src/cpu_ops.h` | Dual dispatch (i0/j0 parallel) in `sgemm_tiled_nn` and `sgemm_tiled_nt`, `gemm_tile_dispatch` helper, shared_packed_A + tls_packed_B buffers, parallel i loop in `sgemm_kblocked_tn`, `pack_b_t` for NT case, `pack_a_conv1d` + `sgemm_fused_conv1d_nn` for implicit GEMM, fused path in `conv1d_cpu` |
 | `Makefile` | Added `-fopenmp` to CPUFLAGS |
 | `plan.md` | New: optimization plan with steps, safety gates, expected speedups |
+
+---
+
+## 2026-03-09: G2P V4 — Neural Text Normalization
+
+### The Problem
+
+The G2P V3 model (4.45M param Conformer CTC) was trained only on Wikipedia/LibriTTS text. It handles plain English words well (87.6% exact match on general text) but completely fails on semiotic classes: times ("3:45 PM"), dates ("March 9, 2026"), money ("$12.50"), telephone numbers, measurements, Roman numerals, etc.
+
+Evaluated on 1,484 gold test cases across 18 normalization classes:
+- **V3 model: 10.3% exact match**
+- **Misaki baseline: 23.7% exact match**
+- TIME, TELEPHONE, ROMAN, RANGE, SCORE, ADDRESS: 0% for both
+
+### Solution: Augmentation + Label Smoothing
+
+**Scaled augmentation data from 8.7K to 31.8K pairs** covering all 13 semiotic classes programmatically. Each critical class now has 3K-8K training examples with diverse sentence frames and value ranges. Key expansions:
+- DATE (1.5K → 7.8K): Added abbreviated months, dot-separated dates, month-day only
+- MONEY (1.5K → 5.1K): Dense dollar/cents, comma-formatted, pounds, euros
+- MEASURE (1K → 4.3K): Added 10+ new units (dB, cal, psi, rpm), decimals, percentages
+- TIME (1.6K → 3.6K): Multiple templates per time, am/pm variants, bare times
+- TELEPHONE (0.6K → 3.4K): Dot-separated format, 1-800 toll-free numbers
+
+**Fixed a critical bug in eval_normalization.py**: The `NeuralG2P` class used wrong checkpoint key names (`model_state_dict` instead of `model`, wrong constructor parameter names). It would have failed to load any model.
+
+**Added CTC label smoothing** to train.py: `loss = (1-α)*CTC + α*(-mean(log_probs))` with α=0.1. Prevents overconfident predictions and should help with normalization patterns where multiple outputs are plausible.
+
+### Training Config
+- Data: 745K pairs (713K V3 + 32K augmentation)
+- Dropout: 0.15 (up from 0.1), label smoothing: 0.1
+- Same architecture: 4.45M Conformer, RoPE + RMSNorm, no conv/QK-norm
+- Muon + AdamW, 50 epochs, max_tokens=115,632
+
+### V3 Baseline (for comparison)
+
+| Class | V3 | Misaki | N |
+|-------|-----|--------|---|
+| ORDINAL | 87.5% | 96.4% | 56 |
+| CARDINAL | 56.5% | 85.5% | 131 |
+| ABBREVIATION | 15.0% | 18.3% | 60 |
+| MEASURE | 3.2% | 0.0% | 216 |
+| DATE | 2.7% | 2.7% | 148 |
+| MONEY | 0.0% | 100.0% | 144 |
+| TIME | 0.0% | 0.0% | 234 |
+| TELEPHONE | 0.0% | 0.0% | 100 |
+| **OVERALL** | **10.3%** | **23.7%** | **1484** |
+
+### V4 Results (1x augmentation)
+
+First attempt with 32K augmentation mixed 1:1 into 713K training data.
+
+| Class | V3 | V4 | Misaki | N |
+|-------|-----|-----|--------|---|
+| TIME | 0.0% | **97.0%** | 0.0% | 234 |
+| ORDINAL | 87.5% | **92.9%** | 96.4% | 56 |
+| MEASURE | 3.2% | **72.7%** | 0.0% | 216 |
+| FRACTION | 1.6% | **76.2%** | 0.0% | 63 |
+| CARDINAL | 56.5% | 59.5% | 85.5% | 131 |
+| ABBREVIATION | 15.0% | **48.3%** | 18.3% | 60 |
+| TELEPHONE | 0.0% | **17.0%** | 0.0% | 100 |
+| DATE | 2.7% | 2.0% | 2.7% | 148 |
+| MONEY | 0.0% | 2.1% | **100.0%** | 144 |
+| ROMAN | 0.0% | 0.7% | 0.0% | 141 |
+| **OVERALL** | **10.3%** | **42.0%** | **23.7%** | **1484** |
+
+**Problem**: MONEY/DATE/ROMAN still terrible. CTC stuttering on $ sign, model ignoring Roman numerals (only 463 examples in 745K = 0.06%).
+
+**Diagnosis**: 32K augmentation was only 4.3% of total data — not enough signal for the model to learn rare patterns. Also missing bare formats (e.g. "1/1/2000" without sentence wrapper).
+
+### V4b Results (5x oversampled augmentation + bare formats)
+
+Added bare patterns (no sentence wrapper) for DATE, MONEY, TIME, TELEPHONE, ROMAN.
+Oversampled augmentation 5x: 713K + 5×35K = 890K total, augmentation at ~20%.
+
+| Class | V3 | V4 | V4b | Misaki | N |
+|-------|-----|-----|------|--------|---|
+| TIME | 0.0% | 97.0% | **98.3%** | 0.0% | 234 |
+| ORDINAL | 87.5% | 92.9% | **94.6%** | 96.4% | 56 |
+| MEASURE | 3.2% | 72.7% | **88.9%** | 0.0% | 216 |
+| FRACTION | 1.6% | 76.2% | **79.4%** | 0.0% | 63 |
+| CARDINAL | 56.5% | 59.5% | **77.9%** | 85.5% | 131 |
+| ABBREVIATION | 15.0% | 48.3% | **63.3%** | 18.3% | 60 |
+| ROMAN | 0.0% | 0.7% | **44.7%** | 0.0% | 141 |
+| MONEY | 0.0% | 2.1% | **34.7%** | **100.0%** | 144 |
+| TELEPHONE | 0.0% | 17.0% | **24.0%** | 0.0% | 100 |
+| RANGE | 0.0% | 11.8% | **23.5%** | 0.0% | 17 |
+| DATE | 2.7% | 2.0% | **12.8%** | 2.7% | 148 |
+| ADDRESS | 0.0% | 0.0% | **9.0%** | 0.0% | 100 |
+| SCORE | 0.0% | 6.2% | 6.2% | 0.0% | 16 |
+| SYMBOL | 5.9% | 0.0% | 5.9% | 76.5% | 17 |
+| LETTERS | 35.0% | 30.0% | 35.0% | 40.0% | 20 |
+| CONNECTOR | 12.5% | 0.0% | 12.5% | 62.5% | 8 |
+| DECIMAL | 0.0% | 0.0% | 0.0% | 0.0% | 6 |
+| MIXED | 0.0% | 0.0% | 0.0% | 0.0% | 7 |
+| **OVERALL** | **10.3%** | **42.0%** | **56.9%** | **23.7%** | **1484** |
+
+### V5+: Rule-Based Date Preprocessing (84.6% overall)
+
+After V5 training revealed that the CTC model fundamentally can't learn month-number→month-name lookup tables, added `preprocess_text()` to the inference pipeline. This function expands date patterns to fully spoken form *before* the neural model sees them:
+
+- `1/1/2000` → `January first, two thousand`
+- `2000-01-01` → `January first, two thousand`
+- `January 1, 2000` → `January first, two thousand` (day ordinal + year expansion)
+
+Implementation: ~60 lines in `train.py` with pure-Python ordinal and year-to-words functions (no num2words dependency). Handles years 1000-2099, days 1-31.
+
+Also fixed ADDRESS test data: spoken forms now include trailing period (raw text "She lives at 8080 Elm St." ends with period, so spoken form should too).
+
+| Class | V5 (before) | V5+ (after) | Delta |
+|-------|-------------|-------------|-------|
+| DATE | 14.9% | **100.0%** | +85.1 |
+| ADDRESS | 0.0% (strict) | **84.0%** | +84.0 |
+| **OVERALL** | **70.4%** | **84.6%** | **+14.2** |
+
+All other classes unchanged. The 84.6% overall exceeds the plan.md target of 80%.
+
+**Key insight**: A hybrid approach (rule-based preprocessing for structured patterns + neural model for everything else) is far more effective than trying to make the neural model learn lookup tables. The CTC model excels at sequence-to-sequence mappings with natural alignment (words → phonemes), but fails at arbitrary code lookups (month number → month name).
+
+### V5 Results (LLM augmentation + quality filtering)
+
+#### LLM data pipeline
+
+Built `augment_with_llm.py`: uses Qwen3.5-9B via llama.cpp `/completion` endpoint (NOT `/v1/chat/completions` — Qwen3.5's thinking mode consumes all tokens on reasoning otherwise).
+
+Pipeline: LLM generates diverse (written, spoken) pairs → quality filter (remove pairs with digits in spoken form, hallucinations) → Misaki phonemizes spoken forms.
+
+- Generated 16,404 raw pairs across 14 semiotic classes in ~55 minutes
+- After dedup: 9,662 unique pairs
+- After quality filtering (digits in spoken form, length mismatches): 9,502 clean pairs
+- 0 Misaki phonemization failures
+
+Also fixed a `to_roman()` bug in `augment_data.py` (early `return` inside `for` loop).
+
+#### Training data
+
+| Source | Pairs | Notes |
+|--------|-------|-------|
+| g2p_train_v3.tsv | 713,500 | Base Wikipedia/LibriTTS |
+| g2p_augment_v3.tsv × 5 | 176,530 | Programmatic augmentation (fixed to_roman) |
+| g2p_augment_llm_clean.tsv × 5 | 47,510 | LLM-generated diverse data |
+| **Total** | **937,540** | Augmentation at 23.9% of total |
+
+Training: 50 epochs, dropout=0.15, label_smoothing=0.1, Muon+AdamW. Best val loss at epoch 43.
+
+#### Results (V5+: with date preprocessing + fixed ADDRESS test data)
+
+| Class | V4b | V5+ | Misaki | N | Delta |
+|-------|------|------|--------|---|-------|
+| DATE | 12.8% | **100.0%** | 2.7% | 148 | +87.2 |
+| ROMAN | 44.7% | **100.0%** | 0.0% | 141 | +55.3 |
+| TIME | 98.3% | **99.1%** | 0.0% | 234 | +0.8 |
+| FRACTION | 79.4% | **93.7%** | 0.0% | 63 | +14.3 |
+| MEASURE | 88.9% | **92.1%** | 0.0% | 216 | +3.2 |
+| CARDINAL | 77.9% | **84.7%** | 85.5% | 131 | +6.8 |
+| ADDRESS | 9.0% | **84.0%** | 0.0% | 100 | +75.0 |
+| ORDINAL | 94.6% | 82.1% | 96.4% | 56 | -12.5 |
+| SCORE | 6.2% | **75.0%** | 0.0% | 16 | +68.8 |
+| ABBREVIATION | 63.3% | **71.7%** | 18.3% | 60 | +8.4 |
+| TELEPHONE | 24.0% | **65.0%** | 0.0% | 100 | +41.0 |
+| MONEY | 34.7% | **63.2%** | **100.0%** | 144 | +28.5 |
+| RANGE | 23.5% | **47.1%** | 0.0% | 17 | +23.6 |
+| SYMBOL | 5.9% | **35.3%** | 76.5% | 17 | +29.4 |
+| **OVERALL** | **56.9%** | **84.6%** | **23.7%** | **1484** | **+27.7** |
+
+Minor regression: ORDINAL dropped from 94.6% → 82.1%. May be due to competition with new augmentation data.
+
+#### Still failing: numeric dates → SOLVED by preprocessing
+
+The model produced **garbage** for numeric date formats: `12/25/2025` → gibberish phonemes. Textual dates (`December 25, 2025`) mostly worked. The CTC model can't learn the slash→month-name mapping — essentially a lookup table (1→January, 2→February... 12→December) — from training data alone.
+
+**Fix**: Added `preprocess_text()` to expand dates to fully spoken English before the neural model sees them. Result: **DATE 14.9% → 100%**, overall **70.4% → 84.6%**.
+
+#### Key insights
+
+1. **LLM augmentation works**: Adding 9.5K diverse LLM-generated pairs (on top of 35K programmatic) pushed overall from 56.9% → 76.1%.
+2. **Quality filtering matters**: 1.3% of LLM pairs had digits in spoken form. Filtering these prevented training on bad data.
+3. **Qwen3.5 thinking trap**: The chat completions endpoint wastes all tokens on internal reasoning. Must use raw `/completion` endpoint to bypass thinking mode.
+4. **to_roman bug impact**: The early-return bug meant Roman numerals > first matching value were wrong. Fixing this + LLM data → 100% ROMAN accuracy.
+5. **Hybrid approach wins**: Rule-based preprocessing for structured patterns (dates) + neural model for everything else is far more effective than pure neural. The CTC model excels at natural sequence-to-sequence mappings but fails at arbitrary code lookups.
+
+### Remaining weak spots
+
+1. **MONEY (63.2%)**: Still 37% error rate. Model sometimes stutters on $ sign.
+2. **ORDINAL regression (82.1%)**: Down from 94.6% in V4b. May need to oversample ordinals to compensate for augmentation competition.
+3. **TELEPHONE (65.0%)**: Digit-by-digit reading has some failure modes.
+4. **SYMBOL/CONNECTOR/LETTERS**: Small test sets but consistently weak. Need targeted augmentation or rule-based expansion.
+
+### Key technical insights
+
+1. **Oversampling is critical**: 5x augmentation improved overall from 42% → 57%. The model needs normalization patterns to be ~20% of training data, not 4%.
+2. **Bare formats matter**: Adding "1/1/2000" without sentence wrappers helped DATE jump from 2% → 13%.
+3. **CTC label smoothing**: At α=0.1, helped with generalization but wasn't the main driver of improvement.
+4. **Docker /dev/shm limit**: 64MB shm caused multi-worker dataloading to crash. Auto-detection fix: limit to 2 workers when shm < 512MB.
+5. **LLM data diversity**: Template-based augmentation creates repetitive patterns. LLM-generated sentences have natural variety in vocabulary, sentence structure, and context.
+
+---
+
+## 2026-03-10: V5+ Error Analysis — Exact Match is Misleading
+
+### The Scores Look Awful. Are They?
+
+After reaching 84.6% overall exact match, the remaining weak classes looked terrible:
+
+| Class | Exact% | N | Looks like... |
+|-------|--------|---|---------------|
+| CONNECTOR | 12.5% | 8 | catastrophic |
+| DECIMAL | 16.7% | 6 | catastrophic |
+| LETTERS | 35.0% | 20 | bad |
+| SYMBOL | 35.3% | 17 | bad |
+| RANGE | 47.1% | 17 | mediocre |
+| MONEY | 63.2% | 144 | mediocre |
+| TELEPHONE | 65.0% | 100 | mediocre |
+
+Deep dive into actual error patterns reveals **three distinct failure modes**:
+
+### 1. "Almost correct" — functionally working (MONEY, TELEPHONE, RANGE)
+
+PER distribution analysis showed most "errors" are 1-2 character differences:
+
+| Class | Exact | PER<5% | Avg PER | Typical Error |
+|-------|-------|--------|---------|---------------|
+| MONEY | 63.2% | **84.7%** | 3.1% | "dollarˈ**z**" vs "dollar" (singular/plural) |
+| TELEPHONE | 65% | **83%** | 2.1% | Missing space between digit phonemes |
+| RANGE | 47.1% | **76.5%** | 3.0% | Dropped stress mark on one syllable |
+
+These classes work. A TTS engine would produce identical audio for the model's output vs the expected. The MONEY error is systematic: the model defaults to "dollars" (plural) even for $1.xx amounts, because plural examples vastly outnumber singular in training data.
+
+### 2. Test methodology issue (LETTERS)
+
+Every LETTERS "error" is a spacing difference:
+```
+Expected (Misaki on "F B I"):  ˈɛf bˈi ˌI    ← spaces between letters
+Model (on "FBI"):              ˌɛfbˌiˈI      ← same phonemes, no spaces
+```
+
+The eval pipeline phonemizes the spoken form "F B I" (with spaces between letters) → naturally gets spaces in output. But the model processes "FBI" as one token → no spaces. Both produce identical TTS audio.
+
+### 3. Zero training data (DECIMAL, CONNECTOR, SYMBOL)
+
+| Class | Training examples | Root cause |
+|-------|-------------------|------------|
+| DECIMAL | **0** "point" patterns | "3.14" → confused with dates/money |
+| CONNECTOR | **0** "w/", "w/o", "24/7" | Never seen these patterns |
+| SYMBOL | partial (@ works, 6'2" doesn't) | Missing feet/inches, +, degree |
+
+You can't learn from zero examples regardless of model size. A 100M parameter model would fail just as badly — this is pure data coverage.
+
+### Would a bigger model help?
+
+**No.** The 4.45M param model already achieves:
+- TIME: 99.1% (234 cases)
+- DATE: 100% (with preprocessing)
+- ROMAN: 100%
+- FRACTION: 93.7%
+- MEASURE: 92.1%
+
+The model has plenty of capacity. The remaining errors come from missing training data (can't learn from nothing) and CTC alignment precision (1-2 phoneme boundary artifacts that more parameters won't fix). The ROI is in data, not architecture.
+
+### Fix plan
+
+1. Add DECIMAL/CONNECTOR augmentation to `augment_data.py` (zero→hundreds of examples)
+2. Fix LETTERS test evaluation (strip spaces before comparison)
+3. Oversample "dollar" singular for MONEY
+4. Retrain V6
+
+---
+
+## 2026-03-10: V7 — Full Evaluation (Plain Text + Normalization)
+
+### What changed in V7
+
+Added targeted training data for the zero-example classes identified in the V5+ error analysis:
+- **DECIMAL**: 821 pairs ("3.14" → "three point one four")
+- **CONNECTOR**: 137 pairs ("w/", "w/o", "24/7", "4x4")
+- **SYMBOL**: 389 pairs (feet/inches, #, @, +, degree)
+- **Dollar singular**: 175 pairs ($1.xx → "one dollar and...")
+- **Currencies**: Expanded euro coverage to match dollar density, added ¥, CHF, ₹, and named currencies (yen, yuan, won, peso, ruble, krona, etc.)
+
+Total augmentation: 41,312 pairs (up from 35,306), oversampled 5x. Training: 50 epochs on 967K total pairs.
+
+Also added `best_exact.pt` checkpoint saving — the best val_loss checkpoint is dominated by plain text and doesn't optimize for normalization accuracy. V6 showed this clearly: best val_loss (epoch 26) = 74.4% on gold tests, while epoch 42 had 82.2% exact match on validation.
+
+### Full evaluation: plain text + all normalization classes
+
+Built `eval_full.py` to test both plain text pronunciation (5,000 samples from the val split of g2p_train_v3.tsv) and normalization (1,484 gold test cases) in one run. This is the first time we measured plain text accuracy alongside normalization.
+
+| Category | N | Exact% | PER |
+|----------|---|--------|-----|
+| **PLAIN** | **5,000** | **83.3%** | **0.49%** |
+| | | | |
+| TIME | 234 | 100.0% | 0.00% |
+| DATE | 148 | 99.3% | 0.06% |
+| FRACTION | 63 | 93.7% | 0.41% |
+| MEASURE | 216 | 91.2% | 0.41% |
+| ROMAN | 141 | 90.1% | 0.84% |
+| CARDINAL | 131 | 86.3% | 1.38% |
+| ORDINAL | 56 | 85.7% | 0.73% |
+| DECIMAL | 6 | 83.3% | 1.60% |
+| ABBREVIATION | 60 | 73.3% | 2.86% |
+| ADDRESS | 100 | 70.0% | 2.96% |
+| MONEY | 144 | 68.8% | 3.30% |
+| TELEPHONE | 100 | 66.0% | 2.27% |
+| RANGE | 17 | 64.7% | 3.15% |
+| SYMBOL | 17 | 64.7% | 1.35% |
+| CONNECTOR | 8 | 62.5% | 6.66% |
+| SCORE | 16 | 50.0% | 8.96% |
+| LETTERS | 20 | 35.0% | 9.83% |
+| MIXED | 7 | 14.3% | 14.18% |
+| **NORM TOTAL** | **1,484** | **84.4%** | **1.49%** |
+| **GRAND TOTAL** | **6,484** | **83.6%** | **0.72%** |
+
+### Normalization: targeted augmentation worked but caused regressions
+
+| Class | V5+ | V7 | Delta |
+|-------|------|------|-------|
+| **DECIMAL** | 16.7% | **83.3%** | **+66.7** |
+| **CONNECTOR** | 12.5% | **62.5%** | **+50.0** |
+| **SYMBOL** | 35.3% | **64.7%** | **+29.4** |
+| **RANGE** | 47.1% | **64.7%** | **+17.6** |
+| SCORE | 75.0% | 50.0% | **-25.0** |
+| ADDRESS | 84.0% | 70.0% | **-14.0** |
+| ROMAN | 100.0% | 90.1% | **-9.9** |
+
+Gains in small classes (31 cases gained) offset by losses in larger ones (28 cases lost). Classic distribution shift / catastrophic forgetting from adding new augmentation data.
+
+### Plain text: 83.3% exact, 0.49% PER
+
+The 0.49% PER means the model gets >99.5% of phoneme characters right on plain English text. The 83.3% exact match is lower than V3 baseline's 87.8% — that's the cost of the normalization augmentation (the model traded some plain text precision for normalization ability).
+
+Typical plain text errors:
+- **Long sequences with multiple numbers**: ISBNs, "617 Dam Busters Squadron", dates + numbers in same sentence
+- **CTC stuttering on 4-digit cardinals**: "1234" sometimes garbles ("wˈθn θˈnd" instead of "wˈʌn θˈWzᵊnd")
+- **Wikipedia formatting artifacts**: Georgian characters, technical identifiers like "kfreebsd-i386"
+
+### Checkpoint selection confirmed critical
+
+The val_loss checkpoint (best.pt, epoch 33) scored 79.0% on normalization — 5.4 points worse than best_exact (epoch 42, 84.4%). The `best_exact.pt` addition was essential.
+
+### Where this leaves us
+
+The model does raw text → phonemes end-to-end at 83.6% exact / 0.72% PER across all categories. For context, the current C++ pipeline (`phonemize.cpp`, 3,051 lines) uses a 7-stage fallback chain: dictionary lookups → POS disambiguation → morphological stemming → number expansion → CMU/eSpeak fallback → neural G2P → letter spelling. It loads 6 data files and handles dozens of edge cases.
+
+The neural model replaces all of that with a single forward pass, but at 83.6% exact match it's not yet reliable enough to be a drop-in replacement — dictionary lookup is ~100% precise for known words. The realistic deployment path is hybrid: neural text normalization (expanding numbers/dates/money to words) feeding into the existing dictionary pipeline for word pronunciation.
+
+### The journey so far
+
+| Version | Plain | Norm | What changed |
+|---------|-------|------|-------------|
+| V3 | 87.8% | 10.3% | Wikipedia/LibriTTS only |
+| V4 | — | 42.0% | +8.7K augmentation |
+| V4b | — | 56.9% | 5× oversampling |
+| V5 | — | 76.1% | +LLM data, label smoothing |
+| V5+ | — | 84.6% | +rule-based date preprocessing |
+| **V7** | **83.3%** | **84.4%** | +DECIMAL/CONNECTOR/SYMBOL/currencies |
+
+---
+
+## 2026-03-10: Text Normalization — C++ Port of preprocess_text()
+
+### The problem
+
+The G2P model was trained on text preprocessed by Python's `preprocess_text()` — a 5-stage pipeline that expands money ($12.50 → "twelve dollars and fifty cents"), dates (1/15/2024 → "January fifteenth, twenty twenty four"), numbers (1234 → "one thousand two hundred thirty four"), and folds Unicode to ASCII (café → cafe). The C++ test binaries (`test_g2p`, `test_g2p_cuda`) were feeding raw text directly, causing ~203/1000 mismatches vs Python on inputs containing numbers, dates, and currency.
+
+This is separate from the main phonemizer (`phonemize.cpp`), which has its own number/currency pipeline that converts directly to phonemes. `preprocess_text()` is only needed for standalone G2P inference and the three-way verification script.
+
+### The implementation
+
+Single-header C++17 in `src/text_normalize.h` (~300 lines). Four stages matching Python exactly:
+
+1. **Money expansion** — hand-rolled UTF-8 scanner for $€£¥, avoids regex for multi-byte currency symbols. Parses `\d[\d,]*(\.\d+)?` amounts, generates "twelve dollars and fifty cents" style output with full currency table (dollars/cents, euros/cents, pounds/pence, yen).
+
+2. **Date expansion** — three `std::regex` patterns (US `M/D/YYYY`, ISO `YYYY-MM-DD`, textual `Month DD, YYYY`). Day ordinals ("first"..."thirty first"), year-to-words ("twenty twenty four", "nineteen oh five").
+
+3. **Number expansion** — hand-rolled digit scanner with letter-adjacency check. Skips numbers attached to letters (70s, 3G, MP3, 5kg). Range 0–999,999,999.
+
+4. **Unicode → ASCII** — UTF-8 codepoint decoder + lookup tables covering Latin-1 Supplement (U+00A0–U+00FF, 96 entries), Latin Extended-A (U+0100–U+017F, 128 entries), and common punctuation (curly quotes, em/en dash, ellipsis, euro sign, trademark). Strips anything outside printable ASCII (32–126).
+
+### Challenges and solutions
+
+**UTF-8 currency symbols in regex**: The Python regex `([$€£¥])\s*(\d[\d,]*)` works because Python's regex engine is Unicode-aware. C++ `std::regex` operates on bytes, so multi-byte UTF-8 characters in character classes would fail. Solution: hand-rolled byte-level scanner that checks for the exact UTF-8 byte sequences of each currency symbol (e.g., € = `0xE2 0x82 0xAC`).
+
+**Letter adjacency for number expansion**: Python's `str.isalpha()` returns True for accented Unicode letters (é, ñ), but C++ `isalpha()` only handles ASCII. If an accented letter preceded a number, C++ would expand it while Python wouldn't. Solution: treat any byte ≥ 0x80 as "alpha" for the adjacency check — valid since any non-ASCII byte in UTF-8 is part of a multi-byte character, which is almost always a letter in practice.
+
+**NFC normalization**: Python does `unicodedata.normalize("NFC", text)` before `unidecode()`. Full NFC in C++ is complex (combining character composition). In practice, input text is already NFC, and the unidecode table handles the same characters either way — a decomposed sequence (base letter + combining mark) would keep the ASCII base letter and strip the combining mark, giving the same result as NFC→unidecode. Skipped NFC entirely.
+
+**unidecode coverage**: The Python `unidecode` library covers the entire Unicode range. Rather than porting its full 70KB dataset, we cover only the codepoints that actually appear in the training data: Latin-1 Supplement (accented letters, common symbols), Latin Extended-A (Eastern European characters), and a handful of punctuation marks. Unknown codepoints are simply stripped (same as unidecode returning empty for exotic scripts).
+
+### Verification
+
+Tested against Python on the full training dataset:
+- **708,968 samples**: 0 differences (exact byte-for-byte match)
+- **193 samples with actual changes** (numbers, dates, money, Unicode): all match
+- **Targeted edge cases**: $0.50, ¥5000, café, 2024-03-10, MP3 — all match
+
+### Files changed
+
+| File | Changes |
+|------|---------|
+| `src/text_normalize.h` | New: complete preprocess_text() port (~300 lines) |
+| `src/test_preprocess.cpp` | New: standalone preprocessing test binary |
+| `src/test_g2p.cpp` | Added `#include "text_normalize.h"`, preprocess before infer |
+| `src/test_g2p_cuda.cu` | Same |
+| `Makefile` | Added `test_preprocess` target, updated deps for test_g2p/test_g2p_cuda |
+
+---
+
+## Day 12: rokoko_v2 + CUDA G2P optimization (2024-03-11)
+
+### rokoko_v2: Neural G2P + TTS in one binary
+
+Created `rokoko_v2` — a new binary that replaces the 3000-line dictionary phonemizer with the neural G2P model. The pipeline is dead simple: text → preprocess → G2P forward pass → tokenize → TTS infer → WAV.
+
+Data files reduced from 6+ (gold dict, silver dict, POS tagger, espeak fallback, G2P model, CMU extra) to just 2 (weights.bin + g2p_v8_model.bin).
+
+The key trick was copying only the VOCAB table (90 entries) and `to_tokens()` function (~15 lines) from phonemize.cpp, avoiding linking the full phonemizer. The `.cu` file is compiled by nvcc (for G2P CUDA kernels), while `rokoko_cuda.cpp` is compiled by g++ (for AVX2 headers in phonemize.h), then linked together.
+
+### CUDA G2P: 2.24x speedup (now 1.55x faster than torch.compile)
+
+Profiled the CUDA G2P inference and found the bottleneck: **massive per-operation overhead from cublasLt descriptors and per-head attention loops**.
+
+The original code had ~200 GPU operations per inference (8 layers × 25 ops/layer):
+- 13 cublasLt calls per layer, each creating/destroying 4 descriptors (matmul desc + 3 matrix layouts) = **52 descriptor API calls per layer**
+- 4 separate per-head GEMMs for attention scores + 4 for value weighted sums = 8 tiny GEMMs on [64×T] matrices
+- Separate scale kernel and per-head softmax launches
+
+**Optimizations applied:**
+
+| Change | Ops eliminated per layer |
+|--------|------------------------|
+| cublasSgemm instead of cublasLt | -52 descriptor create/destroy API calls |
+| cublasSgemmStridedBatched for attention | 8 GEMM calls → 2 batched |
+| Scale folded into GEMM alpha | -1 scale kernel |
+| Batched softmax across heads | 4 launches → 1 |
+| Fused residual add via beta=1 | -2 add kernels |
+
+**Challenge**: The attention matrices in the QKV buffer have a non-trivial strided layout. QKV is column-major [3d, T] where each head h occupies rows [h*dk, (h+1)*dk). The stride between heads is just `dk` (=64), which maps perfectly to cublasSgemmStridedBatched's strideA/strideB. The output buffer `attn_out[d, T]` also has stride `dk` between heads. The critical insight was computing K^T*Q (not Q^T*K) so softmax operates on contiguous rows — this layout is preserved naturally in the batched version.
+
+**Challenge**: Replacing cublasLt loses the EPILOGUE_BIAS fusion (bias add inside the GEMM). Solution: a simple `g2p_bias_kernel` that adds bias to each column of a column-major matrix — one block per column, cheap to launch.
+
+**Results:**
+
+| Implementation | µs/word | Speedup vs torch.compile |
+|---------------|---------|--------------------------|
+| PyTorch CUDA (eager) | 2078 | 0.47x |
+| **torch.compile** | **980** | **1.0x** |
+| C++ CUDA (old, cublasLt) | 1414 | 0.69x |
+| **C++ CUDA (optimized)** | **632** | **1.55x** |
+
+### Files changed
+
+| File | Changes |
+|------|---------|
+| `src/rokoko_v2.cu` | New: neural G2P + TTS pipeline in one binary |
+| `src/g2p_model_cuda.h` | Replaced cublasLt with cublasSgemm, batched attention, fused residuals |
+| `Makefile` | Added rokoko_v2 build target |
+
+---
+
+## Fix G2P eval methodology + NaN guard (2026-03-11)
+
+### Lenient eval for phoneme comparison
+
+The eval script (`eval_full.py`) was comparing model output against Misaki reference character-by-character, penalizing differences in stress marks (ˈ vs ˌ), schwa variants (ᵊ vs ə), and punctuation. This is eval noise, not real errors — e.g., ADDRESS showed 0% exact match when the pronunciations were actually ~75% correct.
+
+Added `normalize_phonemes()` that strips stress marks, normalizes schwa variants, and removes punctuation before comparison. The report now shows **both Strict% and Lenient%** columns side by side (standard G2P eval practice per CMU Sphinx, Reichel & Pfitzinger 2008):
+
+```
+Category              N   Strict%  Lenient%    PER
+----------------------------------------------------
+PLAIN              5000    96.4%     98.2%   0.08%
+----------------------------------------------------
+ADDRESS             100     0.0%     75.0%   5.34%
+DATE                148     8.8%      8.8%  26.88%
+```
+
+The lenient metric lets us distinguish "real errors" (wrong phonemes) from "style differences" (stress placement, schwa reduction) that don't affect intelligibility.
+
+### NaN guard in training
+
+Added a NaN/Inf check after loss computation in `train.py`. When a bad batch produces NaN loss, the training loop now skips it (zeroes gradients, updates the AMP scaler to reduce scale) instead of corrupting all model weights. This prevents training collapse from rare degenerate batches.
+
+### Files changed
+
+| File | Changes |
+|------|---------|
+| `scripts/g2p/eval_full.py` | Added `normalize_phonemes()`, dual Strict/Lenient columns in report and JSON output |
+| `scripts/g2p/train.py` | Added NaN/Inf loss guard before optimizer step |
+
+---
+
+## V8 Evaluation + HTTP Server Mode (2026-03-11)
+
+### G2P V8: 8 layers, full evaluation with Strict/Lenient metrics
+
+V8 doubles the transformer depth from 4 to 8 layers (all else unchanged: d=256, 4 heads, ff=1024, RoPE, RMSNorm, no conv/QK-norm). Trained 50 epochs on the same 750K dataset.
+
+Full evaluation on 5,000 plain text + 1,484 normalization gold test cases:
+
+| Category | N | Strict% | Lenient% | PER |
+|----------|---|---------|----------|-----|
+| **PLAIN** | **5,000** | **96.4%** | **98.2%** | **0.08%** |
+| | | | | |
+| ABBREVIATION | 60 | 83.3% | 83.3% | 1.62% |
+| ADDRESS | 100 | 0.0% | 75.0% | 5.34% |
+| CARDINAL | 131 | 97.7% | 98.5% | 0.19% |
+| CONNECTOR | 8 | 75.0% | 87.5% | 4.66% |
+| DATE | 148 | 8.8% | 8.8% | 26.88% |
+| DECIMAL | 6 | 66.7% | 66.7% | 7.03% |
+| FRACTION | 63 | 100.0% | 100.0% | 0.00% |
+| LETTERS | 20 | 65.0% | 65.0% | 11.14% |
+| MEASURE | 216 | 97.2% | 97.2% | 0.17% |
+| MIXED | 7 | 0.0% | 14.3% | 14.03% |
+| MONEY | 144 | 100.0% | 100.0% | 0.00% |
+| ORDINAL | 56 | 100.0% | 100.0% | 0.00% |
+| RANGE | 17 | 76.5% | 76.5% | 5.89% |
+| ROMAN | 141 | 100.0% | 100.0% | 0.00% |
+| SCORE | 16 | 68.8% | 68.8% | 2.61% |
+| SYMBOL | 17 | 35.3% | 35.3% | 16.50% |
+| TELEPHONE | 100 | 100.0% | 100.0% | 0.00% |
+| TIME | 234 | 99.6% | 99.6% | 0.03% |
+| **NORM TOTAL** | **1,484** | **80.3%** | **85.5%** | **3.71%** |
+| **GRAND TOTAL** | **6,484** | **92.7%** | **95.3%** | **0.91%** |
+
+### V7 → V8 comparison
+
+| Metric | V7 (4 layers) | V8 (8 layers) |
+|--------|---------------|---------------|
+| Plain text strict | 83.3% | **96.4%** (+13.1) |
+| Plain text PER | 0.49% | **0.08%** |
+| Norm strict | **84.4%** | 80.3% (-4.1) |
+| Norm lenient | — | **85.5%** |
+| Grand total strict | 83.6% | **92.7%** (+9.1) |
+
+Doubling depth dramatically improved plain text (96.4% exact, 0.08% PER — the model gets >99.9% of phoneme characters right). Five normalization classes hit 100% (MONEY, TELEPHONE, ORDINAL, ROMAN, FRACTION). But DATE collapsed to 8.8% — caused by a training data mismatch where `preprocess_text()` expands years as cardinals ("one thousand nine hundred ninety six") but phoneme targets were generated by Misaki from raw text ("nineteen ninety six"). See the section above for full analysis. SYMBOL regressed (64.7% → 35.3%) — the model is doubling "percent" in outputs like "fifteen percent percent".
+
+### HTTP server mode
+
+Added `--serve [port]` to `rokoko_v2`. Loads TTS weights + G2P model once, pre-allocates arena (512MB) + workspace (256MB), and serves synthesis over HTTP with mutex-serialized GPU access. Uses cpp-httplib (header-only).
+
+- `GET /health` → `{"status":"ok"}`
+- `POST /synthesize` → JSON `{"text":"...","voice":"af_heart"}` → WAV bytes
+
+Eliminates ~230ms init overhead per request. Second request onwards: ~20ms for short text (vs 250ms+ cold start).
+
+### Files changed
+
+| File | Changes |
+|------|---------|
+| `src/rokoko_v2.cu` | `--serve [port]` mode, `TtsPipeline` struct, pre-allocated arena |
+| `src/server.h` | New: HTTP server (header-only, templated) |
+| `src/cpp-httplib/httplib.h` | New: cpp-httplib v0.18.7 |
+| `src/rokoko_cuda.cpp` | `write_wav_to_()` made non-static |
+| `src/rokoko.h` | Added `write_wav_to_()` declaration |
+| `Makefile` | Updated rokoko_v2 deps |
+
+---
+
+## The DATE regression saga (2026-03-11 to 2026-03-12)
+
+This is the full story of the Wv8 DATE regression, three failed attempts to fix it, and what we learned.
+
+### The regression
+
+Wv8 DATE accuracy collapsed from 99.3% (Wv7) to 8.8%. Everything else improved — PLAIN went from 83.3% to 96.4%. The problem was specific to dates.
+
+### Root cause
+
+Commit ef833a9 ("Unified preprocess_text()") changed the training data loader from `normalize_text()` (unicode→ASCII only) to `preprocess_text()` (expands numbers, dates, money to words). This created a mismatch between what the model sees and what phoneme targets expect:
+
+```
+Data loader input:   preprocess_text("in 1996")  →  "in one thousand nine hundred ninety six"
+Phoneme target:      Misaki("in 1996")            →  phonemes for "nineteen ninety six"
+```
+
+The phoneme targets in Dv4 (`g2p_train_v4.tsv`, 745K lines) were generated by Misaki on **raw** text. Misaki handles "1996" as a year in context. But `preprocess_text()` has no context and always expands as a cardinal number. This affected ~87K training pairs (~12%). The 8-layer model memorized the conflicting signal, producing garbled output for any number-adjacent text.
+
+### Why we can't just remove preprocess_text()
+
+The CTC model uses upsample factor 3: each input character gets 3 output time slots. Input "1996" = 4 chars → 12 slots. The phoneme sequence for "nineteen ninety six" needs ~20 slots. The model physically cannot produce enough phonemes for unexpanded numbers. This was confirmed empirically. `preprocess_text()` must stay.
+
+### Fix attempt 1: Wv9 — regenerate all phoneme targets (FAILED)
+
+**Idea**: Run Misaki on `preprocess_text(raw)` output instead of raw text, so input and targets agree.
+
+**What went wrong**: Misaki produces ❓ for proper nouns (Clarkson, Vedder, Macklin, etc.). The original data pipeline (generate_data_parallel.py line 219) filtered ❓ lines out. We didn't know this. We re-ran Misaki on all 745K lines. **315K lines (42%) came back with ❓.** We trained Wv9 on this corrupted data without checking.
+
+**Result**: PLAIN collapsed from 96.4% → 47.8%. Grand total 53.1%. Completely useless model. Wasted 2+ hours of GPU time.
+
+**What we should have done**: `grep -c '❓' data.tsv` before training. Would have taken 1 second.
+
+### Fix attempt 2: Wv10 — selective re-phonemization (FAILED)
+
+**Idea**: Only re-phonemize lines where `preprocess_text()` actually changes the text (~33% of lines). Keep original phonemes for unchanged lines. Drop lines where Misaki produces ❓.
+
+**Script**: `scripts/g2p/rephonemize.py` — three cases:
+- Text unchanged → keep original phonemes (497K lines kept)
+- Text changed, Misaki succeeds → use new phonemes (116K lines re-phonemized)
+- Text changed, Misaki produces ❓ → drop line (130K lines dropped)
+
+**Result (Dv5)**: 614K lines, 0 ❓ tokens. Clean data. But trained model scored:
+- PLAIN: 72.8% (was 96.4% in Wv8) — **massive regression**
+- DATE: 4.7% (was 8.8%) — **even worse**
+- CARDINAL: 100% (was 92.4%) — improved
+- MONEY: 100% (was 97.2%) — improved
+- Grand total: 72.5% (was 92.7%)
+
+**Why it failed**: Two reasons:
+1. Lost 130K training lines (18% of data) — those lines had useful general G2P examples
+2. PLAIN eval uses Dv3 phonemes as reference, but Wv10 was trained on Dv5 phonemes. For the 116K re-phonemized lines, the targets diverge from the eval reference.
+
+### Fix attempt 3: "Just fix preprocess_text()" (NOT ATTEMPTED — dead end identified)
+
+**Idea**: Fix `preprocess_text()` to expand standalone years as years (not cardinals), e.g. "1996" → "nineteen ninety six". No retraining needed — just a preprocessing change.
+
+**Why it's a dead end**: We tested preprocess_text() against the DATE gold data. It already produces correct output for 144/148 cases (97%). The 4 failures are decade patterns ("1990s" → "the nineteen nineties"). Fixing those 4 would only help 2.7% of DATE cases.
+
+The real problem: the Wv8 model produces **garbled phonemes** for the expanded text:
+
+```
+"first"     → model: fˈɜɹsθ      expected: fˈɜɹst     (θ instead of t)
+"thousand"  → model: ʤ θˈWzᵊnd    expected: θˈWzᵊnd     (extra ʤ inserted)
+"fourth"    → model: fˈɔv θˈ      expected: fˈɔɹθ       (completely wrong)
+"seventeen" → model: sˌɛv ntˈin   expected: sˌɛvəntˈin  (missing ən)
+```
+
+The preprocessing is correct. The model is broken for these inputs because it was trained on mismatched data. Fixing preprocessing doesn't fix the model.
+
+### Current status
+
+Wv8 remains the best model (96.4% PLAIN, 92.7% grand total) with the DATE regression unresolved (8.8%). All three fix attempts failed. The core tension:
+
+1. `preprocess_text()` must expand numbers (CTC constraint)
+2. Expanding numbers changes the text the model sees
+3. Phoneme targets were generated from raw text (before expansion)
+4. Re-generating targets with Misaki loses 130K lines (Misaki can't handle proper nouns)
+5. The model trained on mismatched data produces garbled phonemes for expanded numbers
+
+Resolving this likely requires either:
+- A better phonemizer that doesn't fail on proper nouns (so we can re-generate all targets)
+- Fixing preprocess_text() year handling AND retraining on aligned data
+- A completely different approach to number handling in the G2P pipeline
+
+### What we can't reproduce
+
+We don't know exactly what data Wv8 was trained on. The blog said "same 750K dataset" but no file combination matches 750K. Batch count analysis suggests ~940K total pairs, which matches either:
+- Candidate A: `data/g2p_train_v3.tsv` + `augment_v3:5` + `llm_clean:5` = 937K
+- Candidate B: `data/g2p_train_v4.tsv` + `augment_v5:5` = 946K
+
+Both candidate configurations are recorded in `data/g2p_v8/data_manifest.json`. We added `train_setup.json` logging (commit 3ebe9e8) to prevent this from happening again.
+
+### Lessons
+
+See `LESSONS.md` for detailed rules. The short version:
+1. Log exact data files for every training run (now automated via train_setup.json)
+2. `grep -c '❓' data.tsv` before every training run
+3. Any change to data loading is a data change — diff check before committing
+4. Don't regenerate data without testing on 100 lines first
+5. When investigating a regression, trace examples through the FULL pipeline before proposing fixes
+6. Never say "double-checked" without inspecting actual output data
+
+---
+
+## Optimization Round 3: G2P Pre-alloc + WMMA TF32 + SineGen Cleanup + TTS Profile (2026-03-14)
+
+Four optimizations in one round: eliminating CUDA graph invalidation, tensor core acceleration for the fused FFN, memory reclamation for SineGen, and profiling TTS to find next bottlenecks.
+
+### Item 1: Pre-allocate G2P workspace at max T
+
+**Problem**: When a text longer than any previous input arrived, the G2P workspace grew via `cudaFree` + `cudaMalloc`. This changed the base pointer, invalidating all cached CUDA graphs (whose pointers were baked in during capture). Every cached graph had to be re-captured.
+
+**Fix**: Allocate workspace at `max_pos_` (2048) size during `load_from_file_()`. The workspace is 89.7 MB (dominated by `h*T*T` attention scores at 64 MB for T=2048). Trivial next to TTS's 327 MB. The grow-and-invalidate block in `infer()` becomes a simple bounds check that should never fire.
+
+**Result**: Graphs are never invalidated regardless of input sequence. Cached replay confirmed at 2.7ms.
+
+### Item 2: WMMA TF32 GEMV in fused FFN kernel (reverted — no improvement)
+
+**Problem**: The fused FFN kernel's scalar GEMV (gate+up and down projections) was suspected to be slower than cuBLAS tensor cores (1.1ms vs 0.3ms in earlier testing — 3.7x gap).
+
+**Approach**: Replace scalar dot-product loops with WMMA 16x16x8 TF32 matrix-multiply fragments. Each warp processes 16-wide output tiles, accumulating over the input dimension in chunks of 8.
+
+**Challenge — Opaque fragment layout**: The WMMA API treats fragment element mappings as opaque. Can't manually fill `b_frag.x[i]` — `i % 8` doesn't map to row index. First attempt also tried `store_matrix_sync` to thread-local arrays (a warp-cooperative op that requires shared memory). Rewrote using per-warp shared memory broadcast buffers (128 floats per warp for B fragment, 256 floats for accumulator store).
+
+**A/B benchmark result**: Both scalar and WMMA achieve **1.1ms cached replay**. WMMA wasted 15/16 of tensor core compute broadcasting the input vector across 16 columns of the B fragment. The broadcast buffer fill (128 floats per warp per k-chunk) and accumulator store/extract added overhead that negated any tensor core throughput advantage. The scalar version with coalesced memory access (from the weight transpose) was already memory-bandwidth-limited, not compute-limited — tensor cores couldn't help.
+
+**Decision**: Reverted WMMA. Kept scalar FFN kernel (simpler, same speed, full FP32 precision). The `-arch=native` Makefile change was kept since it generates correct code for our Blackwell GPU regardless.
+
+**Lesson**: WMMA is designed for GEMM, not GEMV. For matrix-vector products, the 16-wide N dimension is pure waste. The earlier "cuBLAS 0.3ms" measurement was likely a batched GEMM (multiple columns), not a single-column GEMV. For true GEMV on small matrices (256×2048), scalar with coalesced access is hard to beat.
+
+### Item 3: TTS nsys profile
+
+**Approach**: Profile-only, no code changes. Run nsys to identify where time actually goes.
+
+**Key findings** (49 tokens, T=49, medium-length text, 28.2ms total):
+
+| Kernel Category | Time (ms) | % | Instances | Avg (us) |
+|---|---|---|---|---|
+| im2col + simt SGEMM (conv) | 6.2 | 31% | 150 | 41 |
+| Cutlass tensorop GEMM | 4.7 | 23% | 42 | 112 |
+| Instance norm (AdaIN) | 2.3 | 11% | 70 | 32 |
+| cuBLAS GEMV | 1.6 | 8% | 765 | 2.1 |
+| LSTM gates | 1.1 | 5% | 754 | 1.4 |
+| Weight norm | 0.8 | 4% | 89 | 8.7 |
+| Channel bias add | 0.5 | 3% | 76 | 7.1 |
+| Snake activation | 0.4 | 2% | 48 | 9.3 |
+| Everything else | 2.6 | 13% | — | — |
+
+**Observations**:
+- **im2col + simt SGEMM (31%)**: Convolutions using `im2col` unfold + non-tensor-core SGEMM (`align1`). The `align1` variant means weight layout doesn't meet tensor core alignment requirements. Aligning weights to 4-float boundaries would unlock tensor core GEMM and potentially 3-4x speedup for these ops.
+- **LSTM gates (754 instances!)**: Tiny kernels (1.4 us each) with massive launch count. Each bidirectional LSTM timestep is a separate kernel. Fusing all timesteps or using CUDA graphs for the LSTM section could eliminate launch overhead.
+- **cuBLAS GEMV (765 instances)**: Similarly tiny. These are the LSTM matrix-vector products.
+- **Launch overhead**: Total kernel time ~20ms, total wall time 28ms → ~8ms in launch overhead + CPU work. This is ~29% overhead, confirming that kernel fusion / CUDA graphs would help significantly.
+- **Encode-phase graph** is feasible: ~100 kernels before the L sync point. Cache per-T like G2P.
+
+### Item 4: SineGen save/restore
+
+**Problem**: SineGen allocated `d_phase_low` (L2*9 floats), `d_har_source` (T_audio floats), and `d_rand_ini` (9 floats) from `decode_arena` but never reclaimed them. Wasted ~0.5-2.5 MB depending on text length.
+
+**Fix**: Wrap in `decode_arena.save()` / `decode_arena.restore()` around the SineGen temporaries (keeping `d_gen_har` outside since it must persist). Updated `compute_decode_bytes()` to take `max(sinegen_temps, generator_pool)` instead of summing both, since they now overlap.
+
+**Safety**: All ops are on the same CUDA stream — stream ordering guarantees SineGen kernels complete before any subsequent kernel writes to the reclaimed region. Same pattern used for F0/N chains at line 995.
+
+### Summary
+
+| Change | Effect |
+|---|---|
+| G2P workspace pre-alloc | Graphs never invalidated, 89.7 MB upfront |
+| WMMA TF32 FFN | No improvement — reverted. Scalar GEMV already at 1.1ms |
+| SineGen save/restore | ~0.5-2.5 MB reclaimed per inference |
+| TTS profile | Identified im2col+SGEMM (31%) and LSTM launch overhead (13%) as top targets |
+
+### Files changed
+
+| File | Changes |
+|---|---|
+| `src/g2p.h` | Pre-allocate workspace at max_pos_ in `load_from_file_()`, replace grow-and-invalidate with bounds check in `infer()` |
+| `src/tts.cpp` | SineGen save/restore around temporaries, updated `compute_decode_bytes()` to overlap SineGen temps with generator pool |
+| `Makefile` | Added `-arch=native` to NVFLAGS |
+
+---
+
+## Optimization Round 4: Fused FFN was a regression — cuBLAS SGEMM wins (2026-03-15)
+
+### Discovery: the fused kernel was slower, not faster
+
+Built a proper benchmark harness (`bench.sh`) to measure G2P and TTS timing with 10 warmup runs and 30 timed runs, reporting median/p95/min/max. First benchmark revealed the fused FFN scalar kernel (introduced in Round 2) was actually a **regression** compared to the original cuBLAS SGEMM calls.
+
+The key insight: the fused kernel processes each of T columns independently as scalar GEMV, doing `O(d × ff)` scalar multiply-adds per thread block. cuBLAS processes all T columns simultaneously as a single SGEMM, using tensor cores. For T>1 (which is always true for real text), batched GEMM is fundamentally more efficient than T separate GEMVs.
+
+**A/B benchmark results:**
+
+| Variant | G2P short | G2P medium | Notes |
+|---|---|---|---|
+| Baseline (last commit, no CUDA graphs, cuBLAS FFN) | 0.73ms | 0.91ms | Separate gate/up SGEMM + SwiGLU + down SGEMM |
+| Fused FFN kernel (scalar GEMV, with CUDA graphs) | 1.10ms | 1.36ms | 1.5x slower despite graphs! |
+| cuBLAS SGEMM FFN (with CUDA graphs) | 0.34ms | 0.48ms | **2x faster than baseline** |
+
+The fused kernel's per-column scalar GEMV was so slow it negated the entire benefit of CUDA graphs. Replacing it with cuBLAS SGEMM *and* keeping CUDA graphs gave a 2x improvement over the original.
+
+### Implementation
+
+Replaced the single `g2p_fused_ffn_kernel` call with 5 operations per layer:
+
+1. `g2p_bias_rms_norm_kernel` — fused out_bias + RMSNorm → normed
+2. `cublasSgemm` — gate+up GEMM: `ffn_out[2*ff, T] = gate_up_w[2*ff, d] × normed[d, T]`
+3. `g2p_swiglu_bias_kernel` — fused bias + SwiGLU on interleaved layout
+4. `cublasSgemm` — down GEMM with `beta=1` for fused residual: `X += down_w[d, ff] × ffn_out[ff, T]`
+5. `g2p_bias_kernel` — down bias
+
+The gate_up_w weight transpose from Round 2 was already correct for this: stored as `[d, 2*ff]` row-major = `[2*ff, d]` col-major, matching cuBLAS `CUBLAS_OP_N` with `lda=2*ff`. For the down GEMM, `ldb=2*ff` lets cuBLAS read only the first ff rows of the interleaved ffn_out buffer (SwiGLU output sits in the gate half).
+
+Added `ffn_out[2*ff, T]` to workspace layout and pre-alloc formula. Workspace grew from 89.7 MB to 105.7 MB.
+
+### Benchmark harness
+
+Added `bench.sh` — starts server, warms up graph caches, runs N timed requests per text (short/medium/long), reports median/p95 timing and RTFx. Takes its own `flock --exclusive /tmp/gpu.lock` for the entire run.
+
+Added STT verification: after benchmarking, saves one audio per text and runs it through paraketto STT. Compares normalized transcription against input text. All three lengths pass.
+
+### Final benchmark results
+
+```
+=== Rokoko Benchmark ===
+Warmup: 10 | Timed runs: 30
+
+--- short (1.60s audio) ---
+           median       p95       min       max
+  G2P:       0.34      0.40      0.33      0.43  ms
+  TTS:      10.58     15.11     10.41     15.71  ms
+  Total:    11.61     17.17     11.38     17.82  ms
+  RTFx:       138x        93x  (median / p95)
+
+--- medium (5.72s audio) ---
+  G2P:       0.48      0.54      0.46      0.55  ms
+  TTS:      36.36     42.55     36.29     43.55  ms
+  Total:    38.36     45.10     38.07     45.74  ms
+  RTFx:       149x       127x  (median / p95)
+
+--- long (18.82s audio) ---
+  G2P:       0.70      0.73      0.64      0.77  ms
+  TTS:     121.06    121.50    120.92    121.93  ms
+  Total:   125.43    126.03    125.07    126.62  ms
+  RTFx:       150x       149x  (median / p95)
+
+=== STT Verification (paraketto) ===
+  short: PASS
+  medium: PASS
+  long: PASS
+```
+
+### Lesson learned
+
+Kernel fusion is not always a win. Fusing 5 kernel launches into 1 sounds great for reducing launch overhead, but if the fused kernel uses a fundamentally worse algorithm (per-column scalar GEMV vs batched GEMM with tensor cores), the compute regression dominates. The fused kernel's 1.1ms per-layer execution (memory-bandwidth-limited scalar dot products) dwarfed the ~0.1ms of launch overhead it saved.
+
+**Rule of thumb**: if cuBLAS can process the full batch in a single SGEMM call, don't try to beat it with hand-written GEMV — even inside a fused kernel.
+
+### Files changed
+
+| File | Changes |
+|---|---|
+| `src/g2p.h` | Replace fused FFN kernel with cuBLAS SGEMM + small fused kernels, add ffn_out to workspace, update pre-alloc formula |
+| `bench.sh` | New benchmark harness with warmup, median/p95 stats, STT verification via paraketto |
+
+---
