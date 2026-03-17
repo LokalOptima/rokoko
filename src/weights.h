@@ -14,9 +14,6 @@
 #include <vector>
 
 #include <cuda_runtime.h>
-// FP32 throughout
-#include <cublas_v2.h>
-#include <cublasLt.h>
 
 // ---------------------------------------------------------------------------
 // Utility macros
@@ -28,16 +25,6 @@
         if (err != cudaSuccess) {                                              \
             fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,  \
                     cudaGetErrorString(err));                                   \
-            std::exit(1);                                                      \
-        }                                                                      \
-    } while (0)
-
-#define CUBLAS_CHECK(call)                                                     \
-    do {                                                                       \
-        cublasStatus_t err = (call);                                           \
-        if (err != CUBLAS_STATUS_SUCCESS) {                                    \
-            fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__,          \
-                    __LINE__, (int)err);                                        \
             std::exit(1);                                                      \
         }                                                                      \
     } while (0)
@@ -378,7 +365,6 @@ size_t compute_decode_bytes(int T, int L);
 /// Run Kokoro inference: phoneme token IDs + style vector → audio samples.
 std::vector<float> rokoko_infer(const Weights& w,
     const int* token_ids, int T, const float* style_vec,
-    cublasHandle_t cublas, cublasLtHandle_t ltHandle,
     cudaStream_t stream, GpuArena& arena, GpuArena& decode_arena,
     float* d_workspace, size_t workspace_bytes);
 

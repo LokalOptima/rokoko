@@ -22,8 +22,6 @@
 #include <unistd.h>
 
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
-#include <cublasLt.h>
 
 #include "weights.h"
 #include "kernels.h"
@@ -286,8 +284,6 @@ static std::vector<Chunk> chunk_ipa(const std::string& ipa) {
 struct TtsPipeline {
     Weights& weights;
     G2PModelCuda& g2p;
-    cublasHandle_t cublas;
-    cublasLtHandle_t ltHandle;
     cudaStream_t stream;
     GpuArena& encode_arena;
     GpuArena& decode_arena;
@@ -319,7 +315,7 @@ struct TtsPipeline {
 
         // G2P
         t0 = clk::now();
-        std::string ipa = g2p.infer(preprocessed, ltHandle, stream);
+        std::string ipa = g2p.infer(preprocessed, stream);
         t1 = clk::now();
         last_g2p_ms = ms(t0, t1);
         fprintf(stderr, "G2P: \"%s\" (%.1f ms)\n", ipa.c_str(), last_g2p_ms);
@@ -349,7 +345,7 @@ struct TtsPipeline {
             const float* style = voice_data + phoneme_count * 256;
 
             auto audio = rokoko_infer(weights, chunk.tokens.data(), T, style,
-                                       cublas, ltHandle, stream, encode_arena,
+                                       stream, encode_arena,
                                        decode_arena, d_workspace, ws_bytes);
             fprintf(stderr, "  chunk %zu: T=%d, %zu samples (%.2fs), decode arena=%.1f MB\n",
                     c, T, audio.size(), audio.size()/24000.0, decode_arena.offset/1e6);
@@ -536,13 +532,6 @@ int main(int argc, char** argv) {
             prefetched.gpu_data_size / 1e6, g2p.param_bytes() / 1e6);
 
     // --- cuBLAS handles ---
-    cublasHandle_t cublas;
-    CUBLAS_CHECK(cublasCreate(&cublas));
-    CUBLAS_CHECK(cublasSetStream(cublas, stream));
-    CUBLAS_CHECK(cublasSetMathMode(cublas, CUBLAS_TF32_TENSOR_OP_MATH));
-    cublasLtHandle_t ltHandle;
-    CUBLAS_CHECK(cublasLtCreate(&ltHandle));
-
     // --- Voice map ---
     VoiceMap voices = build_voice_map(bundle);
 
@@ -564,7 +553,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Encode arena: %.0f MB | Workspace: %.0f MB | Decode arena: on demand\n",
                 ENCODE_ARENA_BYTES / 1e6, WORKSPACE_BYTES / 1e6);
 
-        TtsPipeline pipeline{prefetched, g2p, cublas, ltHandle, stream,
+        TtsPipeline pipeline{prefetched, g2p, stream,
                              encode_arena, decode_arena, d_workspace, WORKSPACE_BYTES, voices};
 
         run_server(pipeline, serve_host, serve_port);
@@ -575,8 +564,6 @@ int main(int argc, char** argv) {
         encode_arena.destroy();
         g2p.free();
         prefetched.free();
-        cublasLtDestroy(ltHandle);
-        cublasDestroy(cublas);
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     }
@@ -593,7 +580,7 @@ int main(int argc, char** argv) {
 
     // --- G2P infer ---
     auto t_g2p0 = clk::now();
-    std::string ipa = g2p.infer(preprocessed, ltHandle, stream);
+    std::string ipa = g2p.infer(preprocessed, stream);
     auto t_g2p1 = clk::now();
     fprintf(stderr, "G2P: \"%s\" (%.1f ms)\n", ipa.c_str(), ms(t_g2p0, t_g2p1));
 
@@ -643,7 +630,7 @@ int main(int argc, char** argv) {
 
         auto t0 = clk::now();
         auto audio = rokoko_infer(prefetched, chunk.tokens.data(), T, style,
-                                   cublas, ltHandle, stream, encode_arena,
+                                   stream, encode_arena,
                                    decode_arena, d_workspace, WORKSPACE_BYTES);
         auto t1 = clk::now();
 
@@ -668,8 +655,6 @@ int main(int argc, char** argv) {
     // Cleanup
     g2p.free();
     prefetched.free();
-    cublasLtDestroy(ltHandle);
-    cublasDestroy(cublas);
     CUDA_CHECK(cudaStreamDestroy(stream));
     return 0;
 }

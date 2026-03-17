@@ -13,93 +13,93 @@
 #include <vector>
 
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
-#include <cublasLt.h>
 #include "weights.h"
 #include "kernels.h"
 
 // ---------------------------------------------------------------------------
-// cuBLAS SGEMM wrapper
+// Cutlass GEMM (extern, defined in cutlass_gemm.cu)
+// ---------------------------------------------------------------------------
+extern "C" int cutlass_gemm_tn(int M, int N, int K,
+    const float* A, int lda, const float* B, int ldb,
+    float* C, int ldc, float alpha, float beta,
+    float* workspace, size_t workspace_bytes, cudaStream_t stream);
+extern "C" int cutlass_gemm_nt(int M, int N, int K,
+    const float* A, int lda, const float* B, int ldb,
+    float* C, int ldc, float alpha, float beta,
+    float* workspace, size_t workspace_bytes, cudaStream_t stream);
+extern "C" int cutlass_gemm_nn(int M, int N, int K,
+    const float* A, int lda, const float* B, int ldb,
+    float* C, int ldc, float alpha, float beta,
+    float* workspace, size_t workspace_bytes, cudaStream_t stream);
+extern "C" int cutlass_gemm_batched_tn(int M, int N, int K,
+    const float* A, int lda, long long strideA,
+    const float* B, int ldb, long long strideB,
+    float* C, int ldc, long long strideC,
+    int batch_count, float alpha, float beta,
+    float* workspace, size_t workspace_bytes, cudaStream_t stream);
+extern "C" int cutlass_gemm_batched_nn(int M, int N, int K,
+    const float* A, int lda, long long strideA,
+    const float* B, int ldb, long long strideB,
+    float* C, int ldc, long long strideC,
+    int batch_count, float alpha, float beta,
+    float* workspace, size_t workspace_bytes, cudaStream_t stream);
+
+// Workspace pointer + size, threaded through all functions
+static float* s_workspace = nullptr;
+static size_t s_workspace_bytes = 0;
+
+// ---------------------------------------------------------------------------
+// GEMM wrappers: drop-in replacements for the old cuBLAS wrappers
 // ---------------------------------------------------------------------------
 
-// C = alpha * op(A) * op(B) + beta * C  (all FP32)
-static void sgemm(cublasHandle_t cublas,
-                  cublasOperation_t transa, cublasOperation_t transb,
-                  int m, int n, int k,
-                  const float* A, int lda,
-                  const float* B, int ldb,
-                  float* C, int ldc,
-                  float alpha = 1.0f, float beta = 0.0f) {
-    CUBLAS_CHECK(cublasSgemm(cublas, transa, transb, m, n, k,
-                              &alpha, A, lda, B, ldb, &beta, C, ldc));
+// C = alpha * A^T * B + beta * C
+static void sgemm_tn(int m, int n, int k,
+                      const float* A, int lda,
+                      const float* B, int ldb,
+                      float* C, int ldc,
+                      cudaStream_t stream,
+                      float alpha = 1.0f, float beta = 0.0f) {
+    if (n == 1) {
+        // GEMV: y[m] = alpha * A[k,m]^T * x[k] + beta * y[m]
+        gemv_tn_f32(A, lda, B, C, m, k, alpha, beta, stream);
+        return;
+    }
+    cutlass_gemm_tn(m, n, k, A, lda, B, ldb, C, ldc,
+                     alpha, beta, s_workspace, s_workspace_bytes, stream);
 }
 
-// Strided batched SGEMM
-static void sgemm_strided_batched(cublasHandle_t cublas,
-                                   cublasOperation_t transa,
-                                   cublasOperation_t transb,
-                                   int m, int n, int k,
-                                   const float* A, int lda, long long strideA,
-                                   const float* B, int ldb, long long strideB,
-                                   float* C, int ldc, long long strideC,
-                                   int batch_count,
-                                   float alpha = 1.0f, float beta = 0.0f) {
-    CUBLAS_CHECK(cublasSgemmStridedBatched(
-        cublas, transa, transb, m, n, k,
-        &alpha, A, lda, strideA, B, ldb, strideB,
-        &beta, C, ldc, strideC, batch_count));
+// C = alpha * A * B^T + beta * C
+static void sgemm_nt(int m, int n, int k,
+                      const float* A, int lda,
+                      const float* B, int ldb,
+                      float* C, int ldc,
+                      cudaStream_t stream,
+                      float alpha = 1.0f, float beta = 0.0f) {
+    cutlass_gemm_nt(m, n, k, A, lda, B, ldb, C, ldc,
+                     alpha, beta, s_workspace, s_workspace_bytes, stream);
 }
 
-// ---------------------------------------------------------------------------
-// cuBLASLt SGEMM with fused bias epilogue
-//   C[m,n] = alpha * op(A)[m,k] * op(B)[k,n] + bias[m]
-//   Matches the sgemm() signature but fuses bias_add into the GEMM.
-//   Uses a pre-created cublasLtHandle — caller manages lifetime.
-// ---------------------------------------------------------------------------
+// C = alpha * A * B + beta * C
+static void sgemm_nn(int m, int n, int k,
+                      const float* A, int lda,
+                      const float* B, int ldb,
+                      float* C, int ldc,
+                      cudaStream_t stream,
+                      float alpha = 1.0f, float beta = 0.0f) {
+    cutlass_gemm_nn(m, n, k, A, lda, B, ldb, C, ldc,
+                     alpha, beta, s_workspace, s_workspace_bytes, stream);
+}
 
-static void sgemm_bias(cublasLtHandle_t ltHandle,
-                        cublasOperation_t transa, cublasOperation_t transb,
-                        int m, int n, int k,
+// C = alpha * A^T * B + bias + beta * C  (GEMM + separate bias add)
+static void sgemm_bias(int m, int n, int k,
                         const float* A, int lda,
                         const float* B, int ldb,
                         float* C, int ldc,
                         const float* bias,
                         cudaStream_t stream) {
-    cublasLtMatmulDesc_t matmulDesc;
-    cublasLtMatrixLayout_t Adesc, Bdesc, Cdesc;
-
-    cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
-    cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA,
-                                    &transa, sizeof(transa));
-    cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB,
-                                    &transb, sizeof(transb));
-
-    // Set bias epilogue
-    cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
-    cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_EPILOGUE,
-                                    &epilogue, sizeof(epilogue));
-    cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
-                                    &bias, sizeof(bias));
-
-    // Matrix layouts (column-major)
-    int rowsA = (transa == CUBLAS_OP_N) ? m : k;
-    int colsA = (transa == CUBLAS_OP_N) ? k : m;
-    int rowsB = (transb == CUBLAS_OP_N) ? k : n;
-    int colsB = (transb == CUBLAS_OP_N) ? n : k;
-    cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_32F, rowsA, colsA, lda);
-    cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_32F, rowsB, colsB, ldb);
-    cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_32F, m, n, ldc);
-
-    float alpha = 1.0f, beta = 0.0f;
-    cublasLtMatmul(ltHandle, matmulDesc,
-                    &alpha, A, Adesc, B, Bdesc,
-                    &beta, C, Cdesc, C, Cdesc,
-                    nullptr, nullptr, 0, stream);
-
-    cublasLtMatrixLayoutDestroy(Adesc);
-    cublasLtMatrixLayoutDestroy(Bdesc);
-    cublasLtMatrixLayoutDestroy(Cdesc);
-    cublasLtMatmulDescDestroy(matmulDesc);
+    cutlass_gemm_tn(m, n, k, A, lda, B, ldb, C, ldc,
+                     1.0f, 0.0f, s_workspace, s_workspace_bytes, stream);
+    channel_bias_add_f32(C, bias, m, n, stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -125,8 +125,7 @@ static std::unordered_map<const float*, float*> s_w_nhwc;
 // gemm_conv1d: Conv1d forward.
 //   When residual != nullptr: y = conv(x,w) + residual, then bias_add(y, bias).
 //   When residual == nullptr: y = conv(x,w) + bias (fused in Cutlass epilogue).
-static void gemm_conv1d(cublasHandle_t cublas,
-                         const float* x, const float* w, const float* bias,
+static void gemm_conv1d(const float* x, const float* w, const float* bias,
                          float* y, float* workspace, size_t workspace_bytes,
                          int C_in, int C_out, int T_in, int K,
                          int stride, int padding, int dilation,
@@ -139,8 +138,6 @@ static void gemm_conv1d(cublasHandle_t cublas,
     if (K > 1) {
         auto it = s_w_nhwc.find(w);
         if (it != s_w_nhwc.end()) {
-            // With residual: Cutlass does y = conv + residual, bias added after
-            // Without residual: Cutlass does y = conv + bias (fused epilogue)
             const float* cutlass_bias = residual ? nullptr : bias;
             int rc = cutlass_conv1d_fprop(x, it->second, cutlass_bias, y,
                                            residual, workspace, workspace_bytes,
@@ -154,7 +151,7 @@ static void gemm_conv1d(cublasHandle_t cublas,
         }
     }
 
-    // cuBLAS path: im2col + SGEMM
+    // Cutlass GEMM fallback: im2col + SGEMM
     const float* col = x;
     if (K > 1 || stride > 1 || padding > 0 || dilation > 1) {
         float* col_buf = workspace;
@@ -163,15 +160,7 @@ static void gemm_conv1d(cublasHandle_t cublas,
         col = col_buf;
     }
 
-    float alpha = 1.0f, beta = 0.0f;
-    CUBLAS_CHECK(cublasSgemm(cublas,
-                             CUBLAS_OP_T, CUBLAS_OP_N,
-                             C_out, T_out, CK,
-                             &alpha,
-                             w, CK,
-                             col, CK,
-                             &beta,
-                             y, C_out));
+    sgemm_tn(C_out, T_out, CK, w, CK, col, CK, y, C_out, stream);
 
     if (residual) {
         add_f32(y, residual, y, C_out * T_out, stream);
@@ -184,8 +173,7 @@ static void gemm_conv1d(cublasHandle_t cublas,
 // im2col + cuBLAS ConvTranspose1d: GEMM + col2im
 //   x[T_in, C_in] * w[C_in, C_out, K] → y[T_out, C_out]
 //   T_out = (T_in - 1) * stride - 2*padding + K + output_padding
-static void gemm_conv_transpose1d(cublasHandle_t cublas,
-                                    const float* x, const float* w, const float* bias,
+static void gemm_conv_transpose1d(const float* x, const float* w, const float* bias,
                                     float* y, float* workspace, size_t workspace_bytes,
                                     int C_in, int C_out, int T_in, int K,
                                     int stride, int padding, int output_padding,
@@ -193,24 +181,9 @@ static void gemm_conv_transpose1d(cublasHandle_t cublas,
     int T_out = (T_in - 1) * stride - 2 * padding + K + output_padding;
     int COK = C_out * K;
 
-    // GEMM: col[T_in, COK] = x[T_in, C_in] × w[C_in, COK]
-    // Row-major [T_in, COK] = col-major [COK, T_in]
-    //   x row-major [T_in, C_in] = col-major [C_in, T_in], ldb=C_in
-    //   w row-major [C_in, COK] = col-major [COK, C_in], lda=COK
-    //   col = col-major [COK, T_in], ldc=COK
-    // cuBLAS: C[COK,T_in] = A[COK,C_in] * B[C_in,T_in]
-    //   A=w (col-major [COK,C_in]), transa=OP_N
-    //   B=x (col-major [C_in,T_in]), transb=OP_N
+    // GEMM: C[COK,T_in] = A[COK,C_in] * B[C_in,T_in]  (OP_N, OP_N)
     float* col_buf = workspace;
-    float alpha = 1.0f, beta_zero = 0.0f;
-    CUBLAS_CHECK(cublasSgemm(cublas,
-                             CUBLAS_OP_N, CUBLAS_OP_N,
-                             COK, T_in, C_in,
-                             &alpha,
-                             w, COK,           // A: col-major [COK, C_in]
-                             x, C_in,          // B: col-major [C_in, T_in]
-                             &beta_zero,
-                             col_buf, COK));    // C: col-major [COK, T_in] = row-major [T_in, COK]
+    sgemm_nn(COK, T_in, C_in, w, COK, x, C_in, col_buf, COK, stream);
 
     // Initialize y: broadcast bias or zero
     if (bias) {
@@ -253,7 +226,6 @@ struct AlbertBuffers {
 
 // Run ALBERT encoder: input_ids[T] -> hidden[T, 768]
 static void albert_forward(const Weights& w, AlbertBuffers& buf,
-                           cublasHandle_t cublas, cublasLtHandle_t ltHandle,
                            cudaStream_t stream, int T) {
     // Step 1: Embeddings
     embedding_gather(w.bert_word_embed, buf.token_ids, buf.emb, T, 128, stream);
@@ -262,8 +234,8 @@ static void albert_forward(const Weights& w, AlbertBuffers& buf,
     layer_norm_f32(buf.emb, w.bert_embed_ln_w, w.bert_embed_ln_b,
                    buf.emb, T, 128, 1e-12f, stream);
 
-    // Step 2: Project 128 -> 768 (GEMM + fused bias)
-    sgemm_bias(ltHandle, CUBLAS_OP_T, CUBLAS_OP_N, 768, T, 128,
+    // Step 2: Project 128 -> 768 (GEMM + bias)
+    sgemm_bias(768, T, 128,
                w.bert_proj_w, 128, buf.emb, 128, buf.hidden, 768,
                w.bert_proj_b, stream);
 
@@ -275,38 +247,36 @@ static void albert_forward(const Weights& w, AlbertBuffers& buf,
         float* K = buf.qkv + T * 768;
         float* V = buf.qkv + T * 768 * 2;
 
-        sgemm_bias(ltHandle, CUBLAS_OP_T, CUBLAS_OP_N, 768, T, 768,
+        sgemm_bias(768, T, 768,
                    a.q_w, 768, buf.hidden, 768, Q, 768, a.q_b, stream);
-        sgemm_bias(ltHandle, CUBLAS_OP_T, CUBLAS_OP_N, 768, T, 768,
+        sgemm_bias(768, T, 768,
                    a.k_w, 768, buf.hidden, 768, K, 768, a.k_b, stream);
-        sgemm_bias(ltHandle, CUBLAS_OP_T, CUBLAS_OP_N, 768, T, 768,
+        sgemm_bias(768, T, 768,
                    a.v_w, 768, buf.hidden, 768, V, 768, a.v_b, stream);
 
         // Multi-head attention: 12 heads, 64 dim each
         // scores[h] = Q_h @ K_h^T / sqrt(64)
         float scale = 1.0f / sqrtf(64.0f);
-        sgemm_strided_batched(cublas,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            T, T, 64,
+        cutlass_gemm_batched_tn(T, T, 64,
             K, 768, 64,
             Q, 768, 64,
             buf.attn_scores, T, (long long)T * T,
-            12, scale);
+            12, scale, 0.0f,
+            s_workspace, s_workspace_bytes, stream);
 
         // Softmax over last dim of scores[h, t, :]
         softmax_f32(buf.attn_scores, buf.attn_scores, 12 * T, T, stream);
 
         // Attn output: context = scores @ V per head
-        sgemm_strided_batched(cublas,
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            64, T, T,
+        cutlass_gemm_batched_nn(64, T, T,
             V, 768, 64,
             buf.attn_scores, T, (long long)T * T,
             buf.attn_out, 768, 64,
-            12);
+            12, 1.0f, 0.0f,
+            s_workspace, s_workspace_bytes, stream);
 
         // Dense projection: attn_out @ dense_w^T + dense_b -> [T, 768]
-        sgemm_bias(ltHandle, CUBLAS_OP_T, CUBLAS_OP_N, 768, T, 768,
+        sgemm_bias(768, T, 768,
                    a.dense_w, 768, buf.attn_out, 768, buf.temp, 768,
                    a.dense_b, stream);
 
@@ -315,12 +285,12 @@ static void albert_forward(const Weights& w, AlbertBuffers& buf,
                                  buf.hidden, T, 768, 1e-12f, stream);
 
         // --- FFN ---
-        sgemm_bias(ltHandle, CUBLAS_OP_T, CUBLAS_OP_N, 2048, T, 768,
+        sgemm_bias(2048, T, 768,
                    a.ffn_w, 768, buf.hidden, 768, buf.ff_mid, 2048,
                    a.ffn_b, stream);
         gelu_f32(buf.ff_mid, buf.ff_mid, T * 2048, stream);
 
-        sgemm_bias(ltHandle, CUBLAS_OP_T, CUBLAS_OP_N, 768, T, 2048,
+        sgemm_bias(768, T, 2048,
                    a.ffn_out_w, 2048, buf.ff_mid, 2048, buf.ff_out, 768,
                    a.ffn_out_b, stream);
 
@@ -350,13 +320,12 @@ struct TextEncoderBuffers {
 static void bilstm_gpu(const float* d_input, float* d_output,
                         const Weights::BiLSTMWeights& lstm_w,
                         int T, int input_size, int hidden_size,
-                        cublasHandle_t cublas, cudaStream_t stream,
-                        GpuArena& arena);
+                        cudaStream_t stream, GpuArena& arena);
 
 // Run text encoder: input_ids[T] -> output[T, 512]
 static void text_encoder_forward(const Weights& w, TextEncoderBuffers& buf,
                                   const int* token_ids_gpu,
-                                  cublasHandle_t cublas, cudaStream_t stream,
+                                  cudaStream_t stream,
                                   int T, GpuArena& arena,
                                   float* workspace = nullptr,
                                   size_t workspace_bytes = 0) {
@@ -370,7 +339,7 @@ static void text_encoder_forward(const Weights& w, TextEncoderBuffers& buf,
         auto& blk = w.text_conv[i];
 
         // Conv1d: [T, 512] -> [T, 512] — wv already has precomputed weight
-        gemm_conv1d(cublas, x, blk.conv_wv, blk.conv_b, buf.conv_out,
+        gemm_conv1d(x, blk.conv_wv, blk.conv_b, buf.conv_out,
                      workspace, workspace_bytes, 512, 512, T, 5, 1, 2, 1, stream);
 
         // LayerNorm across channels
@@ -398,7 +367,7 @@ static void text_encoder_forward(const Weights& w, TextEncoderBuffers& buf,
     te_lstm_w.bhh_rev = w.text_lstm_bhh_rev;
     te_lstm_w.bias_fwd = w.text_lstm_bias_fwd;
     te_lstm_w.bias_rev = w.text_lstm_bias_rev;
-    bilstm_gpu(x, buf.lstm_out, te_lstm_w, T, 512, 256, cublas, stream, arena);
+    bilstm_gpu(x, buf.lstm_out, te_lstm_w, T, 512, 256, stream, arena);
 
     // Copy LSTM output back to emb for downstream use
     cudaMemcpyAsync(buf.emb, buf.lstm_out, T * 512 * sizeof(float),
@@ -419,8 +388,7 @@ static void text_encoder_forward(const Weights& w, TextEncoderBuffers& buf,
 static void bilstm_gpu(const float* d_input, float* d_output,
                         const Weights::BiLSTMWeights& lstm_w,
                         int T, int input_size, int hidden_size,
-                        cublasHandle_t cublas, cudaStream_t stream,
-                        GpuArena& arena) {
+                        cudaStream_t stream, GpuArena& arena) {
     int G = 4 * hidden_size;  // gate_size
     int H = hidden_size;
 
@@ -432,31 +400,28 @@ static void bilstm_gpu(const float* d_input, float* d_output,
     float* d_c       = arena.alloc<float>(H);
     float* d_h_zero  = arena.alloc<float>(H);
 
-    // Helper: run one direction using cuBLAS SGEMM + per-timestep SGEMV
+    // Helper: run one direction
     auto run_direction = [&](const float* wih, const float* whh,
                               const float* bias_combined,
                               float* d_h_all, bool reverse) {
-        // Step 1: Pre-compute input gates for all timesteps (batched GEMM)
-        sgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, G, T, input_size,
-              wih, input_size, d_input, input_size, d_ig, G);
+        // Step 1: Pre-compute input gates for all timesteps (Cutlass GEMM)
+        sgemm_tn(G, T, input_size,
+                 wih, input_size, d_input, input_size, d_ig, G, stream);
 
         // Add precomputed bias (bih + bhh)
         bias_add_f32(d_ig, bias_combined, d_ig, T, G, stream);
 
-        // Step 2: Per-timestep LSTM using cuBLAS SGEMV for Whh @ h
+        // Step 2: Per-timestep LSTM using GEMV for Whh @ h
         CUDA_CHECK(cudaMemsetAsync(d_c, 0, H * sizeof(float), stream));
         CUDA_CHECK(cudaMemsetAsync(d_h_zero, 0, H * sizeof(float), stream));
 
-        float one = 1.0f;
         for (int step = 0; step < T; step++) {
             int t = reverse ? (T - 1 - step) : step;
             int t_prev = reverse ? (t + 1) : (t - 1);
             const float* h_prev = (step == 0) ? d_h_zero : d_h_all + t_prev * H;
 
-            CUBLAS_CHECK(cublasSgemv(cublas, CUBLAS_OP_T,
-                                      H, G, &one,
-                                      whh, H, h_prev, 1, &one,
-                                      d_ig + t * G, 1));
+            // ig[t] += Whh^T * h_prev  (alpha=1, beta=1 to accumulate)
+            gemv_tn_f32(whh, H, h_prev, d_ig + t * G, G, H, 1.0f, 1.0f, stream);
             lstm_gates_f32(d_ig + t * G, d_c, d_c, d_h_all + t * H, H, stream);
         }
     };
@@ -497,10 +462,10 @@ static void adain_1d_forward(const float* x, const float* style,
                               const Weights::AdaIN1dWeights& ain_w,
                               float* y, float* fc_buf, float* norm_ws,
                               int C, int T, int style_dim,
-                              cublasHandle_t cublas, cudaStream_t stream,
+                              cudaStream_t stream,
                               const float* snake_alpha = nullptr) {
-    sgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, 2*C, 1, style_dim,
-          ain_w.fc_w, style_dim, style, style_dim, fc_buf, 2*C);
+    sgemm_tn(2*C, 1, style_dim,
+             ain_w.fc_w, style_dim, style, style_dim, fc_buf, 2*C, stream);
     bias_add_f32(fc_buf, ain_w.fc_b, fc_buf, 1, 2*C, stream);
 
     instance_norm_style_affine_f32(x, ain_w.norm_w, ain_w.norm_b,
@@ -521,7 +486,7 @@ static void adain_resblk1d_forward(const float* x, const float* style,
                                      float* fc_buf, float* y,
                                      int dim_in, int dim_out, int T,
                                      int style_dim,
-                                     cublasHandle_t cublas, cudaStream_t stream,
+                                     cudaStream_t stream,
                                      float* workspace = nullptr,
                                      size_t workspace_bytes = 0) {
     int T_out = blk.has_upsample ? 2 * T : T;
@@ -530,7 +495,7 @@ static void adain_resblk1d_forward(const float* x, const float* style,
     // fc_buf layout: [0..2C) = gamma/beta from FC, [2C..4C) = norm reduction workspace
     float* norm_ws = fc_buf + 2 * dim_in;
     adain_1d_forward(x, style, blk.norm1, residual_buf, fc_buf, norm_ws,
-                     dim_in, T, style_dim, cublas, stream);
+                     dim_in, T, style_dim, stream);
     leaky_relu_f32(residual_buf, residual_buf, dim_in * T, 0.2f, stream);
 
     if (blk.has_upsample) {
@@ -540,7 +505,7 @@ static void adain_resblk1d_forward(const float* x, const float* style,
                         cudaMemcpyDeviceToDevice, stream);
     }
 
-    gemm_conv1d(cublas, residual_buf, blk.conv1_wv, blk.conv1_b, y,
+    gemm_conv1d(residual_buf, blk.conv1_wv, blk.conv1_b, y,
                  workspace, workspace_bytes, dim_in, dim_out, T_out, 3,
                  1, 1, 1, stream);
     cudaMemcpyAsync(residual_buf, y, dim_out * T_out * sizeof(float),
@@ -548,10 +513,10 @@ static void adain_resblk1d_forward(const float* x, const float* style,
 
     norm_ws = fc_buf + 2 * dim_out;
     adain_1d_forward(residual_buf, style, blk.norm2, residual_buf, fc_buf, norm_ws,
-                     dim_out, T_out, style_dim, cublas, stream);
+                     dim_out, T_out, style_dim, stream);
     leaky_relu_f32(residual_buf, residual_buf, dim_out * T_out, 0.2f, stream);
 
-    gemm_conv1d(cublas, residual_buf, blk.conv2_wv, blk.conv2_b, y,
+    gemm_conv1d(residual_buf, blk.conv2_wv, blk.conv2_b, y,
                  workspace, workspace_bytes, dim_out, dim_out, T_out, 3,
                  1, 1, 1, stream);
 
@@ -564,7 +529,7 @@ static void adain_resblk1d_forward(const float* x, const float* style,
     }
 
     if (blk.has_shortcut) {
-        gemm_conv1d(cublas, shortcut_buf, blk.conv1x1_wv, nullptr, residual_buf,
+        gemm_conv1d(shortcut_buf, blk.conv1x1_wv, nullptr, residual_buf,
                      workspace, workspace_bytes, dim_in, dim_out, T_out, 1,
                      1, 0, 1, stream);
         cudaMemcpyAsync(shortcut_buf, residual_buf, dim_out * T_out * sizeof(float),
@@ -712,7 +677,7 @@ static void adain_resblock1_forward(float* x, const float* style,
                                       float* xt_buf, float* conv_out_buf,
                                       float* fc_buf,
                                       int T, int style_dim,
-                                      cublasHandle_t cublas, cudaStream_t stream,
+                                      cudaStream_t stream,
                                       float* workspace = nullptr,
                                       size_t workspace_bytes = 0) {
     int C = rb.channels;
@@ -722,18 +687,18 @@ static void adain_resblock1_forward(float* x, const float* style,
     float* norm_ws = fc_buf + 2 * C;
     for (int j = 0; j < 3; j++) {
         adain_1d_forward(x, style, rb.adain1[j], xt_buf, fc_buf, norm_ws,
-                         C, T, style_dim, cublas, stream, rb.alpha1[j]);
+                         C, T, style_dim, stream, rb.alpha1[j]);
 
         int d = dilations[j];
         int pad = (K * d - d) / 2;
-        gemm_conv1d(cublas, xt_buf, rb.convs1[j].wv, rb.convs1[j].b, conv_out_buf,
+        gemm_conv1d(xt_buf, rb.convs1[j].wv, rb.convs1[j].b, conv_out_buf,
                      workspace, workspace_bytes, C, C, T, K, 1, pad, d, stream);
 
         adain_1d_forward(conv_out_buf, style, rb.adain2[j], xt_buf, fc_buf, norm_ws,
-                         C, T, style_dim, cublas, stream, rb.alpha2[j]);
+                         C, T, style_dim, stream, rb.alpha2[j]);
 
         int pad2 = (K - 1) / 2;
-        gemm_conv1d(cublas, xt_buf, rb.convs2[j].wv, rb.convs2[j].b, x,
+        gemm_conv1d(xt_buf, rb.convs2[j].wv, rb.convs2[j].b, x,
                      workspace, workspace_bytes, C, C, T, K, 1, pad2, 1, stream,
                      x);  // residual: x = conv(xt_buf) + x, then + bias
     }
@@ -904,13 +869,14 @@ static float* s_d_rand_ini = nullptr;  // persistent rand_ini on GPU (seed=42)
 std::vector<float> rokoko_infer(const Weights& w,
                                 const int* token_ids, int T,
                                 const float* style_vec,  // [256] on host
-                                cublasHandle_t cublas,
-                                cublasLtHandle_t ltHandle,
                                 cudaStream_t stream,
                                 GpuArena& arena,
                                 GpuArena& decode_arena,
                                 float* d_workspace,
                                 size_t workspace_bytes) {
+    // Set workspace for Cutlass GEMM (used by all sgemm_* wrappers)
+    s_workspace = d_workspace;
+    s_workspace_bytes = workspace_bytes;
     arena.reset();
 
     // ---- All arena allocations upfront (deterministic per T) ----
@@ -948,23 +914,20 @@ std::vector<float> rokoko_infer(const Weights& w,
     // ---- Encode phase: CUDA graph capture/replay ----
     auto git = s_encode_graph_cache.find(T);
     if (git == s_encode_graph_cache.end()) {
-        // Provide cuBLAS workspace to prevent cudaMalloc during capture
-        cublasSetWorkspace(cublas, d_workspace, workspace_bytes);
-
         cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
 
         // ALBERT encoder
         cudaMemcpyAsync(albert_buf.token_ids, d_token_ids, T * sizeof(int),
                         cudaMemcpyDeviceToDevice, stream);
-        albert_forward(w, albert_buf, cublas, ltHandle, stream, T);
+        albert_forward(w, albert_buf, stream, T);
 
         // bert_encoder: Linear 768→512 → d_en [T, 512]
-        sgemm_bias(ltHandle, CUBLAS_OP_T, CUBLAS_OP_N, 512, T, 768,
+        sgemm_bias(512, T, 768,
                    w.bert_enc_w, 768, albert_buf.hidden, 768, d_en, 512,
                    w.bert_enc_b, stream);
 
         // Text encoder
-        text_encoder_forward(w, te_buf, d_token_ids, cublas, stream, T, arena,
+        text_encoder_forward(w, te_buf, d_token_ids, stream, T, arena,
                              d_workspace, workspace_bytes);
 
         // Duration encoder: 3x (BiLSTM + AdaLN)
@@ -973,11 +936,11 @@ std::vector<float> rokoko_infer(const Weights& w,
 
         for (int layer_i = 0; layer_i < 3; layer_i++) {
             bilstm_gpu(d_cat_buf, d_lstm_out, w.dur_enc_lstm[layer_i],
-                       T, 640, 256, cublas, stream, arena);
+                       T, 640, 256, stream, arena);
 
             auto& aln = w.dur_enc_aln[layer_i];
-            sgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, 1024, 1, 128,
-                  aln.fc_w, 128, d_style_prosody, 128, d_ada_fc, 1024);
+            sgemm_tn(1024, 1, 128,
+                     aln.fc_w, 128, d_style_prosody, 128, d_ada_fc, 1024, stream);
             bias_add_f32(d_ada_fc, aln.fc_b, d_ada_fc, 1, 1024, stream);
             ada_layer_norm_f32(d_lstm_out, d_ada_fc, d_ada_fc + 512,
                                d_x_buf, T, 512, 1e-5f, stream);
@@ -987,8 +950,8 @@ std::vector<float> rokoko_infer(const Weights& w,
 
         // Duration LSTM + projection
         bilstm_gpu(d_cat_buf, d_dur_lstm_out, w.dur_lstm,
-                   T, 640, 256, cublas, stream, arena);
-        sgemm_bias(ltHandle, CUBLAS_OP_T, CUBLAS_OP_N, 50, T, 512,
+                   T, 640, 256, stream, arena);
+        sgemm_bias(50, T, 512,
                    w.dur_proj_w, 512, d_dur_lstm_out, 512, d_dur_proj, 50,
                    w.dur_proj_b, stream);
         sigmoid_sum_f32(d_dur_proj, d_durations, T, 50, stream);
@@ -1057,7 +1020,6 @@ std::vector<float> rokoko_infer(const Weights& w,
     }
 
     // First time for (T, L): capture decode graph
-    cublasSetWorkspace(cublas, d_workspace, workspace_bytes);
     cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed);
 
     // Decode workspace (first alloc, matches compute_decode_bytes order)
@@ -1089,13 +1051,13 @@ std::vector<float> rokoko_infer(const Weights& w,
     //     = col-major [640, T] with lda=640. YES.
     //   B = d_alignment stored as col-major [L, T]. We need [T, L] so transb=OP_T, ldb=L
     float* d_en_expanded = decode_arena.alloc<float>(L * 640);
-    sgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T, 640, L, T,
-          d_cat_buf, 640, d_alignment, L, d_en_expanded, 640);
+    sgemm_nt(640, L, T,
+             d_cat_buf, 640, d_alignment, L, d_en_expanded, 640, stream);
 
     // Shared LSTM: d_en_expanded [L, 640] already row-major — no transpose
     float* d_shared_out = decode_arena.alloc<float>(L * 512);
     bilstm_gpu(d_en_expanded, d_shared_out, w.shared_lstm,
-               L, 640, 256, cublas, stream, decode_arena);
+               L, 640, 256, stream, decode_arena);
 
     // F0 and N prediction chains
     // Both: [L, 512] → 3 AdainResBlk1d → Conv1d proj → [2L, 1]
@@ -1116,21 +1078,21 @@ std::vector<float> rokoko_infer(const Weights& w,
         // block 0: [L, 512] → [L, 512]
         adain_resblk1d_forward(d_fx, d_style_prosody, blocks[0],
                                 d_res_buf, d_sc_buf, d_fc_buf, d_fo,
-                                512, 512, L, 128, cublas, stream,
+                                512, 512, L, 128, stream,
                                 d_dec_workspace, dec_ws_bytes);
         // block 1: [L, 512] → [2L, 256] (upsample)
         cudaMemcpyAsync(d_fx, d_fo, 512 * L * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
         adain_resblk1d_forward(d_fx, d_style_prosody, blocks[1],
                                 d_res_buf, d_sc_buf, d_fc_buf, d_fo,
-                                512, 256, L, 128, cublas, stream,
+                                512, 256, L, 128, stream,
                                 d_dec_workspace, dec_ws_bytes);
         // block 2: [2L, 256] → [2L, 256]
         cudaMemcpyAsync(d_fx, d_fo, 256 * L2 * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
         adain_resblk1d_forward(d_fx, d_style_prosody, blocks[2],
                                 d_res_buf, d_sc_buf, d_fc_buf, d_fo,
-                                256, 256, L2, 128, cublas, stream,
+                                256, 256, L2, 128, stream,
                                 d_dec_workspace, dec_ws_bytes);
         // Projection: Conv1d(256→1, k=1) → [2L, 1]
         conv1d_f32(d_fo, proj_w, proj_b, d_pred, 256, 1, L2, 1, stream);
@@ -1145,8 +1107,8 @@ std::vector<float> rokoko_infer(const Weights& w,
     // ---- Decoder ----
     // Build asr_aligned: alignment^T [L, T] × te_buf.emb [T, 512] → [L, 512]
     float* d_asr_aligned = decode_arena.alloc<float>(L * 512);
-    sgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T, 512, L, T,
-          te_buf.emb, 512, d_alignment, L, d_asr_aligned, 512);
+    sgemm_nt(512, L, T,
+             te_buf.emb, 512, d_alignment, L, d_asr_aligned, 512, stream);
 
     // F0/N downsampling: Conv1d(1,1,k=3,s=2,p=1) on [2L, 1] → [L, 1]
     float* d_f0_down = decode_arena.alloc<float>(L);
@@ -1173,7 +1135,7 @@ std::vector<float> rokoko_infer(const Weights& w,
     float* d_dec_out = decode_arena.alloc<float>(L * 1024);
     adain_resblk1d_forward(d_dec_cat, d_style_acoustic, w.dec_encode,
                             d_dec_res, d_dec_sc, d_dec_fc, d_dec_out,
-                            514, 1024, L, 128, cublas, stream,
+                            514, 1024, L, 128, stream,
                             d_dec_workspace, dec_ws_bytes);
 
     // asr_res: Conv1d(512→64, k=1) — wv has precomputed weight
@@ -1207,7 +1169,7 @@ std::vector<float> rokoko_infer(const Weights& w,
         adain_resblk1d_forward(d_dec_in, d_style_acoustic, w.dec_decode[bi],
                                 d_dec_res, d_dec_sc, d_dec_fc, d_blk_out,
                                 dim_in_sizes[bi], dim_out_sizes[bi], T_blk,
-                                128, cublas, stream,
+                                128, stream,
                                 d_dec_workspace, dec_ws_bytes);
 
         d_dec_x = d_blk_out;
@@ -1285,12 +1247,12 @@ std::vector<float> rokoko_infer(const Weights& w,
         // noise_convs[i]: gen_har [har_frames, 22] → slot1 [src_T, C_out]
         float* d_gen_src = slot1;
         if (i == 0) {
-            gemm_conv1d(cublas, d_gen_har, w.gen_noise_convs[i].w,
+            gemm_conv1d(d_gen_har, w.gen_noise_convs[i].w,
                          w.gen_noise_convs[i].b, d_gen_src,
                          d_dec_workspace, dec_ws_bytes,
                          22, C_out, har_frames, 12, 6, 3, 1, stream);
         } else {
-            gemm_conv1d(cublas, d_gen_har, w.gen_noise_convs[i].w,
+            gemm_conv1d(d_gen_har, w.gen_noise_convs[i].w,
                          w.gen_noise_convs[i].b, d_gen_src,
                          d_dec_workspace, dec_ws_bytes,
                          22, C_out, har_frames, 1, 1, 0, 1, stream);
@@ -1302,13 +1264,13 @@ std::vector<float> rokoko_infer(const Weights& w,
         int src_T = (i == 0) ? ((har_frames + 2*3 - 12) / 6 + 1) : har_frames;
         adain_resblock1_forward(d_gen_src, d_style_acoustic, w.gen_noise_res[i],
                                 d_gen_xt, d_gen_co, d_gen_fc,
-                                src_T, 128, cublas, stream,
+                                src_T, 128, stream,
                                 d_dec_workspace, dec_ws_bytes);
 
         // ups[i]: gen_x (slot0) → slot4 (gen_tmp)
         float* d_gen_tmp = slot4;
         int T_ups = (T_loop - 1) * us - 2 * up + uk;
-        gemm_conv_transpose1d(cublas, d_gen_x, w.gen_ups[i].wv, w.gen_ups[i].b,
+        gemm_conv_transpose1d(d_gen_x, w.gen_ups[i].wv, w.gen_ups[i].b,
                                d_gen_tmp, d_dec_workspace, dec_ws_bytes,
                                C_in, C_out, T_loop, uk, us, up, 0, stream);
 
@@ -1334,7 +1296,7 @@ std::vector<float> rokoko_infer(const Weights& w,
                             cudaMemcpyDeviceToDevice, stream);
             adain_resblock1_forward(d_gen_tmp, d_style_acoustic, w.gen_resblocks[rb_idx],
                                     d_gen_xt, d_gen_co, d_gen_fc,
-                                    T_ups, 128, cublas, stream,
+                                    T_ups, 128, stream,
                                     d_dec_workspace, dec_ws_bytes);
             add_f32(d_rb_avg, d_gen_tmp, d_rb_avg, C_out * T_ups, stream);
         }
@@ -1347,7 +1309,7 @@ std::vector<float> rokoko_infer(const Weights& w,
     // Result is [T_loop, 22] in [T,C] layout
     float* d_gen_tmp = slot4;
     leaky_relu_f32(d_gen_x, d_gen_x, 128 * T_loop, 0.01f, stream);
-    gemm_conv1d(cublas, d_gen_x, w.gen_conv_post_wv, w.gen_conv_post_b, d_gen_tmp,
+    gemm_conv1d(d_gen_x, w.gen_conv_post_wv, w.gen_conv_post_b, d_gen_tmp,
                  d_dec_workspace, dec_ws_bytes, 128, 22, T_loop, 7, 1, 3, 1, stream);
 
     // Transpose [T_loop, 22] → [22, T_loop] for STFT boundary (channels-first)

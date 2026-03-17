@@ -1285,6 +1285,56 @@ void fused_lstm_f32(const float* Whh, const float* ig_all,
 }
 
 // ---------------------------------------------------------------------------
+// GEMV: y[M] = alpha * A[K,M]^T * x[K] + beta * y[M]
+//   A stored col-major [K, M] with leading dim lda.
+//   One warp per output element, warp-shuffle reduction over K.
+// ---------------------------------------------------------------------------
+
+__global__ void gemv_tn_kernel(const float* __restrict__ A, int lda,
+                                const float* __restrict__ x,
+                                float* __restrict__ y,
+                                int M, int K, float alpha, float beta) {
+    int m = blockIdx.x;
+    if (m >= M) return;
+
+    // Column m of A (col-major): A[k, m] = A[k + m * lda]
+    const float* col = A + (long long)m * lda;
+
+    // Parallel reduction over K using all threads in the block
+    float sum = 0.0f;
+    for (int k = threadIdx.x; k < K; k += blockDim.x)
+        sum += col[k] * x[k];
+
+    // Warp-level reduction
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    // Cross-warp reduction via shared memory
+    __shared__ float warp_sums[8];  // up to 256 threads = 8 warps
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x & 31;
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        int n_warps = (blockDim.x + 31) / 32;
+        for (int w = 0; w < n_warps; w++)
+            total += warp_sums[w];
+        y[m] = alpha * total + beta * y[m];
+    }
+}
+
+void gemv_tn_f32(const float* A, int lda, const float* x,
+                  float* y, int M, int K,
+                  float alpha, float beta,
+                  cudaStream_t stream) {
+    // Use enough threads to cover K with good occupancy
+    int threads = (K <= 32) ? 32 : (K <= 64) ? 64 : (K <= 128) ? 128 : 256;
+    gemv_tn_kernel<<<M, threads, 0, stream>>>(A, lda, x, y, M, K, alpha, beta);
+}
+
+// ---------------------------------------------------------------------------
 // im2col for 1D convolution
 //   x: [T_in, C_in] → col: [T_out, C_in*K]  (row-major)
 //   T_out = (T_in + 2*padding - dilation*(K-1) - 1) / stride + 1

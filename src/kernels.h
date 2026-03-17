@@ -285,6 +285,16 @@ void fused_lstm_f32(const float* Whh, const float* ig_all,
                      cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
+// GEMV: y[M] = A[K, M]^T * x[K]  (A stored col-major [K, M])
+//   Replaces cuBLAS cublasSgemv(OP_T, K, M, ...) for small GEMV.
+//   alpha/beta: y = alpha * A^T * x + beta * y
+// ---------------------------------------------------------------------------
+void gemv_tn_f32(const float* A, int lda, const float* x,
+                  float* y, int M, int K,
+                  float alpha, float beta,
+                  cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
 // im2col for 1D convolution: x[T_in, C_in] → col[T_out, C_in*K]
 //   T_out = (T_in + 2*padding - dilation*(K-1) - 1) / stride + 1
 // ---------------------------------------------------------------------------

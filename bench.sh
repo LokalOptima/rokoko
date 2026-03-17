@@ -16,7 +16,7 @@ BINARY="${1:-./rokoko}"
 WARMUP="${2:-10}"
 RUNS="${3:-30}"
 PORT=8097
-PARAKETTO="$HOME/git/ciatterbox/paraketto.static"
+PARAKETTO="$HOME/git/LokalOptima/paraketto/paraketto.fp8"
 
 # Test texts: short (~1.5s audio), medium (~3-5s), long (~15-20s)
 TEXTS=(
