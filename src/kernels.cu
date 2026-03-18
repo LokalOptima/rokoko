@@ -1,6 +1,6 @@
-// kernels.cu — Custom CUDA kernels for Rokoko TTS (FP32)
+// kernels.cu — Custom CUDA kernels for Rokoko TTS
 //
-// All kernels use FP32.
+// FP32 compute kernels + FP16 weight support (cast, GEMV).
 
 #include "kernels.h"
 #include <cmath>
@@ -1036,6 +1036,58 @@ void gemv_tn_f32(const float* A, int lda, const float* x,
                   cudaStream_t stream) {
     int blocks = (M + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
     gemv_tn_kernel<<<blocks, GEMV_ROWS_PER_BLOCK * 32, 0, stream>>>(
+        A, lda, x, y, M, K, alpha, beta);
+}
+
+// ---------------------------------------------------------------------------
+// FP32 → FP16 cast
+// ---------------------------------------------------------------------------
+
+__global__ void cast_f32_to_f16_kernel(const float* __restrict__ src,
+                                        __half* __restrict__ dst, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) dst[i] = __float2half(src[i]);
+}
+
+void cast_f32_to_f16(const float* src, __half* dst, int N, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (N + threads - 1) / threads;
+    cast_f32_to_f16_kernel<<<blocks, threads, 0, stream>>>(src, dst, N);
+}
+
+// ---------------------------------------------------------------------------
+// GEMV with FP16 weights: y[M] = alpha * A[K,M]^T * x[K] + beta * y[M]
+//   A: __half col-major [K, M], x: float, y: float
+//   Loads half weight, converts to float in register, accumulates FP32.
+// ---------------------------------------------------------------------------
+
+__global__ void gemv_tn_f16_kernel(const __half* __restrict__ A, int lda,
+                                    const float* __restrict__ x,
+                                    float* __restrict__ y,
+                                    int M, int K, float alpha, float beta) {
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x & 31;
+    int m = blockIdx.x * GEMV_ROWS_PER_BLOCK + warp_id;
+    if (m >= M) return;
+
+    const __half* col = A + (long long)m * lda;
+
+    float sum = 0.0f;
+    for (int k = lane; k < K; k += 32)
+        sum += __half2float(col[k]) * x[k];
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    if (lane == 0)
+        y[m] = alpha * sum + beta * y[m];
+}
+
+void gemv_tn_f16(const __half* A, int lda, const float* x,
+                  float* y, int M, int K, float alpha, float beta,
+                  cudaStream_t stream) {
+    int blocks = (M + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+    gemv_tn_f16_kernel<<<blocks, GEMV_ROWS_PER_BLOCK * 32, 0, stream>>>(
         A, lda, x, y, M, K, alpha, beta);
 }
 

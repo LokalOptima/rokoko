@@ -1,11 +1,24 @@
 // kernels.h — Custom CUDA kernel launch wrappers for Rokoko TTS
 //
-// All kernels operate on FP32 data.
 // Signal tensors use [T, C] layout (time-major, channels last).
 
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+// ---------------------------------------------------------------------------
+// FP32→FP16 cast: dst[i] = __float2half(src[i])
+// ---------------------------------------------------------------------------
+void cast_f32_to_f16(const float* src, __half* dst, int N, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// GEMV FP16 weights: y[M] = alpha * A[K,M]^T * x[K] + beta * y[M]
+//   A: half_t col-major [K, M], x: float, y: float
+// ---------------------------------------------------------------------------
+void gemv_tn_f16(const __half* A, int lda, const float* x,
+                  float* y, int M, int K, float alpha, float beta,
+                  cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Embedding gather: y[i, :] = table[ids[i], :]
