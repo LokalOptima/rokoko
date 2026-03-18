@@ -281,6 +281,19 @@ void concat4_channels_f32(const float* a, const float* b,
                             cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
+// FP32→FP16 cast with channel zero-padding: [T, C_old] → [T, C_new]
+// ---------------------------------------------------------------------------
+void cast_f32_to_f16_pad(const float* src, __half* dst,
+                           int T, int C_old, int C_new, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Pad blocks: copy n_blocks of old_block_size, zero-fill to new_block_size.
+// ---------------------------------------------------------------------------
+void pad_blocks_f32(const float* src, float* dst,
+                      int n_blocks, int old_block_size, int new_block_size,
+                      cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
 // SineGen phase computation: f0[L2] → phase_low[L2 * 9]
 //   Sequential cumulative sum per harmonic (9 threads)
 // ---------------------------------------------------------------------------

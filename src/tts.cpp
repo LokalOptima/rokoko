@@ -198,6 +198,11 @@ extern "C" void cutlass_reshape_weights_f16(const float* src, __half* dst,
 static std::unordered_map<const float*, float*> s_w_nhwc;       // FP32 NHWC
 static std::unordered_map<const float*, __half*> s_w_nhwc_f16;  // FP16 NHWC
 
+// Padded NHWC FP16 weights: for conv weights where C_in % 8 != 0,
+// we pad C_in to the next multiple of 8 and create NHWC FP16.
+// Maps original wv pointer → (nhwc_f16_ptr, padded_C_in).
+static std::unordered_map<const float*, std::pair<__half*, int>> s_w_nhwc_f16_padded;
+
 // ---------------------------------------------------------------------------
 // Conv1d forward: Cutlass implicit GEMM (w_nhwc), falls back to im2col + GEMM.
 // ---------------------------------------------------------------------------
@@ -226,6 +231,29 @@ static void gemm_conv1d(const float* x, const float* w, const float* bias,
                                                     cutlass_bias, y, residual,
                                                     workspace, workspace_bytes,
                                                     C_in, C_out, T_in, K,
+                                                    stride, padding, dilation, stream);
+                if (rc == 0) {
+                    if (residual && bias)
+                        channel_bias_add_f32(y, bias, C_out, T_out, stream);
+                    return;
+                }
+            }
+        }
+    }
+
+    // Try Cutlass FP16 with padded C_in (for unaligned channels like 514, 1090)
+    if (K > 1 && (C_in % 8 != 0) && (C_out % 4 == 0)) {
+        auto it_pad = s_w_nhwc_f16_padded.find(w);
+        if (it_pad != s_w_nhwc_f16_padded.end()) {
+            auto [w_f16, C_in_pad] = it_pad->second;
+            size_t act_need = (size_t)T_in * C_in_pad * sizeof(__half);
+            if (act_need <= s_fp16_buf_size) {
+                cast_f32_to_f16_pad(x, s_fp16_buf, T_in, C_in, C_in_pad, stream);
+                const float* cutlass_bias = residual ? nullptr : bias;
+                int rc = cutlass_conv1d_fprop_f16(s_fp16_buf, w_f16,
+                                                    cutlass_bias, y, residual,
+                                                    workspace, workspace_bytes,
+                                                    C_in_pad, C_out, T_in, K,
                                                     stride, padding, dilation, stream);
                 if (rc == 0) {
                     if (residual && bias)
@@ -305,6 +333,7 @@ static void gemm_conv_transpose1d(const float* x, const float* w, const float* b
 struct AlbertBuffers {
     float* emb = nullptr;       // [T, 128] embeddings sum
     float* hidden = nullptr;    // [T, 768] main activation
+    __half* hidden_f16 = nullptr; // [T, 768] FP16 copy (cast once, reused by Q/K/V)
     float* qkv = nullptr;       // [T, 3*768] fused QKV
     float* attn_scores = nullptr; // [N_HEADS, T, T]
     float* attn_out = nullptr;  // [T, 768] attention output
@@ -316,6 +345,7 @@ struct AlbertBuffers {
     void alloc(int T, GpuArena& arena) {
         emb        = arena.alloc<float>(T * 128);
         hidden     = arena.alloc<float>(T * 768);
+        hidden_f16 = arena.alloc<__half>(T * 768);
         qkv        = arena.alloc<float>(T * 3 * 768);
         attn_scores= arena.alloc<float>(12 * T * T);
         attn_out   = arena.alloc<float>(T * 768);
@@ -349,12 +379,17 @@ static void albert_forward(const Weights& w, AlbertBuffers& buf,
         float* K = buf.qkv + T * 768;
         float* V = buf.qkv + T * 768 * 2;
 
-        sgemm_bias(768, T, 768,
-                   a.q_w, 768, buf.hidden, 768, Q, 768, a.q_b, stream);
-        sgemm_bias(768, T, 768,
-                   a.k_w, 768, buf.hidden, 768, K, 768, a.k_b, stream);
-        sgemm_bias(768, T, 768,
-                   a.v_w, 768, buf.hidden, 768, V, 768, a.v_b, stream);
+        // Cast hidden to FP16 once, reuse for Q/K/V (saves 2 redundant casts)
+        cast_f32_to_f16(buf.hidden, buf.hidden_f16, T * 768, stream);
+        cutlass_gemm_tn_bias_f16(768, T, 768,
+            s_fp16_weights[a.q_w], 768, buf.hidden_f16, 768,
+            Q, 768, a.q_b, s_workspace, s_workspace_bytes, stream);
+        cutlass_gemm_tn_bias_f16(768, T, 768,
+            s_fp16_weights[a.k_w], 768, buf.hidden_f16, 768,
+            K, 768, a.k_b, s_workspace, s_workspace_bytes, stream);
+        cutlass_gemm_tn_bias_f16(768, T, 768,
+            s_fp16_weights[a.v_w], 768, buf.hidden_f16, 768,
+            V, 768, a.v_b, s_workspace, s_workspace_bytes, stream);
 
         // Multi-head attention: 12 heads, 64 dim each
         // scores[h] = Q_h @ K_h^T / sqrt(64)
@@ -1654,6 +1689,25 @@ void precompute_weight_norms(Weights& w, cudaStream_t stream) {
         s_w_nhwc_f16[wv] = w_f16;
     };
 
+    // Padded NHWC FP16 for conv weights with unaligned C_in.
+    // Pads C_in to next multiple of 8, creates padded FP32 temp, reshapes to NHWC FP16.
+    auto make_nhwc_f16_padded = [&](float* wv, int C_out, int C_in, int K) {
+        if (K <= 1) return;
+        if (C_in % 8 == 0) return;  // already aligned, use normal path
+        if (C_out % 4 != 0) return;
+        int C_in_pad = (C_in + 7) & ~7;
+        // Pad weight: [C_out, C_in, K] → [C_out, C_in_pad, K]
+        float* w_padded = nullptr;
+        CUDA_CHECK(cudaMalloc(&w_padded, (size_t)C_out * C_in_pad * K * sizeof(float)));
+        pad_blocks_f32(wv, w_padded, C_out, C_in * K, C_in_pad * K, stream);
+        // Reshape padded weight to NHWC and cast to FP16
+        __half* w_f16 = nullptr;
+        CUDA_CHECK(cudaMalloc(&w_f16, (size_t)C_out * C_in_pad * K * sizeof(__half)));
+        cutlass_reshape_weights_f16(w_padded, w_f16, C_out, C_in_pad, K, stream);
+        cudaFree(w_padded);  // temp
+        s_w_nhwc_f16_padded[wv] = {w_f16, C_in_pad};
+    };
+
     // ALBERT linear weights
     make_fp16(w.bert_proj_w, 768 * 128);
     make_fp16(w.albert.q_w, 768 * 768);
@@ -1718,6 +1772,8 @@ void precompute_weight_norms(Weights& w, cudaStream_t stream) {
         make_fp16(blk.conv2_wv, dim_out * dim_out * 3);
         make_nhwc_f16(blk.conv1_wv, dim_out, dim_in, 3);
         make_nhwc_f16(blk.conv2_wv, dim_out, dim_out, 3);
+        // Padded FP16 for unaligned C_in (e.g., 514→520, 1090→1096)
+        make_nhwc_f16_padded(blk.conv1_wv, dim_out, dim_in, 3);
         make_adain_fp16(blk.norm1, dim_in, 128);
         make_adain_fp16(blk.norm2, dim_out, 128);
         if (blk.has_shortcut)

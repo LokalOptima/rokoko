@@ -1274,6 +1274,59 @@ void concat3_channels_f32(const float* a, const float* b, const float* c,
 }
 
 // ---------------------------------------------------------------------------
+// FP32→FP16 cast with channel zero-padding: [T, C_old] → [T, C_new] (C_new > C_old)
+//   Pads extra channels with zero. Used to align C_in for FP16 TensorOp convolutions.
+// ---------------------------------------------------------------------------
+
+__global__ void cast_f32_to_f16_pad_kernel(const float* __restrict__ src,
+                                             __half* __restrict__ dst,
+                                             int T, int C_old, int C_new) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = T * C_new;
+    if (idx < total) {
+        int t = idx / C_new;
+        int c = idx % C_new;
+        dst[idx] = (c < C_old) ? __float2half(src[t * C_old + c]) : __float2half(0.0f);
+    }
+}
+
+void cast_f32_to_f16_pad(const float* src, __half* dst,
+                           int T, int C_old, int C_new, cudaStream_t stream) {
+    int total = T * C_new;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    cast_f32_to_f16_pad_kernel<<<blocks, threads, 0, stream>>>(
+        src, dst, T, C_old, C_new);
+}
+
+// ---------------------------------------------------------------------------
+// Pad blocks: copy n_blocks of old_block_size, zero-fill to new_block_size each.
+//   src: [n_blocks * old_block_size], dst: [n_blocks * new_block_size]
+//   Used to pad conv weight C_in dimension for FP16 alignment.
+// ---------------------------------------------------------------------------
+
+__global__ void pad_blocks_kernel(const float* src, float* dst,
+                                    int n_blocks, int old_bs, int new_bs) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_blocks * new_bs;
+    if (idx < total) {
+        int blk = idx / new_bs;
+        int pos = idx % new_bs;
+        dst[idx] = (pos < old_bs) ? src[blk * old_bs + pos] : 0.0f;
+    }
+}
+
+void pad_blocks_f32(const float* src, float* dst,
+                      int n_blocks, int old_block_size, int new_block_size,
+                      cudaStream_t stream) {
+    int total = n_blocks * new_block_size;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    pad_blocks_kernel<<<blocks, threads, 0, stream>>>(
+        src, dst, n_blocks, old_block_size, new_block_size);
+}
+
+// ---------------------------------------------------------------------------
 // SineGen phase computation: f0[L2] → phase_low[L2, 9]
 //   9 threads (one per harmonic), each does sequential cumsum.
 //   Matches PyTorch SineGen: NN upsample → normalize → downsample → cumsum → scale
