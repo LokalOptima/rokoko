@@ -2,7 +2,6 @@
 //
 // Defines:
 //   Weights  — pointers into GPU weight allocation (loaded from weights.bin)
-//   CudaModel — pre-allocated buffers + cuBLAS handle for forward passes
 
 #pragma once
 
@@ -14,9 +13,7 @@
 #include <vector>
 
 #include <cuda_runtime.h>
-// FP32 throughout
-#include <cublas_v2.h>
-#include <cublasLt.h>
+#include <cuda_fp16.h>
 
 // ---------------------------------------------------------------------------
 // Utility macros
@@ -28,16 +25,6 @@
         if (err != cudaSuccess) {                                              \
             fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,  \
                     cudaGetErrorString(err));                                   \
-            std::exit(1);                                                      \
-        }                                                                      \
-    } while (0)
-
-#define CUBLAS_CHECK(call)                                                     \
-    do {                                                                       \
-        cublasStatus_t err = (call);                                           \
-        if (err != CUBLAS_STATUS_SUCCESS) {                                    \
-            fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__,          \
-                    __LINE__, (int)err);                                        \
             std::exit(1);                                                      \
         }                                                                      \
     } while (0)
@@ -177,6 +164,7 @@ struct Weights {
     // Embedding → hidden projection
     float *bert_proj_w = nullptr;           // [768, 128]
     float *bert_proj_b = nullptr;           // [768]
+    __half *bert_proj_w_f16 = nullptr;
 
     // Shared attention layer (looped 6 times)
     struct AlbertLayer {
@@ -190,6 +178,11 @@ struct Weights {
         float *ffn_w = nullptr, *ffn_b = nullptr;       // [2048, 768] + [2048]
         float *ffn_out_w = nullptr, *ffn_out_b = nullptr; // [768, 2048] + [768]
         float *ffn_ln_w = nullptr, *ffn_ln_b = nullptr;   // [768]
+
+        // FP16 companions (v2)
+        __half *q_w_f16 = nullptr, *k_w_f16 = nullptr, *v_w_f16 = nullptr;
+        __half *dense_w_f16 = nullptr;
+        __half *ffn_w_f16 = nullptr, *ffn_out_w_f16 = nullptr;
     } albert;
 
     // Pooler (may not be needed for inference, but load anyway)
@@ -201,6 +194,7 @@ struct Weights {
     // -----------------------------------------------------------------------
     float *bert_enc_w = nullptr;            // [512, 768]
     float *bert_enc_b = nullptr;            // [512]
+    __half *bert_enc_w_f16 = nullptr;
 
     // -----------------------------------------------------------------------
     // Text encoder: 3 conv blocks + bidirectional LSTM
@@ -212,6 +206,7 @@ struct Weights {
         float *conv_b = nullptr;            // [512]
         float *ln_w = nullptr;              // [512] (gamma)
         float *ln_b = nullptr;              // [512] (beta)
+        __half *conv_wv_nhwc_f16 = nullptr; // v2: NHWC FP16 for Cutlass conv
     } text_conv[TEXT_N_CONV];
 
     // Bidirectional LSTM (1 layer)
@@ -225,6 +220,10 @@ struct Weights {
     float *text_lstm_bhh_rev = nullptr;     // [1024]
     float *text_lstm_bias_fwd = nullptr;    // precomputed bih+bhh [1024]
     float *text_lstm_bias_rev = nullptr;    // precomputed bih+bhh [1024]
+    __half *text_lstm_wih_fwd_f16 = nullptr;
+    __half *text_lstm_whh_fwd_f16 = nullptr;
+    __half *text_lstm_wih_rev_f16 = nullptr;
+    __half *text_lstm_whh_rev_f16 = nullptr;
 
     // -----------------------------------------------------------------------
     // Prosody predictor
@@ -237,12 +236,15 @@ struct Weights {
         float *wih_rev = nullptr, *whh_rev = nullptr;
         float *bih_rev = nullptr, *bhh_rev = nullptr;
         float *bias_fwd = nullptr, *bias_rev = nullptr; // precomputed bih+bhh [4H]
+        __half *wih_fwd_f16 = nullptr, *whh_fwd_f16 = nullptr;
+        __half *wih_rev_f16 = nullptr, *whh_rev_f16 = nullptr;
     };
 
     // AdaLayerNorm: fc(style) -> gamma, beta; then (1+gamma)*LN(x)+beta
     struct AdaLayerNormWeights {
         float *fc_w = nullptr;   // [2*D, style_dim=128]
         float *fc_b = nullptr;   // [2*D]
+        __half *fc_w_f16 = nullptr;
     };
 
     // AdaIN1d: InstanceNorm(affine=True) + style FC
@@ -251,6 +253,7 @@ struct Weights {
         float *norm_b = nullptr;  // [C] InstanceNorm bias
         float *fc_w = nullptr;    // [2*C, style_dim=128]
         float *fc_b = nullptr;    // [2*C]
+        __half *fc_w_f16 = nullptr;
     };
 
     // AdainResBlk1d: 2 conv + 2 AdaIN + optional shortcut + optional upsample pool
@@ -264,6 +267,12 @@ struct Weights {
         float *pool_wg = nullptr, *pool_wv = nullptr, *pool_b = nullptr;
         bool has_shortcut = false;
         bool has_upsample = false;
+        // FP16 companions (v2)
+        __half *conv1_wv_nhwc_f16 = nullptr;  // NHWC FP16 for K=3 conv
+        __half *conv2_wv_nhwc_f16 = nullptr;
+        __half *conv1x1_wv_nhwc_f16 = nullptr; // K=1 NHWC FP16 (identity layout)
+        int conv1_c_in_pad = 0;               // padded C_in for conv1 (0 = unpadded)
+        int conv1x1_c_in_pad = 0;             // padded C_in for conv1x1 (0 = unpadded)
     };
 
     // DurationEncoder: 3x (BiLSTM + AdaLayerNorm)
@@ -274,6 +283,7 @@ struct Weights {
     BiLSTMWeights dur_lstm;
     float *dur_proj_w = nullptr;   // [50, 512]
     float *dur_proj_b = nullptr;   // [50]
+    __half *dur_proj_w_f16 = nullptr;
 
     // Shared LSTM (F0/N prediction)
     BiLSTMWeights shared_lstm;
@@ -296,9 +306,9 @@ struct Weights {
     // 3 rounds of: adain1 → Snake → dilated conv → adain2 → Snake → conv → residual add
     struct AdaINResBlock1Weights {
         // convs1[0..2]: dilated conv (d=1,3,5), weight_norm
-        struct { float *wg, *wv, *b; } convs1[3];
+        struct { float *wg, *wv, *b; __half *wv_nhwc_f16 = nullptr; } convs1[3];
         // convs2[0..2]: conv (d=1), weight_norm
-        struct { float *wg, *wv, *b; } convs2[3];
+        struct { float *wg, *wv, *b; __half *wv_nhwc_f16 = nullptr; } convs2[3];
         // adain1[0..2], adain2[0..2]: AdaIN1d
         AdaIN1dWeights adain1[3], adain2[3];
         // alpha1[0..2], alpha2[0..2]: Snake learnable params [C]
@@ -313,6 +323,7 @@ struct Weights {
 
     // asr_res: Conv1d(512,64,k=1) with weight_norm
     float *dec_asr_res_wg = nullptr, *dec_asr_res_wv = nullptr, *dec_asr_res_b = nullptr;
+    __half *dec_asr_res_wv_f16 = nullptr;
 
     // encode: AdainResBlk1d(514→1024)
     AdainResBlk1dWeights dec_encode;
@@ -332,10 +343,10 @@ struct Weights {
     static constexpr int GEN_HAR_CH = GEN_N_FFT + 2;  // 22
 
     // ups[0..1]: ConvTranspose1d (non-depthwise) with weight_norm
-    struct { float *wg, *wv, *b; } gen_ups[GEN_N_UPS];
+    struct { float *wg, *wv, *b; __half *wv_f16 = nullptr; } gen_ups[GEN_N_UPS];
 
     // noise_convs[0..1]: regular Conv1d (no weight_norm)
-    struct { float *w, *b; } gen_noise_convs[GEN_N_UPS];
+    struct { float *w, *b; __half *w_f16 = nullptr; __half *w_nhwc_f16 = nullptr; int c_in_pad = 0; } gen_noise_convs[GEN_N_UPS];
 
     // noise_res[0..1]: AdaINResBlock1
     AdaINResBlock1Weights gen_noise_res[GEN_N_UPS];
@@ -345,6 +356,7 @@ struct Weights {
 
     // conv_post: Conv1d(128→22,k=7,p=3) with weight_norm
     float *gen_conv_post_wg = nullptr, *gen_conv_post_wv = nullptr, *gen_conv_post_b = nullptr;
+    __half *gen_conv_post_wv_f16 = nullptr;  // for im2col+GEMM (C_out=22 misaligned)
 
     // m_source.l_linear: Linear(9→1)
     float *gen_source_w = nullptr, *gen_source_b = nullptr;
@@ -365,11 +377,14 @@ struct Weights {
     /// Get shape for a named tensor.
     const std::vector<int>* get_shape(const std::string& name) const;
 
+    /// Populate __half* fields from v2 tensor names (.f16, .nhwc_f16, etc.)
+    void assign_v2_fp16_pointers();
+
     void print_info() const;
 };
 
 // ---------------------------------------------------------------------------
-// Inference API (defined in tts.cpp)
+// Inference API (defined in rokoko.cpp / rokoko_f16.cpp)
 // ---------------------------------------------------------------------------
 
 /// Compute exact decode-arena bytes needed for given T (tokens) and L (frames).
@@ -378,7 +393,6 @@ size_t compute_decode_bytes(int T, int L);
 /// Run Kokoro inference: phoneme token IDs + style vector → audio samples.
 std::vector<float> rokoko_infer(const Weights& w,
     const int* token_ids, int T, const float* style_vec,
-    cublasHandle_t cublas, cublasLtHandle_t ltHandle,
     cudaStream_t stream, GpuArena& arena, GpuArena& decode_arena,
     float* d_workspace, size_t workspace_bytes);
 

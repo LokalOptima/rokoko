@@ -312,6 +312,186 @@ static void assign_weight_pointers(Weights& w) {
 }
 
 // ---------------------------------------------------------------------------
+// Weights: v2 FP16 pointer assignment
+// ---------------------------------------------------------------------------
+
+void Weights::assign_v2_fp16_pointers() {
+    uint8_t* gpu_base = (uint8_t*)gpu_data;
+
+    // Build suffix map: base tensor name → {f16, nhwc_f16, nhwc_f16_pad, c_in_pad, bias_combined}
+    struct V2Info {
+        __half* f16 = nullptr;
+        __half* nhwc_f16 = nullptr;
+        __half* nhwc_f16_pad = nullptr;
+        int c_in_pad = 0;
+        float* bias_combined_fwd = nullptr;
+        float* bias_combined_rev = nullptr;
+    };
+    std::unordered_map<std::string, V2Info> v2;
+
+    for (const auto& td : tensors) {
+        void* ptr = gpu_base + td.offset;
+        const std::string& n = td.name;
+
+        auto ends_with = [&](const char* suf) -> bool {
+            size_t slen = strlen(suf);
+            return n.size() >= slen && n.compare(n.size() - slen, slen, suf) == 0;
+        };
+
+        if (ends_with(".f16")) {
+            v2[n.substr(0, n.size() - 4)].f16 = (__half*)ptr;
+        } else if (ends_with(".nhwc_f16")) {
+            v2[n.substr(0, n.size() - 9)].nhwc_f16 = (__half*)ptr;
+        } else if (auto pos = n.find(".nhwc_f16_pad"); pos != std::string::npos) {
+            auto& info = v2[n.substr(0, pos)];
+            info.nhwc_f16_pad = (__half*)ptr;
+            info.c_in_pad = std::stoi(n.substr(pos + 13));
+        } else if (ends_with(".bias_combined_fwd")) {
+            v2[n.substr(0, n.size() - 18)].bias_combined_fwd = (float*)ptr;
+        } else if (ends_with(".bias_combined_rev")) {
+            v2[n.substr(0, n.size() - 18)].bias_combined_rev = (float*)ptr;
+        }
+    }
+
+    // Lookup helpers
+    auto f16 = [&](const std::string& base) -> __half* {
+        auto it = v2.find(base); return it != v2.end() ? it->second.f16 : nullptr;
+    };
+    auto nhwc16 = [&](const std::string& base) -> __half* {
+        auto it = v2.find(base);
+        if (it == v2.end()) return nullptr;
+        if (it->second.nhwc_f16) return it->second.nhwc_f16;
+        return it->second.nhwc_f16_pad;  // fall back to padded
+    };
+    auto pad_cin = [&](const std::string& base) -> int {
+        auto it = v2.find(base); return it != v2.end() ? it->second.c_in_pad : 0;
+    };
+
+    // --- ALBERT ---
+    bert_proj_w_f16 = f16("bert.encoder.embedding_hidden_mapping_in.weight");
+
+    const char* apfx = "bert.encoder.albert_layer_groups.0.albert_layers.0";
+    auto aname = [&](const char* s) { return std::string(apfx) + s; };
+    albert.q_w_f16      = f16(aname(".attention.query.weight"));
+    albert.k_w_f16      = f16(aname(".attention.key.weight"));
+    albert.v_w_f16      = f16(aname(".attention.value.weight"));
+    albert.dense_w_f16  = f16(aname(".attention.dense.weight"));
+    albert.ffn_w_f16    = f16(aname(".ffn.weight"));
+    albert.ffn_out_w_f16 = f16(aname(".ffn_output.weight"));
+
+    // --- bert_encoder ---
+    bert_enc_w_f16 = f16("bert_encoder.weight");
+
+    // --- Text encoder conv blocks ---
+    for (int i = 0; i < TEXT_N_CONV; i++) {
+        std::string wv = "text_encoder.cnn." + std::to_string(i) + ".0.weight_v";
+        text_conv[i].conv_wv_nhwc_f16 = nhwc16(wv);
+    }
+
+    // --- Text encoder LSTM ---
+    text_lstm_wih_fwd_f16 = f16("text_encoder.lstm.weight_ih_l0");
+    text_lstm_whh_fwd_f16 = f16("text_encoder.lstm.weight_hh_l0");
+    text_lstm_wih_rev_f16 = f16("text_encoder.lstm.weight_ih_l0_reverse");
+    text_lstm_whh_rev_f16 = f16("text_encoder.lstm.weight_hh_l0_reverse");
+    {
+        auto it = v2.find("text_encoder.lstm");
+        if (it != v2.end()) {
+            if (it->second.bias_combined_fwd) text_lstm_bias_fwd = it->second.bias_combined_fwd;
+            if (it->second.bias_combined_rev) text_lstm_bias_rev = it->second.bias_combined_rev;
+        }
+    }
+
+    // --- Prosody predictor ---
+    auto assign_bilstm_v2 = [&](BiLSTMWeights& lstm, const std::string& prefix) {
+        lstm.wih_fwd_f16 = f16(prefix + ".weight_ih_l0");
+        lstm.whh_fwd_f16 = f16(prefix + ".weight_hh_l0");
+        lstm.wih_rev_f16 = f16(prefix + ".weight_ih_l0_reverse");
+        lstm.whh_rev_f16 = f16(prefix + ".weight_hh_l0_reverse");
+        auto it = v2.find(prefix);
+        if (it != v2.end()) {
+            if (it->second.bias_combined_fwd) lstm.bias_fwd = it->second.bias_combined_fwd;
+            if (it->second.bias_combined_rev) lstm.bias_rev = it->second.bias_combined_rev;
+        }
+    };
+
+    auto assign_adain1d_v2 = [&](AdaIN1dWeights& ain, const std::string& prefix) {
+        ain.fc_w_f16 = f16(prefix + ".fc.weight");
+    };
+
+    auto assign_resblk_v2 = [&](AdainResBlk1dWeights& blk, const std::string& prefix) {
+        std::string c1 = prefix + ".conv1.weight_v";
+        std::string c2 = prefix + ".conv2.weight_v";
+        blk.conv1_wv_nhwc_f16 = nhwc16(c1);
+        blk.conv1_c_in_pad = pad_cin(c1);
+        blk.conv2_wv_nhwc_f16 = nhwc16(c2);
+        if (blk.has_shortcut) {
+            blk.conv1x1_wv_nhwc_f16 = nhwc16(prefix + ".conv1x1.weight_v");
+            blk.conv1x1_c_in_pad = pad_cin(prefix + ".conv1x1.weight_v");
+        }
+        assign_adain1d_v2(blk.norm1, prefix + ".norm1");
+        assign_adain1d_v2(blk.norm2, prefix + ".norm2");
+    };
+
+    // DurationEncoder
+    for (int i = 0; i < PRED_N_LAYERS; i++) {
+        assign_bilstm_v2(dur_enc_lstm[i],
+            "predictor.text_encoder.lstms." + std::to_string(i * 2));
+        dur_enc_aln[i].fc_w_f16 = f16(
+            "predictor.text_encoder.lstms." + std::to_string(i * 2 + 1) + ".fc.weight");
+    }
+
+    assign_bilstm_v2(dur_lstm, "predictor.lstm");
+    dur_proj_w_f16 = f16("predictor.duration_proj.linear_layer.weight");
+
+    assign_bilstm_v2(shared_lstm, "predictor.shared");
+
+    // F0/N blocks
+    for (int i = 0; i < PRED_F0N_BLOCKS; i++) {
+        assign_resblk_v2(f0_blocks[i], "predictor.F0." + std::to_string(i));
+        assign_resblk_v2(n_blocks[i], "predictor.N." + std::to_string(i));
+    }
+
+    // --- Decoder ---
+    dec_asr_res_wv_f16 = f16("decoder.asr_res.0.weight_v");
+    assign_resblk_v2(dec_encode, "decoder.encode");
+    for (int i = 0; i < DEC_N_DECODE; i++)
+        assign_resblk_v2(dec_decode[i], "decoder.decode." + std::to_string(i));
+
+    // --- Generator ---
+    auto assign_resblock1_v2 = [&](AdaINResBlock1Weights& rb, const std::string& prefix) {
+        for (int j = 0; j < 3; j++) {
+            std::string js = std::to_string(j);
+            rb.convs1[j].wv_nhwc_f16 = nhwc16(prefix + ".convs1." + js + ".weight_v");
+            rb.convs2[j].wv_nhwc_f16 = nhwc16(prefix + ".convs2." + js + ".weight_v");
+            assign_adain1d_v2(rb.adain1[j], prefix + ".adain1." + js);
+            assign_adain1d_v2(rb.adain2[j], prefix + ".adain2." + js);
+        }
+    };
+
+    for (int i = 0; i < GEN_N_UPS; i++) {
+        std::string pfx = "decoder.generator.ups." + std::to_string(i);
+        gen_ups[i].wv_f16 = f16(pfx + ".weight_v");
+    }
+
+    for (int i = 0; i < GEN_N_UPS; i++) {
+        std::string pfx = "decoder.generator.noise_convs." + std::to_string(i);
+        gen_noise_convs[i].w_f16 = f16(pfx + ".weight");
+        gen_noise_convs[i].w_nhwc_f16 = nhwc16(pfx + ".weight");
+        gen_noise_convs[i].c_in_pad = pad_cin(pfx + ".weight");
+    }
+
+    for (int i = 0; i < GEN_N_UPS; i++)
+        assign_resblock1_v2(gen_noise_res[i],
+            "decoder.generator.noise_res." + std::to_string(i));
+
+    for (int i = 0; i < GEN_N_RESBLOCKS; i++)
+        assign_resblock1_v2(gen_resblocks[i],
+            "decoder.generator.resblocks." + std::to_string(i));
+
+    gen_conv_post_wv_f16 = f16("decoder.generator.conv_post.weight_v");
+}
+
+// ---------------------------------------------------------------------------
 // Weights::prefetch — CPU only, no CUDA. mmap + populate pages + parse header.
 // ---------------------------------------------------------------------------
 
@@ -346,8 +526,8 @@ Weights Weights::prefetch(const std::string& path) {
 
     uint32_t version;
     memcpy(&version, base + 4, 4);
-    if (version != KOKO_VERSION) {
-        fprintf(stderr, "Unsupported weight file version %u (expected %u)\n", version, KOKO_VERSION);
+    if (version != 1 && version != 2) {
+        fprintf(stderr, "Unsupported weight file version %u (expected 1 or 2)\n", version);
         munmap(mapped, file_size);
         std::exit(1);
     }
@@ -399,8 +579,8 @@ Weights Weights::prefetch(const void* data, size_t size) {
 
     uint32_t version;
     memcpy(&version, base + 4, 4);
-    if (version != KOKO_VERSION) {
-        fprintf(stderr, "Unsupported weight file version %u (expected %u)\n", version, KOKO_VERSION);
+    if (version != 1 && version != 2) {
+        fprintf(stderr, "Unsupported weight file version %u (expected 1 or 2)\n", version);
         std::exit(1);
     }
 

@@ -1,14 +1,14 @@
 #pragma once
 // g2p_model_cuda.h — CUDA inference for G2P V3 Conformer CTC model.
 //
-// Same binary format as g2p_model.h, but runs on GPU using cublas for
+// Same binary format as g2p_model.h, but runs on GPU using Cutlass GEMM for
 // linear projections and custom kernels for RMSNorm, RoPE, softmax, SiLU.
 //
 // Architecture: char_emb → N × (RMSNorm→MHA→RMSNorm→SwiGLU) → upsample → head → CTC decode
 //
 // Optimizations over naive implementation:
-//   - cublasSgemm instead of cublasLt (no descriptor create/destroy overhead)
-//   - cublasSgemmStridedBatched for multi-head attention (1 call vs 4 per-head)
+//   - Cutlass GEMM with TF32 TensorOp + SIMT fallback + operator caching
+//   - Cutlass batched GEMM for multi-head attention (1 call vs 4 per-head)
 //   - Attention scale folded into GEMM alpha (eliminates scale kernel)
 //   - Residual adds fused into GEMM via beta=1 (eliminates add kernels)
 //   - Softmax batched across all heads (1 launch vs 4)
@@ -16,7 +16,7 @@
 // Usage:
 //   G2PModelCuda model;
 //   model.load("data/g2p_model.bin", stream);
-//   std::string phonemes = model.infer("hello world", ltHandle, stream);
+//   std::string phonemes = model.infer("hello world", stream);
 
 #include <cstdint>
 #include <cstdio>
@@ -26,8 +26,28 @@
 #include <vector>
 
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
-#include <cublasLt.h>
+
+// Cutlass GEMM (defined in cutlass_gemm.cu)
+extern "C" int cutlass_gemm_tn(int M, int N, int K,
+    const float* A, int lda, const float* B, int ldb,
+    float* C, int ldc, float alpha, float beta,
+    float* workspace, size_t workspace_bytes, cudaStream_t stream);
+extern "C" int cutlass_gemm_nn(int M, int N, int K,
+    const float* A, int lda, const float* B, int ldb,
+    float* C, int ldc, float alpha, float beta,
+    float* workspace, size_t workspace_bytes, cudaStream_t stream);
+extern "C" int cutlass_gemm_batched_tn(int M, int N, int K,
+    const float* A, int lda, long long strideA,
+    const float* B, int ldb, long long strideB,
+    float* C, int ldc, long long strideC,
+    int batch_count, float alpha, float beta,
+    float* workspace, size_t workspace_bytes, cudaStream_t stream);
+extern "C" int cutlass_gemm_batched_nn(int M, int N, int K,
+    const float* A, int lda, long long strideA,
+    const float* B, int ldb, long long strideB,
+    float* C, int ldc, long long strideC,
+    int batch_count, float alpha, float beta,
+    float* workspace, size_t workspace_bytes, cudaStream_t stream);
 
 // ── CUDA kernels ────────────────────────────────────────────────────────────
 
@@ -352,7 +372,7 @@ __global__ void g2p_bias_ctc_argmax_kernel(const float* __restrict__ logits,
 struct G2PModelCuda {
     bool load(const char* path, cudaStream_t stream);
     bool load(const void* data, size_t size, cudaStream_t stream);
-    std::string infer(const std::string& text, cublasLtHandle_t ltHandle, cudaStream_t stream) const;
+    std::string infer(const std::string& text, cudaStream_t stream) const;
     void free();
 
     bool loaded() const { return d_ > 0; }
@@ -372,9 +392,6 @@ private:
     // GPU weights (all contiguous in one allocation)
     float* weights_gpu_ = nullptr;
     size_t total_bytes_ = 0;
-
-    // cuBLAS handle (created in load, used for all GEMMs)
-    mutable cublasHandle_t cublas_ = nullptr;
 
     // Pointers into weights_gpu_
     float* char_emb_ = nullptr;    // [n_chars, d]
@@ -405,12 +422,8 @@ private:
     // Eliminates ~150 kernel dispatch overheads per inference call.
     mutable std::unordered_map<int, cudaGraphExec_t> graph_cache_;
 
-    // cuBLAS workspace for CUDA graph capture (cuBLAS can't malloc during capture)
-    float* cublas_ws_ = nullptr;
-    static constexpr size_t CUBLAS_WS_BYTES = 4 * 1024 * 1024;
-
-    // Persistent scalars for cuBLAS (pointers captured in graphs must outlive capture)
-    float one_ = 1.0f, zero_ = 0.0f, attn_scale_ = 0.0f;
+    // Attention scale (value, not pointer — Cutlass uses value-based alpha/beta)
+    float attn_scale_ = 0.0f;
 
     bool load_from_file_(FILE* f, const char* label, cudaStream_t stream);
 };
@@ -622,30 +635,28 @@ inline bool G2PModelCuda::load_from_file_(FILE* f, const char* label, cudaStream
     head_w_ = upload(head_w_cpu, n_phones_ * d_);
     head_b_ = upload(head_b_cpu, n_phones_);
 
-    // Create cuBLAS handle
-    cublasCreate(&cublas_);
-    cublasSetMathMode(cublas_, CUBLAS_TF32_TENSOR_OP_MATH);
     attn_scale_ = 1.0f / std::sqrt((float)head_dim_);
-    cudaMalloc(&cublas_ws_, CUBLAS_WS_BYTES);
-    cublasSetWorkspace(cublas_, cublas_ws_, CUBLAS_WS_BYTES);
 
     // Pre-allocate workspace at max_pos_ size so that CUDA graphs are never
     // invalidated by a larger T arriving later.
     {
         int Tm = max_pos_;
         int Tm_up = Tm * up_;
-        workspace_bytes_ =
-            Tm * sizeof(int) +
-            Tm * d_ * sizeof(float) +
-            Tm * 3 * d_ * sizeof(float) +
-            heads_ * Tm * Tm * sizeof(float) +
-            Tm * d_ * sizeof(float) +
-            Tm * d_ * sizeof(float) +
-            Tm * 2 * ff_ * sizeof(float) +
-            Tm * d_ * up_ * sizeof(float) +
-            Tm_up * d_ * sizeof(float) +
-            Tm_up * n_phones_ * sizeof(float) +
-            Tm_up * sizeof(int);
+        auto a = [](size_t off, size_t bytes) -> size_t {
+            return ((off + 255) & ~(size_t)255) + bytes;
+        };
+        workspace_bytes_ = 0;
+        workspace_bytes_ = a(workspace_bytes_, Tm * sizeof(int));
+        workspace_bytes_ = a(workspace_bytes_, Tm * d_ * sizeof(float));
+        workspace_bytes_ = a(workspace_bytes_, Tm * 3 * d_ * sizeof(float));
+        workspace_bytes_ = a(workspace_bytes_, heads_ * Tm * Tm * sizeof(float));
+        workspace_bytes_ = a(workspace_bytes_, Tm * d_ * sizeof(float));
+        workspace_bytes_ = a(workspace_bytes_, Tm * d_ * sizeof(float));
+        workspace_bytes_ = a(workspace_bytes_, Tm * 2 * ff_ * sizeof(float));
+        workspace_bytes_ = a(workspace_bytes_, Tm * d_ * up_ * sizeof(float));
+        workspace_bytes_ = a(workspace_bytes_, Tm_up * d_ * sizeof(float));
+        workspace_bytes_ = a(workspace_bytes_, Tm_up * n_phones_ * sizeof(float));
+        workspace_bytes_ = a(workspace_bytes_, Tm_up * sizeof(int));
         auto ws_err = cudaMalloc(&workspace_, workspace_bytes_);
         if (ws_err != cudaSuccess) {
             fprintf(stderr, "g2p_cuda: workspace alloc failed (%zu bytes): %s\n",
@@ -658,22 +669,20 @@ inline bool G2PModelCuda::load_from_file_(FILE* f, const char* label, cudaStream
     cudaStreamSynchronize(stream);
 
     fprintf(stderr, "g2p_cuda: loaded %s (d=%d, %d layers, %d heads, %d ff, %dx up, %.1f MB, ws=%.1f MB)\n",
-            label, d_, n_layers_, heads_, ff_, up_, total_bytes_ / (1024.0f * 1024.0f),
-            workspace_bytes_ / (1024.0f * 1024.0f));
+            label, d_, n_layers_, heads_, ff_, up_,
+            total_bytes_ / (1024.0f * 1024.0f), workspace_bytes_ / (1024.0f * 1024.0f));
     return true;
 }
 
 inline void G2PModelCuda::free() {
-    for (auto& [t, exec] : graph_cache_) cudaGraphExecDestroy(exec);
+    for (auto& [t, exec] : graph_cache_) if (exec) cudaGraphExecDestroy(exec);
     graph_cache_.clear();
     if (weights_gpu_) { cudaFree(weights_gpu_); weights_gpu_ = nullptr; }
     if (workspace_) { cudaFree(workspace_); workspace_ = nullptr; workspace_bytes_ = 0; }
-    if (cublas_ws_) { cudaFree(cublas_ws_); cublas_ws_ = nullptr; }
-    if (cublas_) { cublasDestroy(cublas_); cublas_ = nullptr; }
     d_ = 0;
 }
 
-inline std::string G2PModelCuda::infer(const std::string& text, cublasLtHandle_t /*ltHandle*/,
+inline std::string G2PModelCuda::infer(const std::string& text,
                                          cudaStream_t stream) const {
     if (d_ == 0) return "";
 
@@ -696,22 +705,22 @@ inline std::string G2PModelCuda::infer(const std::string& text, cublasLtHandle_t
     int d = d_, h = heads_, dk = head_dim_, ff = ff_;
     int T_up = T * up_;
 
-    // Workspace layout:
-    //   ids_gpu[T] | X[d,T] | QKV[3d,T] | attn_scores[h,T,T] | attn_out[d,T] |
-    //   normed[d,T] | ffn_out[2*ff,T] | X_up_proj[d*up,T] | X_up[d,T_up] |
-    //   logits[n_phones,T_up] | argmax[T_up]
-    size_t ws_bytes =
-        T * sizeof(int) +                              // ids_gpu
-        T * d * sizeof(float) +                        // X
-        T * 3 * d * sizeof(float) +                    // QKV
-        h * T * T * sizeof(float) +                    // attn_scores
-        T * d * sizeof(float) +                        // attn_out
-        T * d * sizeof(float) +                        // normed
-        T * 2 * ff * sizeof(float) +                   // ffn_out
-        T * d * up_ * sizeof(float) +                  // X_up_proj
-        T_up * d * sizeof(float) +                     // X_up
-        T_up * n_phones_ * sizeof(float) +             // logits
-        T_up * sizeof(int);                            // argmax
+    // Workspace layout (each buffer 256-byte aligned for Cutlass compatibility):
+    auto a = [](size_t off, size_t bytes) -> size_t {
+        return ((off + 255) & ~(size_t)255) + bytes;
+    };
+    size_t ws_bytes = 0;
+    ws_bytes = a(ws_bytes, T * sizeof(int));                    // ids_gpu
+    ws_bytes = a(ws_bytes, T * d * sizeof(float));              // X
+    ws_bytes = a(ws_bytes, T * 3 * d * sizeof(float));          // QKV
+    ws_bytes = a(ws_bytes, h * T * T * sizeof(float));          // attn_scores
+    ws_bytes = a(ws_bytes, T * d * sizeof(float));              // attn_out
+    ws_bytes = a(ws_bytes, T * d * sizeof(float));              // normed
+    ws_bytes = a(ws_bytes, T * 2 * ff * sizeof(float));         // ffn_out
+    ws_bytes = a(ws_bytes, T * d * up_ * sizeof(float));        // X_up_proj
+    ws_bytes = a(ws_bytes, T_up * d * sizeof(float));           // X_up
+    ws_bytes = a(ws_bytes, T_up * n_phones_ * sizeof(float));   // logits
+    ws_bytes = a(ws_bytes, T_up * sizeof(int));                 // argmax
 
     if (ws_bytes > workspace_bytes_) {
         // Should never happen — workspace is pre-allocated at max_pos_ size
@@ -720,10 +729,11 @@ inline std::string G2PModelCuda::infer(const std::string& text, cublasLtHandle_t
         return "";
     }
 
-    // Assign pointers
+    // Assign pointers (256-byte aligned for Cutlass TensorOp compatibility)
     char* wp = (char*)workspace_;
-    auto wallocf = [&](size_t n) -> float* { float* p = (float*)wp; wp += n * sizeof(float); return p; };
-    auto walloci = [&](size_t n) -> int*   { int* p = (int*)wp; wp += n * sizeof(int); return p; };
+    auto align256 = [&]() { wp = (char*)(((uintptr_t)wp + 255) & ~(uintptr_t)255); };
+    auto wallocf = [&](size_t n) -> float* { align256(); float* p = (float*)wp; wp += n * sizeof(float); return p; };
+    auto walloci = [&](size_t n) -> int*   { align256(); int* p = (int*)wp; wp += n * sizeof(int); return p; };
 
     int* ids_gpu         = walloci(T);
     float* X             = wallocf(T * d);
@@ -737,17 +747,11 @@ inline std::string G2PModelCuda::infer(const std::string& text, cublasLtHandle_t
     float* logits        = wallocf(T_up * n_phones_);
     int* argmax          = walloci(T_up);
 
-    // Set stream on cublas handle
-    cublasSetStream(cublas_, stream);
-
     // Upload input IDs (before graph — stream ordering guarantees completion)
     cudaMemcpyAsync(ids_gpu, ids.data(), T * sizeof(int), cudaMemcpyHostToDevice, stream);
 
-    // CUDA graph: capture all kernel launches on first call per T,
-    // replay as single graph launch on subsequent calls.
-    auto git = graph_cache_.find(T);
-    if (git == graph_cache_.end()) {
-        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+    // Lambda: run all inference kernels on the stream
+    auto run_kernels = [&]() {
 
         g2p_embed_kernel<<<T, 128, 0, stream>>>(ids_gpu, char_emb_, X, T, d);
 
@@ -760,8 +764,9 @@ inline std::string G2PModelCuda::infer(const std::string& text, cublasLtHandle_t
                 X, L.n1_w, normed, T, d, 1e-6f);
 
             // 2. QKV projection
-            cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                        3 * d, T, d, &one_, L.qkv_w, d, normed, d, &zero_, QKV, 3 * d);
+            cutlass_gemm_tn(3 * d, T, d, L.qkv_w, d, normed, d, QKV, 3 * d,
+                             1.0f, 0.0f, nullptr, 0, stream);
+
 
             // 3. Fused QKV bias + RoPE Q&K
             if (use_rope_) {
@@ -772,79 +777,90 @@ inline std::string G2PModelCuda::infer(const std::string& text, cublasLtHandle_t
             }
 
             // 4. Batched attention scores
-            cublasSgemmStridedBatched(cublas_,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                T, T, dk,
-                &attn_scale_,
+            cutlass_gemm_batched_tn(T, T, dk,
                 QKV + d, 3 * d, (long long)dk,
                 QKV,     3 * d, (long long)dk,
-                &zero_,
                 attn_scores, T, (long long)T * T,
-                h);
+                h, attn_scale_, 0.0f, nullptr, 0, stream);
+
 
             // 5. Softmax
             g2p_softmax_kernel<<<h * T, block, block * sizeof(float), stream>>>(
                 attn_scores, T, h * T);
 
             // 6. Batched value weighted sum
-            cublasSgemmStridedBatched(cublas_,
-                CUBLAS_OP_N, CUBLAS_OP_N,
-                dk, T, T,
-                &one_,
+            cutlass_gemm_batched_nn(dk, T, T,
                 QKV + 2 * d, 3 * d, (long long)dk,
                 attn_scores, T,     (long long)T * T,
-                &zero_,
                 attn_out, d, (long long)dk,
-                h);
+                h, 1.0f, 0.0f, nullptr, 0, stream);
 
-            // 7. Output projection with fused residual
-            cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                        d, T, d, &one_, L.out_w, d, attn_out, d, &one_, X, d);
+
+            // 7. Output projection with fused residual (beta=1)
+            cutlass_gemm_tn(d, T, d, L.out_w, d, attn_out, d, X, d,
+                             1.0f, 1.0f, nullptr, 0, stream);
+
 
             // 8a. Fused out_bias + RMSNorm
             g2p_bias_rms_norm_kernel<<<T, block, block * sizeof(float), stream>>>(
                 X, L.out_b, L.n2_w, normed, T, d, 1e-6f);
 
             // 8b. Gate+Up GEMM: ffn_out[2*ff, T] = gate_up_w[2*ff, d] × normed[d, T]
-            cublasSgemm(cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
-                        2 * ff, T, d, &one_, L.gate_up_w, 2 * ff, normed, d, &zero_, ffn_out, 2 * ff);
+            cutlass_gemm_nn(2 * ff, T, d, L.gate_up_w, 2 * ff, normed, d, ffn_out, 2 * ff,
+                             1.0f, 0.0f, nullptr, 0, stream);
 
             // 8c. Fused bias + SwiGLU
             g2p_swiglu_bias_kernel<<<(T * ff + 255) / 256, 256, 0, stream>>>(
                 ffn_out, L.gate_up_b, ff, T);
 
             // 8d. Down GEMM with fused residual: X += down_w[d, ff] × ffn_out[ff, T]
-            cublasSgemm(cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
-                        d, T, ff, &one_, L.down_w, d, ffn_out, 2 * ff, &one_, X, d);
+            cutlass_gemm_nn(d, T, ff, L.down_w, d, ffn_out, 2 * ff, X, d,
+                             1.0f, 1.0f, nullptr, 0, stream);
 
             // 8e. Down bias
             g2p_bias_kernel<<<T, 256, 0, stream>>>(X, L.down_b, d, T);
         }
 
         // Upsample projection (no bias — fused into reshape)
-        cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                    d * up_, T, d, &one_, up_w_, d, X, d, &zero_, X_up_proj, d * up_);
+        cutlass_gemm_tn(d * up_, T, d, up_w_, d, X, d, X_up_proj, d * up_,
+                         1.0f, 0.0f, nullptr, 0, stream);
 
         // Fused upsample bias + reshape
         g2p_upsample_bias_reshape_kernel<<<T_up, 128, 0, stream>>>(
             X_up_proj, up_b_, X_up, T, d, up_);
 
         // Output head (no bias — fused into CTC argmax)
-        cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                    n_phones_, T_up, d, &one_, head_w_, d, X_up, d, &zero_, logits, n_phones_);
+        cutlass_gemm_tn(n_phones_, T_up, d, head_w_, d, X_up, d, logits, n_phones_,
+                         1.0f, 0.0f, nullptr, 0, stream);
 
         // Fused head bias + CTC argmax
         g2p_bias_ctc_argmax_kernel<<<(T_up + 255) / 256, 256, 0, stream>>>(
             logits, head_b_, argmax, T_up, n_phones_);
 
+    };
+
+    // CUDA graph: first call runs directly (populates Cutlass operator caches),
+    // second call captures the graph, third+ replays.
+    auto git = graph_cache_.find(T);
+    if (git == graph_cache_.end()) {
+        // First call: run directly. Cutlass initialize() populates operator
+        // caches. Output is valid — returned to caller.
+        run_kernels();
+        // Mark as "seen but not yet captured" with nullptr
+        graph_cache_[T] = nullptr;
+    } else if (git->second == nullptr) {
+        // Second call: capture graph (all Cutlass operators hit cache)
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        run_kernels();
         cudaGraph_t graph;
         cudaStreamEndCapture(stream, &graph);
         cudaGraphExec_t exec;
         cudaGraphInstantiateWithFlags(&exec, graph, 0);
         cudaGraphDestroy(graph);
-        graph_cache_[T] = exec;
+        git->second = exec;
         cudaGraphLaunch(exec, stream);
     } else {
+        // Third+: replay cached graph
         cudaGraphLaunch(git->second, stream);
     }
 

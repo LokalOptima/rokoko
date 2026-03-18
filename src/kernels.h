@@ -1,12 +1,24 @@
 // kernels.h — Custom CUDA kernel launch wrappers for Rokoko TTS
 //
-// All kernels operate on FP32 data.
 // Signal tensors use [T, C] layout (time-major, channels last).
 
 #pragma once
 
 #include <cuda_runtime.h>
-#include <cstdint>
+#include <cuda_fp16.h>
+
+// ---------------------------------------------------------------------------
+// FP32→FP16 cast: dst[i] = __float2half(src[i])
+// ---------------------------------------------------------------------------
+void cast_f32_to_f16(const float* src, __half* dst, int N, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// GEMV FP16 weights: y[M] = alpha * A[K,M]^T * x[K] + beta * y[M]
+//   A: half_t col-major [K, M], x: float, y: float
+// ---------------------------------------------------------------------------
+void gemv_tn_f16(const __half* A, int lda, const float* x,
+                  float* y, int M, int K, float alpha, float beta,
+                  cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Embedding gather: y[i, :] = table[ids[i], :]
@@ -49,11 +61,6 @@ void gelu_f32(const float* x, float* y, int N, cudaStream_t stream);
 // ---------------------------------------------------------------------------
 void leaky_relu_f32(const float* x, float* y, int N, float alpha,
                     cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Sigmoid: y = 1 / (1 + exp(-x))
-// ---------------------------------------------------------------------------
-void sigmoid_f32(const float* x, float* y, int N, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Softmax over last dimension: y[n, :] = softmax(x[n, :])
@@ -102,29 +109,6 @@ void layer_norm_channels_first_f32(const float* x, const float* gamma,
                                     cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Convert int64 array to int32 (for phoneme IDs from Python)
-// ---------------------------------------------------------------------------
-void cast_i64_to_i32(const int64_t* src, int* dst, int N,
-                     cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Instance normalization 1D: normalize each channel across time
-//   x, y: [T, C], weight, bias: [C]
-//   For each c: y[t,c] = weight[c] * (x[t,c] - mean_c) / sqrt(var_c + eps) + bias[c]
-// ---------------------------------------------------------------------------
-void instance_norm_1d_f32(const float* x, const float* weight, const float* bias,
-                           float* y, float* workspace,  // [2*C] reduction buffer
-                           int C, int T, float eps,
-                           cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Style affine 1D: y[t,c] = (1 + gamma[c]) * x[t,c] + beta[c]
-//   x, y: [T, C], gamma, beta: [C]
-// ---------------------------------------------------------------------------
-void style_affine_1d_f32(const float* x, const float* gamma, const float* beta,
-                           float* y, int C, int T, cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
 // Fused InstanceNorm + StyleAffine: single-pass AdaIN
 //   y[t,c] = (1+gamma[c]) * (norm_w[c] * (x[t,c]-mean)/sqrt(var+eps) + norm_b[c]) + beta[c]
 //   x, y: [T, C], norm_w, norm_b: [C], gamma, beta: [C]
@@ -134,7 +118,8 @@ void instance_norm_style_affine_f32(const float* x, const float* norm_w,
                                       const float* beta, float* y,
                                       float* workspace,  // [2*C] reduction buffer
                                       int C, int T, float eps,
-                                      cudaStream_t stream);
+                                      cudaStream_t stream,
+                                      const float* snake_alpha = nullptr);
 
 // ---------------------------------------------------------------------------
 // Adaptive LayerNorm: normalize rows, then style conditioning
@@ -199,31 +184,6 @@ void conv1d_general_f32(const float* x, const float* w, const float* bias,
                         cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// ConvTranspose1d (non-depthwise, groups=1)
-//   x: [T_in, C_in], w: [C_in, C_out, K], b: [C_out] or nullptr
-//   y: [T_out, C_out]
-//   T_out = (T_in - 1) * stride - 2*padding + K + output_padding
-// ---------------------------------------------------------------------------
-void conv_transpose1d_f32(const float* x, const float* w, const float* bias,
-                          float* y, int C_in, int C_out, int T_in, int K,
-                          int stride, int padding, int output_padding,
-                          cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Snake activation: y = x + (1/alpha) * sin(alpha * x)^2
-//   x, y: [T, C], alpha: [C] (one per channel)
-// ---------------------------------------------------------------------------
-void snake_f32(const float* x, const float* alpha, float* y,
-               int C, int T, cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Nearest-neighbor upsampling with arbitrary integer factor
-//   x: [T_in, C], y: [T_in * factor, C]
-// ---------------------------------------------------------------------------
-void upsample_nearest_f32(const float* x, float* y, int C, int T_in,
-                           int factor, cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
 // Reflection pad 1D: pad left by pad_left, right by pad_right
 //   x: [T, C], y: [T + pad_left + pad_right, C]
 // ---------------------------------------------------------------------------
@@ -240,11 +200,6 @@ void exp_f32(const float* x, float* y, int N, cudaStream_t stream);
 // Element-wise sin: y = sin(x)
 // ---------------------------------------------------------------------------
 void sin_f32(const float* x, float* y, int N, cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Element-wise tanh: y = tanh(x)
-// ---------------------------------------------------------------------------
-void tanh_f32(const float* x, float* y, int N, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // STFT forward: compute magnitude and phase spectrograms
@@ -275,13 +230,13 @@ void lstm_gates_f32(const float* gates, const float* c_prev,
                      cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Fused LSTM: run ALL timesteps in a single kernel launch
-//   Whh: [4H, H], ig_all: [T, 4H] (pre-computed input gates)
-//   h_all: [T, H] output. reverse=1 for backward direction.
+// GEMV: y[M] = A[K, M]^T * x[K]  (A stored col-major [K, M])
+//   alpha/beta: y = alpha * A^T * x + beta * y
 // ---------------------------------------------------------------------------
-void fused_lstm_f32(const float* Whh, const float* ig_all,
-                     float* h_all, int T, int H, int reverse,
-                     cudaStream_t stream);
+void gemv_tn_f32(const float* A, int lda, const float* x,
+                  float* y, int M, int K,
+                  float alpha, float beta,
+                  cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // im2col for 1D convolution: x[T_in, C_in] → col[T_out, C_in*K]
@@ -324,6 +279,19 @@ void concat4_channels_f32(const float* a, const float* b,
                             float* y,
                             int T, int Ca, int Cb, int Cc, int Cd,
                             cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// FP32→FP16 cast with channel zero-padding: [T, C_old] → [T, C_new]
+// ---------------------------------------------------------------------------
+void cast_f32_to_f16_pad(const float* src, __half* dst,
+                           int T, int C_old, int C_new, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Pad blocks: copy n_blocks of old_block_size, zero-fill to new_block_size.
+// ---------------------------------------------------------------------------
+void pad_blocks_f32(const float* src, float* dst,
+                      int n_blocks, int old_block_size, int new_block_size,
+                      cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // SineGen phase computation: f0[L2] → phase_low[L2 * 9]

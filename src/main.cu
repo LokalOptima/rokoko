@@ -22,15 +22,17 @@
 #include <unistd.h>
 
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
-#include <cublasLt.h>
 
-#include "weights.h"
+#include "rokoko_common.h"
 #include "kernels.h"
 #include "normalize.h"
 #include "g2p.h"
 #include "bundle.h"
 #include "server.h"
+
+// Backend-specific: each binary provides its own bundle URL + filename
+extern const char* default_bundle_url();
+extern const char* default_bundle_filename();
 
 // ---------------------------------------------------------------------------
 // Voice map (populated from bundle)
@@ -286,8 +288,6 @@ static std::vector<Chunk> chunk_ipa(const std::string& ipa) {
 struct TtsPipeline {
     Weights& weights;
     G2PModelCuda& g2p;
-    cublasHandle_t cublas;
-    cublasLtHandle_t ltHandle;
     cudaStream_t stream;
     GpuArena& encode_arena;
     GpuArena& decode_arena;
@@ -319,7 +319,7 @@ struct TtsPipeline {
 
         // G2P
         t0 = clk::now();
-        std::string ipa = g2p.infer(preprocessed, ltHandle, stream);
+        std::string ipa = g2p.infer(preprocessed, stream);
         t1 = clk::now();
         last_g2p_ms = ms(t0, t1);
         fprintf(stderr, "G2P: \"%s\" (%.1f ms)\n", ipa.c_str(), last_g2p_ms);
@@ -349,7 +349,7 @@ struct TtsPipeline {
             const float* style = voice_data + phoneme_count * 256;
 
             auto audio = rokoko_infer(weights, chunk.tokens.data(), T, style,
-                                       cublas, ltHandle, stream, encode_arena,
+                                       stream, encode_arena,
                                        decode_arena, d_workspace, ws_bytes);
             fprintf(stderr, "  chunk %zu: T=%d, %zu samples (%.2fs), decode arena=%.1f MB\n",
                     c, T, audio.size(), audio.size()/24000.0, decode_arena.offset/1e6);
@@ -396,6 +396,7 @@ int main(int argc, char** argv) {
             "  --serve [port]      HTTP server with web UI (default: 8080)\n"
             "  --host <addr>       Server bind address (default: 0.0.0.0)\n"
             "  --bundle <file>     Model bundle (default: ~/.cache/rokoko/rokoko.bundle)\n"
+            "  --weights <file>    Standalone .koko weight file (overrides bundle weights)\n"
             "  --help              Show this help\n"
             "\n"
             "Examples:\n"
@@ -414,7 +415,8 @@ int main(int argc, char** argv) {
     }
 
     std::string home = std::getenv("HOME") ? std::getenv("HOME") : ".";
-    std::string bundle_path = home + "/.cache/rokoko/rokoko.bundle";
+    std::string bundle_path = home + "/.cache/rokoko/" + default_bundle_filename();
+    std::string weights_path;  // standalone .koko file (overrides bundle weights)
     std::string text_input;
     std::string voice_name = "af_heart";
     std::string output_path = "output.wav";
@@ -425,6 +427,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--bundle" && i + 1 < argc)       bundle_path = argv[++i];
+        else if (arg == "--weights" && i + 1 < argc) weights_path = argv[++i];
         else if (arg == "--voice" && i + 1 < argc)   voice_name = argv[++i];
         else if (arg == "-o" && i + 1 < argc)        output_path = argv[++i];
         else if (arg == "--stdout")                   output_path = "-";
@@ -465,8 +468,7 @@ int main(int argc, char** argv) {
 
             fprintf(stderr, "Bundle not found at %s — downloading...\n", bundle_path.c_str());
 
-            static const char* url =
-                "https://github.com/lfrati/rokoko/releases/download/v1.0.0/rokoko.bundle";
+            const char* url = default_bundle_url();
 
             // Download to temp file, then rename atomically
             std::string tmp_path = bundle_path + ".tmp";
@@ -510,7 +512,11 @@ int main(int argc, char** argv) {
     // --- Load TTS weights (prefetch in background) + init CUDA ---
     Weights prefetched;
     std::thread prefetch_thread([&]() {
-        prefetched = Weights::prefetch(weights_span.data, weights_span.size);
+        if (!weights_path.empty()) {
+            prefetched = Weights::prefetch(weights_path);
+        } else {
+            prefetched = Weights::prefetch(weights_span.data, weights_span.size);
+        }
     });
     cudaFree(0); // lazy CUDA init
     prefetch_thread.join();
@@ -535,36 +541,44 @@ int main(int argc, char** argv) {
             prop.name, ms(t_start, t_init),
             prefetched.gpu_data_size / 1e6, g2p.param_bytes() / 1e6);
 
-    // --- cuBLAS handles ---
-    cublasHandle_t cublas;
-    CUBLAS_CHECK(cublasCreate(&cublas));
-    CUBLAS_CHECK(cublasSetStream(cublas, stream));
-    CUBLAS_CHECK(cublasSetMathMode(cublas, CUBLAS_TF32_TENSOR_OP_MATH));
-    cublasLtHandle_t ltHandle;
-    CUBLAS_CHECK(cublasLtCreate(&ltHandle));
-
     // --- Voice map ---
     VoiceMap voices = build_voice_map(bundle);
+
+    // --- Pre-allocate arenas + workspace ---
+    static constexpr size_t ENCODE_ARENA_BYTES = 64 * 1024 * 1024;  // 64 MB
+    static constexpr size_t WORKSPACE_BYTES    = 128 * 1024 * 1024; // 128 MB
+
+    GpuArena encode_arena;
+    encode_arena.init(ENCODE_ARENA_BYTES);
+    GpuArena decode_arena;  // starts empty, grows on first use
+    float* d_workspace;
+    CUDA_CHECK(cudaMalloc(&d_workspace, WORKSPACE_BYTES));
+
+    // --- Pre-warm: populate Cutlass operator caches + CUDA graphs ---
+    {
+        auto vit = voices.find("af_heart");
+        if (vit != voices.end()) {
+            const float* voice_data = reinterpret_cast<const float*>(vit->second.start);
+            const float* style = voice_data;  // row 0
+            auto warmup_ipa = g2p.infer("Warmup.", stream);
+            auto warmup_tokens = to_tokens(warmup_ipa.empty() ? "." : warmup_ipa);
+            rokoko_infer(prefetched, warmup_tokens.data(), (int)warmup_tokens.size(),
+                         style, stream, encode_arena, decode_arena,
+                         d_workspace, WORKSPACE_BYTES);
+            cudaStreamSynchronize(stream);
+        }
+        auto t_warm = clk::now();
+        fprintf(stderr, "Pre-warm: %.0f ms\n", ms(t_init, t_warm));
+    }
+
+    fprintf(stderr, "Encode arena: %.0f MB | Workspace: %.0f MB | Decode arena: on demand\n",
+            ENCODE_ARENA_BYTES / 1e6, WORKSPACE_BYTES / 1e6);
 
     // =======================================================================
     // Server mode
     // =======================================================================
     if (serve_mode) {
-        // Pre-allocate arenas + workspace
-        static constexpr size_t ENCODE_ARENA_BYTES = 64 * 1024 * 1024;  // 64 MB
-        static constexpr size_t WORKSPACE_BYTES    = 128 * 1024 * 1024; // 128 MB
-
-        GpuArena encode_arena;
-        encode_arena.init(ENCODE_ARENA_BYTES);
-        GpuArena decode_arena;  // starts empty, grows on first use
-
-        float* d_workspace;
-        CUDA_CHECK(cudaMalloc(&d_workspace, WORKSPACE_BYTES));
-
-        fprintf(stderr, "Encode arena: %.0f MB | Workspace: %.0f MB | Decode arena: on demand\n",
-                ENCODE_ARENA_BYTES / 1e6, WORKSPACE_BYTES / 1e6);
-
-        TtsPipeline pipeline{prefetched, g2p, cublas, ltHandle, stream,
+        TtsPipeline pipeline{prefetched, g2p, stream,
                              encode_arena, decode_arena, d_workspace, WORKSPACE_BYTES, voices};
 
         run_server(pipeline, serve_host, serve_port);
@@ -575,8 +589,6 @@ int main(int argc, char** argv) {
         encode_arena.destroy();
         g2p.free();
         prefetched.free();
-        cublasLtDestroy(ltHandle);
-        cublasDestroy(cublas);
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     }
@@ -593,7 +605,7 @@ int main(int argc, char** argv) {
 
     // --- G2P infer ---
     auto t_g2p0 = clk::now();
-    std::string ipa = g2p.infer(preprocessed, ltHandle, stream);
+    std::string ipa = g2p.infer(preprocessed, stream);
     auto t_g2p1 = clk::now();
     fprintf(stderr, "G2P: \"%s\" (%.1f ms)\n", ipa.c_str(), ms(t_g2p0, t_g2p1));
 
@@ -619,16 +631,6 @@ int main(int argc, char** argv) {
     // --- TTS infer per chunk ---
     std::vector<float> all_audio;
 
-    // Pre-allocate encode arena + workspace (shared across chunks)
-    static constexpr size_t ENCODE_ARENA_BYTES = 64 * 1024 * 1024;  // 64 MB
-    static constexpr size_t WORKSPACE_BYTES    = 128 * 1024 * 1024; // 128 MB
-
-    GpuArena encode_arena;
-    encode_arena.init(ENCODE_ARENA_BYTES);
-    GpuArena decode_arena;  // starts empty, grows on first use
-    float* d_workspace;
-    CUDA_CHECK(cudaMalloc(&d_workspace, WORKSPACE_BYTES));
-
     for (size_t c = 0; c < chunks.size(); c++) {
         auto& chunk = chunks[c];
         int T = (int)chunk.tokens.size();
@@ -643,7 +645,7 @@ int main(int argc, char** argv) {
 
         auto t0 = clk::now();
         auto audio = rokoko_infer(prefetched, chunk.tokens.data(), T, style,
-                                   cublas, ltHandle, stream, encode_arena,
+                                   stream, encode_arena,
                                    decode_arena, d_workspace, WORKSPACE_BYTES);
         auto t1 = clk::now();
 
@@ -668,8 +670,6 @@ int main(int argc, char** argv) {
     // Cleanup
     g2p.free();
     prefetched.free();
-    cublasLtDestroy(ltHandle);
-    cublasDestroy(cublas);
     CUDA_CHECK(cudaStreamDestroy(stream));
     return 0;
 }

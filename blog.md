@@ -2948,3 +2948,636 @@ TOTAL                                             91570
 | `third_party/.gitignore` | Ignore Cutlass headers (downloaded at build time) |
 
 ---
+## 2026-03-15: Optimization Round 6 — Cutlass Operator Caching
+
+### Context
+
+After Round 5, the Cutlass implicit GEMM was functionally correct but slower than cuBLAS im2col+SGEMM (17.2ms vs 9.5ms on short text, 95.7ms vs 92.3ms on long text). The short-vs-long gap pointed to per-call overhead rather than kernel throughput.
+
+### The Problem: `initialize()` on Every Call
+
+Cutlass `ImplicitGemmConvolution::initialize()` does substantial host-side work: it computes tiling parameters, grid dimensions, iterator configurations, and packs everything into a `Params` struct. We were calling this on **every single convolution** — dozens of times per inference.
+
+But Cutlass also has an `update()` method that does exactly one thing: swap the device pointers (input, weights, bias, output) without recomputing any of the tiling/grid state. This is ~100x cheaper than `initialize()`.
+
+### The Fix: Cache by Problem Shape
+
+The key insight: most convolutions in the model share the same `(C_in, C_out, K, stride, padding, dilation, T_in)` shape. For example, the 5 text encoder layers all run (512, 512, K=5) with the same T. The generator resblocks run dozens of (C, C, K=3/7/11) convolutions at the same T.
+
+We cache an initialized operator per unique problem shape in an `unordered_map`. First call for a shape: full `initialize()`. All subsequent calls: `update()` (pointer swap) + `operator()` (kernel launch).
+
+```cpp
+struct ConvKey {
+    int C_in, C_out, T_in, K, stride, padding, dilation;
+    bool operator==(const ConvKey& o) const { /* field-by-field */ }
+};
+
+static std::unordered_map<ConvKey, ImplicitGemm, ConvKeyHash> s_op_cache;
+
+// In cutlass_conv1d_fprop:
+auto it = s_op_cache.find(key);
+if (it != s_op_cache.end()) {
+    it->second.update(arguments, workspace);  // just swap pointers
+    it->second(stream);                        // launch kernel
+} else {
+    conv_op.initialize(arguments, workspace, stream);  // full init
+    conv_op(stream);
+    s_op_cache[key] = conv_op;  // cache for next time
+}
+```
+
+### Results
+
+Operator caching brought Cutlass to **exact parity** with cuBLAS:
+
+```
+=== Cutlass + Operator Caching (bench.sh, 30 timed runs, exclusive GPU lock) ===
+
+--- short (1.60s audio, n=30) ---
+           median       p95       min       max
+  TTS:       9.61     12.21      9.45     12.25  ms
+  RTFx:       148x       116x  (median / p95)
+
+--- medium (5.72s audio, n=30) ---
+           median       p95       min       max
+  TTS:      29.74     31.77     29.52     32.67  ms
+  RTFx:       181x       169x  (median / p95)
+
+--- long (18.82s audio, n=30) ---
+           median       p95       min       max
+  TTS:      92.36     93.17     92.22     96.64  ms
+  RTFx:       194x       192x  (median / p95)
+
+STT: short PASS, medium PASS, long PASS
+```
+
+Comparison (long text TTS median):
+
+| Version | TTS (ms) | RTFx | vs cuBLAS |
+|---------|----------|------|-----------|
+| cuBLAS im2col+SGEMM (main branch) | 92.3 | 194x | 1.00x |
+| Cutlass implicit GEMM (no caching) | 95.7 | 188x | 0.97x |
+| **Cutlass + operator caching** | **92.4** | **194x** | **1.00x** |
+
+Short text improved the most: 17.2ms → 9.6ms (1.79x), confirming that `initialize()` overhead dominated small-problem performance.
+
+### What This Means
+
+Cutlass implicit GEMM now matches cuBLAS while:
+- **Eliminating im2col entirely** — no separate im2col kernel or workspace needed
+- **Fusing bias** into the GEMM epilogue — one fewer kernel launch per conv
+- **Setting up for TensorOp** — switching from `OpClassSimt` to `OpClassTensorOp` (TF32) could push throughput beyond cuBLAS
+
+The SIMT path uses scalar loads (`AlignedArray<float,1>`), matching cuBLAS SGEMM throughput. TF32 TensorOp would use 128-bit vectorized loads + tensor core math — the potential upside.
+
+### Lessons Learned
+
+1. **`initialize()` is expensive, `update()` is free.** Cutlass operators are designed to be initialized once per problem shape, then reused with pointer swaps. Calling `initialize()` per-inference is an anti-pattern.
+
+2. **Profile the right thing.** The gap between short (1.8x slower) and long (1.04x slower) text immediately pointed to fixed per-call overhead, not kernel throughput. The fix was obvious once we looked at the pattern.
+
+### Files Changed
+
+| File | Changes |
+|---|---|
+| `src/cutlass_conv.cu` | Added `ConvKey`/`ConvKeyHash`, `s_op_cache` map, cache-hit path with `update()`, cache-miss path with `initialize()` + cache store |
+
+---
+## 2026-03-15: Optimization Round 7 — TF32 TensorOp
+
+### Context
+
+With operator caching, Cutlass SIMT matched cuBLAS exactly. Next step: switch from CUDA cores (`OpClassSimt`, scalar loads) to tensor cores (`OpClassTensorOp`, TF32 MMA with 128-bit vectorized loads).
+
+### The Change
+
+Replaced the Cutlass template instantiation:
+
+| Parameter | SIMT (before) | TF32 (after) |
+|-----------|--------------|--------------|
+| OpClass | `OpClassSimt` | `OpClassTensorOp` |
+| Threadblock | `128, 128, 8` | `128, 128, 16` |
+| Warp | `32, 64, 8` | `64, 64, 16` |
+| Instruction | `1, 1, 1` (scalar) | `16, 8, 8` (TF32 MMA) |
+| Epilogue alignment | 1 | 4 (float4) |
+| Pipeline stages | 4 | 3 |
+
+TF32 requires C_in and C_out divisible by 4 for aligned 128-bit loads. Added a SIMT fallback for unaligned channels (C=1 for F0/noise convs, C=22 for conv_post/noise_convs). These are tiny convolutions — the fallback to SIMT (or cuBLAS) is fine.
+
+Separate operator caches per variant: `s_tf32_cache` and `s_simt_cache`. Templated `dispatch_conv<>()` handles both paths with the same cache-hit/miss logic.
+
+### TF32 Precision
+
+TF32 rounds FP32 mantissa from 23 bits to 10 bits during MMA. This introduces ~0.1% relative error per multiply-accumulate. For TTS inference, this is inaudible — all three STT verification tests pass perfectly.
+
+### Results
+
+```
+=== TF32 TensorOp + Operator Caching (bench.sh, 30 runs) ===
+
+--- short (1.60s audio) ---
+  TTS:       9.60ms median    RTFx: 147x
+
+--- medium (5.72s audio) ---
+  TTS:      29.74ms median    RTFx: 180x
+
+--- long (18.82s audio) ---
+  TTS:      92.11ms median    RTFx: 195x
+
+STT: short PASS, medium PASS, long PASS
+```
+
+| Version | Short | Medium | Long |
+|---------|-------|--------|------|
+| cuBLAS im2col+SGEMM | 9.5ms | 29.8ms | 92.3ms |
+| Cutlass SIMT + cache | 9.6ms | 29.7ms | 92.4ms |
+| **Cutlass TF32 + cache** | **9.6ms** | **29.7ms** | **92.1ms** |
+
+### Why No Speedup?
+
+The research warned: **on consumer GPUs (GeForce RTX), TF32 tensor core throughput ≈ FP32 SIMT throughput**. This was documented for Ampere consumer (RTX 3000 series) and appears to hold for Blackwell consumer (RTX 5070 Ti / SM120) as well.
+
+On datacenter GPUs (A100: 156 TFLOPS TF32 vs 19.5 TFLOPS FP32), the same code would see ~2-4x speedup. The TF32 path is the right architecture — we just don't see the throughput benefit on consumer silicon.
+
+### What We Achieved
+
+Across rounds 5-7, Cutlass implicit GEMM went from **1.8x slower** to **exact parity** with cuBLAS:
+- Eliminated im2col kernels and workspace memory
+- Fused bias into GEMM epilogue
+- Operator caching eliminates per-call overhead
+- TF32 TensorOp with SIMT fallback for unaligned channels
+- Clean dual-path architecture that scales to datacenter GPUs
+
+### Lessons Learned
+
+1. **Consumer vs datacenter tensor cores matter.** GeForce cards have reduced tensor core throughput relative to CUDA core count. The same code that's 2-4x faster on A100 is break-even on RTX 5070 Ti.
+
+2. **Don't panic on intermediate results.** The initial Cutlass integration was 1.8x slower. Rather than abandoning the approach, we identified the root cause (initialize() overhead) and fixed it with one change.
+
+### Files Changed
+
+| File | Changes |
+|---|---|
+| `src/cutlass_conv.cu` | Added TF32 TensorOp kernel type + SIMT fallback, dual caches, templated `dispatch_conv<>()`, alignment-based path selection |
+
+---
+
+## 2026-03-15: Optimization Round 8 — Dual-Tile Cutlass + Depthwise Fix
+
+### Tile Selection
+
+The 128x128 TF32 tile from Round 7 left 94% of SMs idle on short text — only 4 CTAs for 70 SMs. Added a 64x64x16 TF32 tile that fires when `ceil(C_out/128)*ceil(T_out/128) < SM_COUNT`. This 4x increase in CTA count recovers SM occupancy on small problems while keeping the high-throughput 128x128 tile for large ones.
+
+Also fixed `conv_transpose1d_depthwise` — was launching 1 thread per block instead of 256 threads. This was a silent correctness bug (output was correct but slow).
+
+### Results
+
+```
+=== Dual-Tile (bench.sh, 30 runs) ===
+  Short:   9.76ms / 146x RTFx  (was 11.8ms — 1.21x faster)
+  Medium: 26.50ms / 201x RTFx  (was 27.5ms — 1.04x faster)
+  Long:   71.37ms / 248x RTFx  (was 71.9ms — holds)
+```
+
+---
+
+## 2026-03-15: Optimization Round 9 — Residual Fusion + Snake Fusion
+
+### Residual Add → Cutlass Epilogue
+
+In generator resblocks, the pattern was: `conv → add(conv_out, residual)`. Extended `cutlass_conv1d_fprop` with a `residual` pointer parameter — Cutlass accumulates directly into the residual buffer (`C=residual, beta=1`), then `channel_bias_add` handles bias separately. Eliminates 27 `add_f32` kernels per inference and 33% less memory traffic per fused site.
+
+### Snake → Instance Norm Kernel
+
+Snake activation (`x + sin²(αx)/α`) always followed the AdaIN instance norm in generator resblocks. Added optional `snake_alpha` parameter to `instnorm_style_norm_kernel` — computes norm + snake in a single memory pass instead of separate write + read/write. Eliminates 48 kernel launches.
+
+### Results
+
+```
+Long: 68.2ms → 65.6ms (269x RTFx, +41% vs cuBLAS baseline)
+STT: short PASS, medium PASS, long PASS
+```
+
+---
+
+## 2026-03-15: Optimization Round 10 — CUDA Graph Decode + L-Bucketing
+
+### Decode Graph
+
+Wrapped the entire decode phase in a CUDA graph — captured on first inference, replayed on subsequent calls with the same `(T, L_bucketed)` key. L is rounded up to the nearest multiple of 32 so different utterances that produce similar frame counts share a single cached graph.
+
+Key changes:
+- Decode graph cache keyed by `(T, L_padded)`, with arena-base invalidation when the decode arena grows
+- SineGen `rand_ini` moved to a persistent device buffer (`seed=42`) to avoid per-call randomness that prevents graph replay
+- Async `cudaMemcpyAsync` for host→device token upload, overlapped with graph dispatch
+
+### Results
+
+```
+=== CUDA Graph Decode (bench.sh, 30 runs) ===
+  Short:   8.13ms / 173x RTFx
+  Medium: 23.81ms / 222x RTFx
+  Long:   60.79ms / 289x RTFx
+```
+
+Compared to Round 8 (dual-tile): 1.2x faster on short, 1.1x on medium, 1.17x on long. The biggest win is on short text where launch overhead was a larger fraction of total time.
+
+---
+
+## 2026-03-17: LSTM Fusion — Four Approaches, Zero Improvement
+
+### Motivation
+
+nsys profiling (node-level, long text) showed LSTM consuming 25% of total GPU kernel time:
+
+```
+LSTM SGEMV (cuBLAS):    9.49ms  (4,647 calls, 2.04μs avg)
+lstm_gates_kernel:      6.10ms  (4,636 calls, 1.32μs avg)
+Total LSTM:            15.59ms  (9,283 kernel instances)
+```
+
+The model has 5 BiLSTMs (H=256): 1 in the text encoder, 3 in the duration encoder, 1 for duration prediction, and 1 shared LSTM for F0/N prediction. Each BiLSTM runs 2 directions × T timesteps × 2 kernels (SGEMV + gates) = 4T kernel launches. With T≈310 for long text, that's ~6,200 kernel instances — the overwhelming majority of graph nodes.
+
+The current implementation: cuBLAS `cublasSgemv` for the [1024, 256] hidden-to-gate GEMV, plus a separate `lstm_gates_f32` kernel for sigmoid/tanh nonlinearities. Both are captured inside CUDA graphs (encode + decode), so CPU-side launch overhead is zero. The question: can we do better than ~9,000 graph nodes of tiny kernels?
+
+### Approach 1: Single-Block Fused (H=256 threads) — Already Failed
+
+This was tried in Phase 3.9 and produced catastrophic 37.7x RTFx. One CUDA block with H=256 threads, each thread computing 4 gate dot products of length 256 sequentially. Only 1 SM active (out of ~60), uncoalesced Whh reads (stride H=256 between threads reading different rows), only 8 warps for latency hiding. cuBLAS SGEMV distributes the same work across the full GPU.
+
+### Approach 2: Single-Block Fused (4H=1024 threads, transposed Whh)
+
+**Idea:** Fix the old kernel's problems — use 4H=1024 threads (one per gate output), transpose Whh from [4H, H] to [H, 4H] at load time for coalesced access. All 1024 outputs computed in parallel, then threads 0-255 apply gates and write h.
+
+**Implementation:** Added `whh_fwd_T`/`whh_rev_T` fields to `BiLSTMWeights`, transposed at load time with `transpose_f32`. New kernel uses shared memory for `s_h[H]` (hidden state broadcast) and `s_gemv[4H]` (GEMV output). Inner loop reads `Whh_T[k * G + tid]` — adjacent threads read adjacent memory (coalesced).
+
+**Result:**
+
+```
+=== Single-Block 1024 Threads (bench.sh, 10 runs) ===
+  short:  10.73ms TTS   132x RTFx  (baseline: 8.13ms, 173x)
+  medium: 36.58ms TTS   148x RTFx  (baseline: 23.81ms, 222x)
+  long:  101.56ms TTS   178x RTFx  (baseline: 60.79ms, 289x)
+```
+
+**Why it failed:** Still only 1 SM. The Whh GEMV reads 1MB per timestep. A single SM gets ~16 GB/s of the ~960 GB/s total memory bandwidth — 60x less than cuBLAS which distributes across ~30 SMs. The 4x improvement over Approach 1 (from 37.7x to 178x) came from coalesced access + 32 warps for latency hiding, but single-SM bandwidth is the hard limit.
+
+### Approach 3: Multi-SM Cooperative (naive, 2 grid.sync()/step)
+
+**Idea:** Use `cudaLaunchCooperativeKernel` with `cooperative_groups::grid::sync()` for inter-block synchronization. Multiple SMs compute the GEMV cooperatively, then sync, then apply gates, then sync, then next timestep.
+
+First verified cooperative launches work inside CUDA graph capture (they do, CUDA 12+).
+
+**Implementation:** `gridDim.x = max_cooperative_blocks`, each thread handles `ceil(G / total_threads)` GEMV outputs. After GEMV: `grid.sync()`. Then each thread handles `ceil(H / total_threads)` gate computations. After gates: `grid.sync()`. Required `-rdc=true` + device link step in Makefile.
+
+**Result:**
+
+```
+=== Cooperative Naive (bench.sh, 10 runs) ===
+  short:  14.68ms TTS   102x RTFx
+  medium: 57.73ms TTS    96x RTFx
+  long:  169.11ms TTS   108x RTFx
+```
+
+**Why it failed:** Two problems:
+1. **Thread utilization:** With ~60 SMs × 256 threads = 15,360 total threads but only G=1024 GEMV outputs, 93% of threads were idle during the GEMV phase.
+2. **Sync overhead:** 2 `grid.sync()` calls per timestep × 310 timesteps × 2 directions × 5 BiLSTMs ≈ 6,200 syncs. At ~5-10μs per grid sync, that's 31-62ms of pure synchronization overhead.
+
+### Approach 4: Multi-SM Cooperative (warp-per-unit, 1 grid.sync()/step)
+
+**Idea:** Fix both problems from Approach 3. Assign 1 warp (32 threads) per hidden unit. Each warp cooperatively computes all 4 gate dot products for its hidden unit using warp shuffle reduction, then immediately applies gate nonlinearities — no inter-block dependency within a timestep. Only 1 `grid.sync()` needed (to ensure all h values are written before the next timestep).
+
+**Key insight for coalescing:** With 32 lanes in a warp all working on the same Whh row, lane `l` reads `Whh[row * H + l]` — adjacent lanes read adjacent elements. Perfectly coalesced WITHOUT transposing Whh.
+
+**Implementation:** 32 blocks × 8 warps/block = 256 warps = 256 hidden units (one per warp). Each warp: 32 lanes handle 8 elements each of the 256-element dot product, warp shuffle reduction (`__shfl_down_sync`), lane 0 applies sigmoid/tanh and writes c, h.
+
+**Result:**
+
+```
+=== Cooperative Warp-Per-Unit (bench.sh, 30 runs) ===
+  short:   8.15ms TTS   173x RTFx  (baseline: 8.13ms, 173x)
+  medium: 23.66ms TTS   224x RTFx  (baseline: 23.81ms, 222x)
+  long:   60.25ms TTS   291x RTFx  (baseline: 60.79ms, 289x)
+```
+
+STT: short PASS, medium PASS, long PASS.
+
+**This matched the baseline exactly** — within measurement noise. The GEMV computation matched cuBLAS speed, but the grid.sync() overhead (~1-2μs per sync × ~3,100 syncs = ~3-6ms) cancelled out the savings from eliminating ~9,000 graph nodes.
+
+### Why LSTM Fusion Doesn't Help
+
+The fundamental reason: **CUDA graph node dispatch overhead on RTX 5070 Ti is negligible** (~0.3μs per node). Total kernel time for all ~10,000 graph nodes was 61.85ms; wall time was ~65ms. The overhead of dispatching 9,283 LSTM graph nodes is only ~3ms — not enough headroom for any fusion approach to pay for itself.
+
+| Approach | Blocks | Threads | Syncs/step | Short | Long | Problem |
+|----------|--------|---------|------------|-------|------|---------|
+| Baseline (cuBLAS) | many | many | — | 8.13ms | 60.79ms | — |
+| 1-block H threads | 1 | 256 | 0 | — | — | 1 SM, uncoalesced |
+| 1-block 4H threads | 1 | 1024 | 0 | 10.73ms | 101.56ms | 1 SM bandwidth |
+| Coop naive | ~60 | 256 | 2 | 14.68ms | 169.11ms | 93% idle + 2 syncs |
+| Coop warp/unit | 32 | 256 | 1 | 8.15ms | 60.25ms | Grid.sync ≈ savings |
+
+### Lessons Learned
+
+1. **Profile the overhead, not just the kernels.** I initially estimated ~3μs per graph node dispatch based on kernel time vs wall time analysis. The actual overhead was ~0.3μs — a 10x overestimate that motivated three approaches before proper A/B testing revealed the truth.
+
+2. **The GEMV bandwidth wall is real.** For a [1024, 256] GEMV reading 1MB of Whh per timestep, single-SM bandwidth (16 GB/s) versus multi-SM (960 GB/s) is a 60x disadvantage. No amount of kernel fusion can overcome having 1/60th the memory bus.
+
+3. **Grid.sync() is not free.** Even at ~1-2μs per sync, thousands of syncs per inference add up. The cost of inter-SM synchronization must be weighed against the savings from reduced graph nodes.
+
+4. **CUDA graphs on modern GPUs have very low per-node overhead.** The RTX 5070 Ti (SM120/Blackwell) dispatches graph nodes at ~0.3μs each. This makes "reduce graph node count" a much weaker optimization lever than expected.
+
+5. **Always A/B test against the actual baseline.** Comparing against stale benchmark numbers can produce phantom improvements. The proper comparison revealed our Approach 4 was a wash, not the "1.5x speedup" initially measured against outdated numbers.
+
+---
+
+## 2026-03-18: Dropping cuBLAS — Cutlass + Custom Kernels Only
+
+### Motivation
+
+With Cutlass implicit GEMM for convolutions and Cutlass batched GEMM for G2P attention already in place, cuBLAS was only used for:
+- `cublasSgemm` for TTS linear layers (ALBERT attention, text encoder projections, predictor)
+- `cublasSgemv` for small matrix-vector products (style FC layers, [D, 128] × [128])
+- `cublasSgemmBatched` for G2P attention (already migrated in the GEMM work)
+
+The goal: eliminate the last `libcublas`/`libcublasLt` dependency entirely.
+
+### Cutlass GEMM: The Full Tiered Architecture
+
+Created `cutlass_gemm.cu` with three layout combinations (TN, NT, NN) × four fallback tiers:
+
+1. **TF32 Large** (128×128×16): high per-CTA throughput for large problems
+2. **TF32 Small** (64×64×16): 4× more CTAs for small problems where Large under-fills the GPU
+3. **TF32 Align1**: handles M not divisible by 4 (SIMT epilogue with align-1 stores, but TF32 MMA compute)
+4. **SIMT**: no alignment requirements at all, for K not divisible by 4
+
+Plus batched variants (TN, NN) for G2P multi-head attention, and `cutlass_gemm_tn_bias` with stride-0 C source for fused bias broadcast.
+
+The tier selection is automatic — each `cutlass_gemm_*` function tries tiers in order and falls back on `can_implement()` failure. All use the same operator caching pattern from Round 6.
+
+### Custom GEMV Kernel
+
+For N=1 cases (style FC: [D, 128] × [128] → [D]), cuBLAS `Sgemv` was replaced with a custom `gemv_tn_f32` kernel. One warp per output row, 8 rows per block (256 threads total), warp-shuffle reduction over K. This handles the ~100 small matrix-vector products in the predictor.
+
+### The Alignment Bug
+
+Initial Cutlass GEMM integration produced NaN outputs and verification failures. Root cause: G2P workspace pointers were only 4-byte aligned, but Cutlass TensorOp requires 256-byte alignment for vectorized 128-bit loads. Fixed by adding `align256()` to all workspace pointer assignments in `g2p.h`.
+
+### Bias Fusion
+
+Added `cutlass_gemm_tn_bias()` using stride-0 C source layout — the same technique as `cutlass_conv.cu` residual fusion. The bias vector [M] is broadcast across all N columns via `LayoutCM(0)` (zero stride = same column repeated). This eliminates ~100 separate `channel_bias_add_f32` kernel launches per TTS inference.
+
+### G2P Graph Capture Fix
+
+Cutlass `initialize()` allocates internal state and can't run inside CUDA graph capture. Solution: first call for each input length T runs kernels directly (populates operator caches), graph capture deferred to the second call when all operators hit cache. Third+ calls replay the graph.
+
+### Results
+
+Performance matches the cuBLAS baseline within measurement noise — the goal was dependency elimination, not speedup:
+
+| Metric | cuBLAS | Cutlass |
+|--------|--------|---------|
+| Short (1.6s audio) | 8.13ms / 173x | ~8ms / ~175x |
+| Long (18.8s audio) | 60.79ms / 289x | ~60ms / ~290x |
+| Binary dependencies | libcublas + libcublasLt | none (Cutlass is header-only) |
+
+### What We Removed
+
+- `libcublas`, `libcublasLt` from linker flags
+- All `cublas*.h` includes
+- `cublasHandle_t` creation/destruction in `main.cu`
+- 2 shared libraries (~120 MB on disk) no longer loaded at runtime
+
+### Files Changed
+
+| File | Changes |
+|---|---|
+| `src/cutlass_gemm.cu` | New — TN/NT/NN × 4 tiers + batched + bias fusion |
+| `src/kernels.cu` | Added `gemv_tn_f32` kernel |
+| `src/kernels.h` | Added GEMV declaration |
+| `src/tts.cpp` | Replaced cuBLAS wrappers with Cutlass GEMM calls |
+| `src/g2p.h` | 256-byte workspace alignment, deferred graph capture |
+| `Makefile` | Removed `-lcublas -lcublasLt` |
+
+---
+
+## 2026-03-18: Code Cleanup
+
+Removed ~400 lines of dead code accumulated from optimization iterations:
+
+**Dead kernels** (9 removed from `kernels.cu` + `kernels.h`):
+- `fused_lstm_f32` — failed LSTM fusion attempt (Round LSTM)
+- `sigmoid_f32` — replaced by fused `sigmoid_sum_f32`
+- `cast_i64_to_i32` — token IDs are int32 now
+- `instance_norm_1d_f32` — replaced by `instance_norm_style_affine_f32`
+- `style_affine_1d_f32` — fused into instance_norm
+- `snake_f32` — fused into instance_norm via snake_alpha (Round 9)
+- `conv_transpose1d_f32` — replaced by `gemm_conv_transpose1d`
+- `upsample_nearest_f32` — replaced by `upsample_nearest_1d_2x_f32`
+- `tanh_f32` — no callers
+
+**Dead Cutlass types** (2 removed from `cutlass_gemm.cu`):
+- `GemmBatchedTN_SIMT`, `GemmBatchedNN_SIMT` — batched SIMT fallback never instantiated (fallback uses loop of single GEMMs instead)
+- Saves ~30s compile time (2 fewer Cutlass template instantiations)
+
+**Stale comments**: Updated cuBLAS references across `tts.cpp`, `weights.h`, `kernels.h`, `cutlass_conv.cu`, `cutlass_gemm.cu`, `main.cu`.
+
+---
+
+## Round 11: FP16 Mixed-Precision Weights
+
+**Goal**: Use FP16 Tensor Cores (175.8 TFLOPS on RTX 5070 Ti) instead of TF32 (43.9 TFLOPS). Convert weight matrices to half precision; keep activations/accumulator/output in FP32.
+
+### Approach
+
+1. After weight norms, cast 191 weight matrices to FP16 (~95 MB extra GPU memory)
+2. Before each GEMM/Conv, cast FP32 activations to FP16 into a 16 MB staging buffer
+3. Use FP16 MMA instruction `GemmShape<16,8,16>` (vs TF32 `<16,8,8>`)
+4. Accumulator and output stay FP32 — no quality loss in non-linear ops
+5. GEMV (LSTM Whh) reads FP16 weights with FP32 x directly — memory-bound, no cast needed
+
+**Graceful fallback**: Convolutions with unaligned channels (C_in % 8 ≠ 0: 1090, 514, 22) automatically fall back to TF32 path.
+
+### New files
+
+| File | Purpose |
+|------|---------|
+| `src/cutlass_gemm_f16.cu` | FP16 GEMM: TN, NN, TN+bias, tiered dispatch (Large/Small/Align1/SIMT) |
+| `src/cutlass_conv_f16.cu` | FP16 implicit GEMM Conv1d + fused reshape+cast kernel for NHWC weights |
+| `scripts/compare_wav.py` | Mel spectrogram SNR comparison (80-bin log mel, n_fft=1024, hop=256) |
+
+### nsys Profiling (medium text, 5.7s audio)
+
+| Kernel category | FP32 time | FP16 time | Change |
+|----------------|-----------|-----------|--------|
+| Cutlass Conv Large (48 calls) | 8.7ms | 4.5ms | **−48%** |
+| Cutlass Conv SIMT→FP16 Small (88 calls) | 3.4ms | 1.8ms | **−47%** |
+| Cutlass GEMM (FP16-eligible) | 4.3ms | 2.6ms | **−40%** |
+| cast_f32_to_f16 overhead | — | +1.7ms | 519 calls × 3.2μs |
+| GEMV FP16 (LSTM Whh, 1826 calls) | 2.5ms | 2.3ms | −8% |
+| **Net kernel savings** | | | **5.8ms** |
+
+**Still on TF32** (unaligned channels): 3.5ms of Conv/GEMM can't use FP16 due to C_in=1090/514/22.
+
+### Verification
+
+- **Paraketto STT**: 3/3 texts PASS (short/medium/long) — identical transcriptions
+- **Mel spectrogram SNR**: 29.2 dB (positive control noise floor: 35 dB, negative control: −1.7 dB)
+
+### bench.sh Results
+
+| Text | FP32 TTS | FP16 TTS | Speedup | FP32 RTFx | FP16 RTFx |
+|------|----------|----------|---------|-----------|-----------|
+| Short (1.6s) | 9.48ms | 8.07ms | 15% | 150x | 159x |
+| Medium (5.7s) | 22.73ms | 18.25ms | 20% | 229x | 271x |
+| Long (18.8s) | 58.08ms | 52.77ms | 9% | 296x | 324x |
+
+### Waste identified (next steps)
+
+1. **cast_f32_to_f16: 1.7ms** (519 calls) — 30% of savings eaten by activation casting. Fix: keep activations in FP16 throughout pipeline, or fuse cast into preceding kernels.
+2. **TF32 fallback for unaligned channels: 3.5ms** — decoder bottleneck at 1090/514 channels. Fix: pad channels to alignment boundary.
+3. **GEMV FP16: marginal** — 1826 LSTM Whh calls at 1.3μs each are launch-overhead-bound. FP16 only saves 8%. Not worth optimizing further.
+
+---
+
+## Round 12: Pad Unaligned Decoder Channels
+
+**Problem**: 14 decoder conv1 calls with C_in=514 or C_in=1090 can't use FP16 TensorOp (requires C_in % 8 == 0). They fall back to TF32 Cutlass, costing 3.9ms on medium text.
+
+**Fix**: Pad weights at startup and activations at cast time:
+- New `pad_blocks_f32` kernel: zero-pads conv weight C_in from 514→520, 1090→1096 (one-time at init)
+- New `cast_f32_to_f16_pad` kernel: casts `[T, C_old]` FP32 → `[T, C_new]` FP16 with zero-padded channels
+- `gemm_conv1d` gains a padded FP16 path: when C_in % 8 ≠ 0 and a padded NHWC FP16 weight exists, uses the pad+cast path
+- `s_w_nhwc_f16_padded` map: stores padded NHWC FP16 weights alongside C_in_pad
+
+Only the conv1 weights in each block need padding (conv2 inputs are already aligned, shortcut is K=1 GEMM).
+
+### bench.sh Results
+
+| Text | Before | After | Delta |
+|------|--------|-------|-------|
+| Short (1.6s) | 8.07ms | 6.45ms | −1.62ms (−20%) |
+| Medium (5.7s) | 18.25ms | 16.57ms | −1.68ms (−9%) |
+| Long (18.8s) | 52.77ms | 51.43ms | −1.34ms (−3%) |
+
+STT 3/3 PASS.
+
+---
+
+## Round 13: FP16 Binary (Two Binaries, Two Weight Formats)
+
+**Goal**: Eliminate all runtime weight preparation. Pre-bake weight norm, NHWC reshape, channel padding, FP16 casting, and LSTM bias precomputation into a v2 weight file. The FP16 binary loads v2 weights and calls Cutlass FP16 directly — no maps, no fallback, zero startup compute.
+
+### Architecture
+
+Two binaries, two weight files:
+```
+make rokoko       # FP32 binary, loads v1 weights (runtime conversion)
+make rokoko.fp16  # FP16 binary, loads v2 weights (pre-baked FP16)
+```
+
+Both link the same `main.o`. The linker resolves `rokoko_infer()` and `precompute_weight_norms()` from whichever `.cpp` is linked.
+
+### File layout
+
+| File | Purpose |
+|------|---------|
+| `src/rokoko.cpp` | FP32 inference: GEMM wrappers with map-based FP16 dispatch + fallback chain |
+| `src/rokoko_f16.cpp` | FP16 inference: direct Cutlass FP16 calls, no maps, no fallback |
+| `src/rokoko_common.h` | Shared: WAV I/O, `compute_decode_bytes`, buffer structs |
+| `src/weights.h` | `__half*` companion fields alongside `float*` for all weight matrices |
+| `src/weights.cpp` | `assign_v2_fp16_pointers()`: suffix-matching over v2 tensor names |
+| `scripts/convert_v2.py` | Standalone Python converter: v1 KOKO → v2 KOKO (numpy, no GPU) |
+
+### KOKO v2 Weight Format
+
+Same structure as v1 but version=2 and mixed dtypes per tensor:
+```
+[4B "KOKO"] [4B version=2] [8B header_len]
+[text header: "name offset size_bytes dtype shape..."]
+[padding to 4096]
+[data blob: 256-byte aligned tensors]
+```
+
+Tensor suffixes: `.f16` (FP16 GEMM), `.nhwc_f16` (NHWC FP16 conv), `.nhwc_f16_pad{N}` (padded NHWC FP16), `.bias_combined_fwd/rev` (precomputed LSTM bias).
+
+The Python converter applies all transforms on CPU: weight norm, NHWC reshape, channel padding (514→520, 1090→1096, 22→24), FP16 cast, LSTM bias = bih + bhh. 966 tensors total (688 base + 192 FP16 + 74 NHWC + 12 bias), 589 MB on disk.
+
+### Key differences in rokoko_f16.cpp
+
+- **GEMM wrappers take `const __half*`**: always call Cutlass FP16, no `s_fp16_weights` map lookup
+- **`gemm_conv1d` takes `const __half*` NHWC weight**: K=1 → GEMM, K>1 → Cutlass FP16 conv. Optional `C_in_pad` for padded channels
+- **`precompute_weight_norms`**: just `w.assign_v2_fp16_pointers()` + staging buffer alloc. Zero GPU compute
+- **conv_post (C_out=22)**: im2col + FP16 GEMM directly (workspace-based staging, not s_fp16_buf)
+- **bilstm_gpu**: takes `__half*` wih/whh directly from struct, always FP16 GEMV
+
+### bench.sh Results
+
+| Text | FP32 (v1 weights) | FP16 (v2 weights) | Delta |
+|------|-------|-------|-------|
+| Short (1.6s) | 6.44ms | 6.45ms | ~same |
+| Medium (5.7s) | 16.59ms | 16.66ms | ~same |
+| Long (18.8s) | 51.49ms | 48.02ms | **−3.47ms (−6.7%)** |
+
+RTFx: 347x (long, FP16 binary). STT 3/3 PASS on both binaries.
+
+The long text improvement comes from slightly more efficient CUDA graph capture (no fallback dispatch logic baked in). Init time for precompute_weight_norms drops from ~80ms to ~0ms (pointer assignment only), but this is offset by the larger v2 file upload (589 MB vs 327 MB). Net init is similar.
+
+**Next step**: strip redundant FP32 weight matrices from v2 file (keep only biases/norms/embeddings in FP32). This would cut v2 to ~260 MB and make init genuinely faster.
+
+---
+
+## Round 14: FP16 Bundle (One Download per Binary)
+
+**Problem**: The FP32 binary downloads a single self-contained `rokoko.bundle` (364 MB) with G2P + voices + weights. The FP16 binary downloads *two* files: the same `rokoko.bundle` for G2P/voices, plus a separate `weights.koko` (163 MB) for v2 weights. Two downloads, two files to manage, and the FP16 binary carries 327 MB of FP32 weights it never uses.
+
+**Goal**: Each binary downloads exactly one bundle. FP32 gets `rokoko.bundle`, FP16 gets `rokoko.fp16.bundle`. Same UX, no wasted bandwidth.
+
+### Changes
+
+**`scripts/convert_v2.py`** — now produces a full ROKO bundle instead of a standalone `.koko` file:
+
+1. `read_bundle_entries()`: extracts *all* entries from the source bundle (G2P, voices, weights) — not just the weights
+2. Converts weights from v1 to v2 (same as before: weight norm, NHWC, padding, FP16, LSTM bias)
+3. `write_koko_v2_bytes()`: builds the KOKO v2 weight blob in memory (was writing to disk)
+4. `write_roko_bundle()`: packs v2 weights + G2P + voices into a ROKO bundle (16-byte header + 72-byte TOC entries + 256-byte-aligned data)
+
+```
+$ uv run scripts/convert_v2.py -o rokoko.fp16.bundle
+Reading bundle: ~/.cache/rokoko/rokoko.bundle
+  6 entries: g2p, voice/af_bella, voice/af_heart, voice/af_nicole, voice/af_sky, weights
+  585 tensors, 163.4 MB KOKO v2 blob
+  Done: 200.1 MB on disk
+```
+
+The FP16 bundle is 200 MB vs the FP32 bundle's 364 MB — 45% smaller because v2 weights are half precision.
+
+**`src/main.cu`** — unified download logic:
+
+The old code had two download blocks: a hardcoded `rokoko.bundle` download, then a conditional v2 weight download for FP16. Now there's one download block that calls `default_bundle_url()` / `default_bundle_filename()` — each backend provides its own URL and filename. The separate v2 weight download block is gone.
+
+**`src/rokoko.cpp`** / **`src/rokoko_f16.cpp`** — renamed `default_weights_url/filename` → `default_bundle_url/filename`:
+
+| Binary | `default_bundle_filename()` | `default_bundle_url()` |
+|--------|---------------------------|----------------------|
+| `rokoko` (FP32) | `rokoko.bundle` | `…/rokoko.bundle` |
+| `rokoko.fp16` (FP16) | `rokoko.fp16.bundle` | `…/rokoko.fp16.bundle` |
+
+### Bundle format (ROKO)
+
+```
+[4B "ROKO"] [4B version=1] [4B count] [4B padding]
+[count × 72B TOC entries: 56B name + 8B offset + 8B size]
+[padding to 4096]
+[data: 256-byte aligned entries]
+```
+
+Both bundles use the same format. The only difference is the weights entry: v1 KOKO (FP32) vs v2 KOKO (FP16). G2P and voice entries are identical byte-for-byte copies.
+
+### bench.sh Results
+
+| Text | RTFx (median) | RTFx (p95) |
+|------|--------------|------------|
+| Short (1.6s) | 223x | 178x |
+| Medium (5.7s) | 301x | 273x |
+| Long (18.8s) | 354x | 348x |
+
+STT 3/3 PASS. Performance unchanged from Round 13 — this was a packaging change, not a compute change.
