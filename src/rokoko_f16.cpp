@@ -1,6 +1,6 @@
-// tts.cpp — TTS CUDA inference (FP16 weights, FP32 activations/output)
+// rokoko_f16.cpp — FP16 TTS CUDA inference (pre-baked FP16 weights from v2 file)
 //
-// Provides rokoko_infer(), write_wav(), precompute_weight_norms().
+// Provides rokoko_infer(), precompute_weight_norms().
 
 #include <chrono>
 #include <cmath>
@@ -14,27 +14,15 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include "weights.h"
+#include "rokoko_common.h"
 #include "kernels.h"
 
 // ---------------------------------------------------------------------------
-// Cutlass GEMM — FP32/TF32 (extern, defined in cutlass_gemm.cu)
+// Cutlass GEMM — FP32 (activation-only NT, stays FP32)
 // ---------------------------------------------------------------------------
-extern "C" int cutlass_gemm_tn(int M, int N, int K,
-    const float* A, int lda, const float* B, int ldb,
-    float* C, int ldc, float alpha, float beta,
-    float* workspace, size_t workspace_bytes, cudaStream_t stream);
 extern "C" int cutlass_gemm_nt(int M, int N, int K,
     const float* A, int lda, const float* B, int ldb,
     float* C, int ldc, float alpha, float beta,
-    float* workspace, size_t workspace_bytes, cudaStream_t stream);
-extern "C" int cutlass_gemm_nn(int M, int N, int K,
-    const float* A, int lda, const float* B, int ldb,
-    float* C, int ldc, float alpha, float beta,
-    float* workspace, size_t workspace_bytes, cudaStream_t stream);
-extern "C" int cutlass_gemm_tn_bias(int M, int N, int K,
-    const float* A, int lda, const float* B, int ldb,
-    float* D, int ldd, const float* bias,
     float* workspace, size_t workspace_bytes, cudaStream_t stream);
 extern "C" int cutlass_gemm_batched_tn(int M, int N, int K,
     const float* A, int lda, long long strideA,
@@ -69,48 +57,28 @@ extern "C" int cutlass_gemm_nn_f16(int M, int N, int K,
 static float* s_workspace = nullptr;
 static size_t s_workspace_bytes = 0;
 
-// ---------------------------------------------------------------------------
-// FP16 weight map: original float* → half* (populated in precompute_weight_norms)
-// ---------------------------------------------------------------------------
-static std::unordered_map<const float*, const __half*> s_fp16_weights;
-
 // FP16 activation staging buffer (pre-allocated, reused across all GEMM/Conv calls)
 static __half* s_fp16_buf = nullptr;
 static size_t s_fp16_buf_size = 0;  // in bytes
 
 // ---------------------------------------------------------------------------
-// GEMM wrappers (Cutlass) — auto-dispatch FP16 when weight has FP16 version
+// GEMM wrappers — FP16 direct (no map lookup, no fallback)
 // ---------------------------------------------------------------------------
 
-// C = alpha * A^T * B + beta * C
+// C = alpha * A^T * B + beta * C  (A is FP16 weight, B is FP32 activation)
 static void sgemm_tn(int m, int n, int k,
-                      const float* A, int lda,
+                      const __half* A, int lda,
                       const float* B, int ldb,
                       float* C, int ldc,
                       cudaStream_t stream,
                       float alpha = 1.0f, float beta = 0.0f) {
-    auto fp16_it = s_fp16_weights.find(A);
-    if (fp16_it != s_fp16_weights.end()) {
-        const __half* A_f16 = fp16_it->second;
-        if (n == 1) {
-            gemv_tn_f16(A_f16, lda, B, C, m, k, alpha, beta, stream);
-            return;
-        }
-        size_t need = (size_t)n * k * sizeof(__half);
-        if (need <= s_fp16_buf_size) {
-            cast_f32_to_f16(B, s_fp16_buf, n * k, stream);
-            cutlass_gemm_tn_f16(m, n, k, A_f16, lda, s_fp16_buf, ldb,
-                                 C, ldc, alpha, beta,
-                                 s_workspace, s_workspace_bytes, stream);
-            return;
-        }
-    }
     if (n == 1) {
-        gemv_tn_f32(A, lda, B, C, m, k, alpha, beta, stream);
+        gemv_tn_f16(A, lda, B, C, m, k, alpha, beta, stream);
         return;
     }
-    cutlass_gemm_tn(m, n, k, A, lda, B, ldb, C, ldc,
-                     alpha, beta, s_workspace, s_workspace_bytes, stream);
+    cast_f32_to_f16(B, s_fp16_buf, n * k, stream);
+    cutlass_gemm_tn_f16(m, n, k, A, lda, s_fp16_buf, ldb,
+                         C, ldc, alpha, beta, s_workspace, s_workspace_bytes, stream);
 }
 
 // C = alpha * A * B^T + beta * C  (activation-only, stays FP32)
@@ -124,61 +92,29 @@ static void sgemm_nt(int m, int n, int k,
                      alpha, beta, s_workspace, s_workspace_bytes, stream);
 }
 
-// C = alpha * A * B + beta * C
+// C = alpha * A * B + beta * C  (A is FP16 weight, B is FP32 activation)
 static void sgemm_nn(int m, int n, int k,
-                      const float* A, int lda,
+                      const __half* A, int lda,
                       const float* B, int ldb,
                       float* C, int ldc,
                       cudaStream_t stream,
                       float alpha = 1.0f, float beta = 0.0f) {
-    auto fp16_it = s_fp16_weights.find(A);
-    if (fp16_it != s_fp16_weights.end()) {
-        size_t need = (size_t)n * k * sizeof(__half);
-        if (need <= s_fp16_buf_size) {
-            cast_f32_to_f16(B, s_fp16_buf, n * k, stream);
-            cutlass_gemm_nn_f16(m, n, k, fp16_it->second, lda, s_fp16_buf, ldb,
-                                 C, ldc, alpha, beta,
-                                 s_workspace, s_workspace_bytes, stream);
-            return;
-        }
-    }
-    cutlass_gemm_nn(m, n, k, A, lda, B, ldb, C, ldc,
-                     alpha, beta, s_workspace, s_workspace_bytes, stream);
+    cast_f32_to_f16(B, s_fp16_buf, n * k, stream);
+    cutlass_gemm_nn_f16(m, n, k, A, lda, s_fp16_buf, ldb,
+                         C, ldc, alpha, beta, s_workspace, s_workspace_bytes, stream);
 }
 
-// C = A^T * B + bias  (fused into Cutlass epilogue via stride-0 C source)
+// C = A^T * B + bias  (A is FP16 weight)
 static void sgemm_bias(int m, int n, int k,
-                        const float* A, int lda,
+                        const __half* A, int lda,
                         const float* B, int ldb,
                         float* C, int ldc,
                         const float* bias,
                         cudaStream_t stream) {
-    auto fp16_it = s_fp16_weights.find(A);
-    if (fp16_it != s_fp16_weights.end()) {
-        size_t need = (size_t)n * k * sizeof(__half);
-        if (need <= s_fp16_buf_size) {
-            cast_f32_to_f16(B, s_fp16_buf, n * k, stream);
-            cutlass_gemm_tn_bias_f16(m, n, k, fp16_it->second, lda, s_fp16_buf, ldb,
-                                      C, ldc, bias,
-                                      s_workspace, s_workspace_bytes, stream);
-            return;
-        }
-    }
-    cutlass_gemm_tn_bias(m, n, k, A, lda, B, ldb, C, ldc, bias,
-                          s_workspace, s_workspace_bytes, stream);
+    cast_f32_to_f16(B, s_fp16_buf, n * k, stream);
+    cutlass_gemm_tn_bias_f16(m, n, k, A, lda, s_fp16_buf, ldb,
+                              C, ldc, bias, s_workspace, s_workspace_bytes, stream);
 }
-
-// ---------------------------------------------------------------------------
-// Cutlass implicit GEMM Conv1d — FP32/TF32 (extern, defined in cutlass_conv.cu)
-// ---------------------------------------------------------------------------
-extern "C" int cutlass_conv1d_fprop(const float* x, const float* w, const float* bias,
-                                     float* y, const float* residual,
-                                     float* workspace, size_t workspace_bytes,
-                                     int C_in, int C_out, int T_in, int K,
-                                     int stride, int padding, int dilation,
-                                     cudaStream_t stream);
-extern "C" void cutlass_reshape_weights(const float* src, float* dst,
-                                         int C_out, int C_in, int K, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Cutlass implicit GEMM Conv1d — FP16 (extern, defined in cutlass_conv_f16.cu)
@@ -190,120 +126,51 @@ extern "C" int cutlass_conv1d_fprop_f16(const __half* x, const __half* w,
                                           int C_in, int C_out, int T_in, int K,
                                           int stride, int padding, int dilation,
                                           cudaStream_t stream);
-extern "C" void cutlass_reshape_weights_f16(const float* src, __half* dst,
-                                              int C_out, int C_in, int K,
-                                              cudaStream_t stream);
-
-// NHWC weight maps: wv pointer → NHWC pointer (populated at startup)
-static std::unordered_map<const float*, float*> s_w_nhwc;       // FP32 NHWC
-static std::unordered_map<const float*, __half*> s_w_nhwc_f16;  // FP16 NHWC
-
-// Padded NHWC FP16 weights: for conv weights where C_in % 8 != 0,
-// we pad C_in to the next multiple of 8 and create NHWC FP16.
-// Maps original wv pointer → (nhwc_f16_ptr, padded_C_in).
-static std::unordered_map<const float*, std::pair<__half*, int>> s_w_nhwc_f16_padded;
 
 // ---------------------------------------------------------------------------
-// Conv1d forward: Cutlass implicit GEMM (w_nhwc), falls back to im2col + GEMM.
+// Conv1d forward: FP16 Cutlass (NHWC weights), K=1 falls back to GEMM.
 // ---------------------------------------------------------------------------
 
 // gemm_conv1d: Conv1d forward.
 //   When residual != nullptr: y = conv(x,w) + residual, then bias_add(y, bias).
 //   When residual == nullptr: y = conv(x,w) + bias (fused in Cutlass epilogue).
-static void gemm_conv1d(const float* x, const float* w, const float* bias,
+static void gemm_conv1d(const float* x, const __half* w, const float* bias,
                          float* y, float* workspace, size_t workspace_bytes,
                          int C_in, int C_out, int T_in, int K,
                          int stride, int padding, int dilation,
                          cudaStream_t stream,
-                         const float* residual = nullptr) {
+                         const float* residual = nullptr,
+                         int C_in_pad = 0) {
     int T_out = (T_in + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
-    int CK = C_in * K;
 
-    // Try Cutlass FP16 implicit GEMM (needs NHWC FP16 weights, aligned channels)
-    if (K > 1 && (C_in % 8 == 0) && (C_out % 4 == 0)) {
-        auto it_f16 = s_w_nhwc_f16.find(w);
-        if (it_f16 != s_w_nhwc_f16.end()) {
-            size_t act_need = (size_t)T_in * C_in * sizeof(__half);
-            if (act_need <= s_fp16_buf_size) {
-                cast_f32_to_f16(x, s_fp16_buf, T_in * C_in, stream);
-                const float* cutlass_bias = residual ? nullptr : bias;
-                int rc = cutlass_conv1d_fprop_f16(s_fp16_buf, it_f16->second,
-                                                    cutlass_bias, y, residual,
-                                                    workspace, workspace_bytes,
-                                                    C_in, C_out, T_in, K,
-                                                    stride, padding, dilation, stream);
-                if (rc == 0) {
-                    if (residual && bias)
-                        channel_bias_add_f32(y, bias, C_out, T_out, stream);
-                    return;
-                }
-            }
-        }
+    if (K == 1 && stride == 1 && padding == 0 && dilation == 1) {
+        // K=1: just a GEMM (w is straight FP16, not NHWC)
+        sgemm_tn(C_out, T_out, C_in, w, C_in, x, C_in, y, C_out, stream);
+        if (residual) add_f32(y, residual, y, C_out * T_out, stream);
+        if (bias) channel_bias_add_f32(y, bias, C_out, T_out, stream);
+        return;
     }
 
-    // Try Cutlass FP16 with padded C_in (for unaligned channels like 514, 1090)
-    if (K > 1 && (C_in % 8 != 0) && (C_out % 4 == 0)) {
-        auto it_pad = s_w_nhwc_f16_padded.find(w);
-        if (it_pad != s_w_nhwc_f16_padded.end()) {
-            auto [w_f16, C_in_pad] = it_pad->second;
-            size_t act_need = (size_t)T_in * C_in_pad * sizeof(__half);
-            if (act_need <= s_fp16_buf_size) {
-                cast_f32_to_f16_pad(x, s_fp16_buf, T_in, C_in, C_in_pad, stream);
-                const float* cutlass_bias = residual ? nullptr : bias;
-                int rc = cutlass_conv1d_fprop_f16(s_fp16_buf, w_f16,
-                                                    cutlass_bias, y, residual,
-                                                    workspace, workspace_bytes,
-                                                    C_in_pad, C_out, T_in, K,
-                                                    stride, padding, dilation, stream);
-                if (rc == 0) {
-                    if (residual && bias)
-                        channel_bias_add_f32(y, bias, C_out, T_out, stream);
-                    return;
-                }
-            }
-        }
+    // K>1: Cutlass FP16 implicit GEMM conv (w is NHWC FP16)
+    int actual_cin = C_in_pad ? C_in_pad : C_in;
+    if (C_in_pad) {
+        cast_f32_to_f16_pad(x, s_fp16_buf, T_in, C_in, C_in_pad, stream);
+    } else {
+        cast_f32_to_f16(x, s_fp16_buf, T_in * C_in, stream);
     }
-
-    // Try Cutlass TF32 implicit GEMM (needs NHWC weights, K>1)
-    if (K > 1) {
-        auto it = s_w_nhwc.find(w);
-        if (it != s_w_nhwc.end()) {
-            const float* cutlass_bias = residual ? nullptr : bias;
-            int rc = cutlass_conv1d_fprop(x, it->second, cutlass_bias, y,
-                                           residual, workspace, workspace_bytes,
-                                           C_in, C_out, T_in, K,
-                                           stride, padding, dilation, stream);
-            if (rc == 0) {
-                if (residual && bias)
-                    channel_bias_add_f32(y, bias, C_out, T_out, stream);
-                return;
-            }
-        }
-    }
-
-    // Cutlass GEMM fallback: im2col + SGEMM
-    const float* col = x;
-    if (K > 1 || stride > 1 || padding > 0 || dilation > 1) {
-        float* col_buf = workspace;
-        im2col_1d_f32(x, col_buf, C_in, T_in, K, stride, padding, dilation,
-                       T_out, stream);
-        col = col_buf;
-    }
-
-    sgemm_tn(C_out, T_out, CK, w, CK, col, CK, y, C_out, stream);
-
-    if (residual) {
-        add_f32(y, residual, y, C_out * T_out, stream);
-    }
-    if (bias) {
+    const float* cutlass_bias = residual ? nullptr : bias;
+    cutlass_conv1d_fprop_f16(s_fp16_buf, w, cutlass_bias, y, residual,
+                              workspace, workspace_bytes,
+                              actual_cin, C_out, T_in, K,
+                              stride, padding, dilation, stream);
+    if (residual && bias)
         channel_bias_add_f32(y, bias, C_out, T_out, stream);
-    }
 }
 
 // im2col + GEMM ConvTranspose1d: GEMM + col2im
 //   x[T_in, C_in] * w[C_in, C_out, K] → y[T_out, C_out]
 //   T_out = (T_in - 1) * stride - 2*padding + K + output_padding
-static void gemm_conv_transpose1d(const float* x, const float* w, const float* bias,
+static void gemm_conv_transpose1d(const float* x, const __half* w, const float* bias,
                                     float* y, float* workspace, size_t workspace_bytes,
                                     int C_in, int C_out, int T_in, int K,
                                     int stride, int padding, int output_padding,
@@ -330,30 +197,6 @@ static void gemm_conv_transpose1d(const float* x, const float* w, const float* b
 // ALBERT encoder forward pass
 // ---------------------------------------------------------------------------
 
-struct AlbertBuffers {
-    float* emb = nullptr;       // [T, 128] embeddings sum
-    float* hidden = nullptr;    // [T, 768] main activation
-    float* qkv = nullptr;       // [T, 3*768] fused QKV
-    float* attn_scores = nullptr; // [N_HEADS, T, T]
-    float* attn_out = nullptr;  // [T, 768] attention output
-    float* ff_mid = nullptr;    // [T, 2048] FFN intermediate
-    float* ff_out = nullptr;    // [T, 768] FFN output
-    float* temp = nullptr;      // [T, 768] temporary buffer
-    int* token_ids = nullptr;   // [T] int32 token IDs
-
-    void alloc(int T, GpuArena& arena) {
-        emb        = arena.alloc<float>(T * 128);
-        hidden     = arena.alloc<float>(T * 768);
-        qkv        = arena.alloc<float>(T * 3 * 768);
-        attn_scores= arena.alloc<float>(12 * T * T);
-        attn_out   = arena.alloc<float>(T * 768);
-        ff_mid     = arena.alloc<float>(T * 2048);
-        ff_out     = arena.alloc<float>(T * 768);
-        temp       = arena.alloc<float>(T * 768);
-        token_ids  = arena.alloc<int>(T);
-    }
-};
-
 // Run ALBERT encoder: input_ids[T] -> hidden[T, 768]
 static void albert_forward(const Weights& w, AlbertBuffers& buf,
                            cudaStream_t stream, int T) {
@@ -366,7 +209,7 @@ static void albert_forward(const Weights& w, AlbertBuffers& buf,
 
     // Step 2: Project 128 -> 768 (GEMM + bias)
     sgemm_bias(768, T, 128,
-               w.bert_proj_w, 128, buf.emb, 128, buf.hidden, 768,
+               w.bert_proj_w_f16, 128, buf.emb, 128, buf.hidden, 768,
                w.bert_proj_b, stream);
 
     // Step 3: Shared ALBERT layer x12
@@ -378,11 +221,11 @@ static void albert_forward(const Weights& w, AlbertBuffers& buf,
         float* V = buf.qkv + T * 768 * 2;
 
         sgemm_bias(768, T, 768,
-                   a.q_w, 768, buf.hidden, 768, Q, 768, a.q_b, stream);
+                   a.q_w_f16, 768, buf.hidden, 768, Q, 768, a.q_b, stream);
         sgemm_bias(768, T, 768,
-                   a.k_w, 768, buf.hidden, 768, K, 768, a.k_b, stream);
+                   a.k_w_f16, 768, buf.hidden, 768, K, 768, a.k_b, stream);
         sgemm_bias(768, T, 768,
-                   a.v_w, 768, buf.hidden, 768, V, 768, a.v_b, stream);
+                   a.v_w_f16, 768, buf.hidden, 768, V, 768, a.v_b, stream);
 
         // Multi-head attention: 12 heads, 64 dim each
         // scores[h] = Q_h @ K_h^T / sqrt(64)
@@ -407,7 +250,7 @@ static void albert_forward(const Weights& w, AlbertBuffers& buf,
 
         // Dense projection: attn_out @ dense_w^T + dense_b -> [T, 768]
         sgemm_bias(768, T, 768,
-                   a.dense_w, 768, buf.attn_out, 768, buf.temp, 768,
+                   a.dense_w_f16, 768, buf.attn_out, 768, buf.temp, 768,
                    a.dense_b, stream);
 
         // Fused Residual + LayerNorm (attention)
@@ -416,12 +259,12 @@ static void albert_forward(const Weights& w, AlbertBuffers& buf,
 
         // --- FFN ---
         sgemm_bias(2048, T, 768,
-                   a.ffn_w, 768, buf.hidden, 768, buf.ff_mid, 2048,
+                   a.ffn_w_f16, 768, buf.hidden, 768, buf.ff_mid, 2048,
                    a.ffn_b, stream);
         gelu_f32(buf.ff_mid, buf.ff_mid, T * 2048, stream);
 
         sgemm_bias(768, T, 2048,
-                   a.ffn_out_w, 2048, buf.ff_mid, 2048, buf.ff_out, 768,
+                   a.ffn_out_w_f16, 2048, buf.ff_mid, 2048, buf.ff_out, 768,
                    a.ffn_out_b, stream);
 
         // Fused Residual + LayerNorm (FFN)
@@ -433,18 +276,6 @@ static void albert_forward(const Weights& w, AlbertBuffers& buf,
 // ---------------------------------------------------------------------------
 // Text encoder forward pass
 // ---------------------------------------------------------------------------
-
-struct TextEncoderBuffers {
-    float* emb = nullptr;       // [T, 512] embedding (time-major)
-    float* conv_out = nullptr;  // [T, 512] conv output / working buffer
-    float* lstm_out = nullptr;  // [T, 512] LSTM output
-
-    void alloc(int T, GpuArena& arena) {
-        emb      = arena.alloc<float>(T * 512);
-        conv_out = arena.alloc<float>(T * 512);
-        lstm_out = arena.alloc<float>(T * 512);
-    }
-};
 
 // Forward declaration
 static void bilstm_gpu(const float* d_input, float* d_output,
@@ -468,8 +299,8 @@ static void text_encoder_forward(const Weights& w, TextEncoderBuffers& buf,
     for (int i = 0; i < 3; i++) {
         auto& blk = w.text_conv[i];
 
-        // Conv1d: [T, 512] -> [T, 512] — wv already has precomputed weight
-        gemm_conv1d(x, blk.conv_wv, blk.conv_b, buf.conv_out,
+        // Conv1d: [T, 512] -> [T, 512] — using pre-baked NHWC FP16 weights
+        gemm_conv1d(x, blk.conv_wv_nhwc_f16, blk.conv_b, buf.conv_out,
                      workspace, workspace_bytes, 512, 512, T, 5, 1, 2, 1, stream);
 
         // LayerNorm across channels
@@ -497,6 +328,10 @@ static void text_encoder_forward(const Weights& w, TextEncoderBuffers& buf,
     te_lstm_w.bhh_rev = w.text_lstm_bhh_rev;
     te_lstm_w.bias_fwd = w.text_lstm_bias_fwd;
     te_lstm_w.bias_rev = w.text_lstm_bias_rev;
+    te_lstm_w.wih_fwd_f16 = w.text_lstm_wih_fwd_f16;
+    te_lstm_w.whh_fwd_f16 = w.text_lstm_whh_fwd_f16;
+    te_lstm_w.wih_rev_f16 = w.text_lstm_wih_rev_f16;
+    te_lstm_w.whh_rev_f16 = w.text_lstm_whh_rev_f16;
     bilstm_gpu(x, buf.lstm_out, te_lstm_w, T, 512, 256, stream, arena);
 
     // Copy LSTM output back to emb for downstream use
@@ -530,13 +365,13 @@ static void bilstm_gpu(const float* d_input, float* d_output,
     float* d_c       = arena.alloc<float>(H);
     float* d_h_zero  = arena.alloc<float>(H);
 
-    // Helper: run one direction
-    auto run_direction = [&](const float* wih, const float* whh,
+    // Helper: run one direction (FP16 weights directly)
+    auto run_direction = [&](const __half* wih_f16, const __half* whh_f16,
                               const float* bias_combined,
                               float* d_h_all, bool reverse) {
         // Step 1: Pre-compute input gates for all timesteps (Cutlass GEMM)
         sgemm_tn(G, T, input_size,
-                 wih, input_size, d_input, input_size, d_ig, G, stream);
+                 wih_f16, input_size, d_input, input_size, d_ig, G, stream);
 
         // Add precomputed bias (bih + bhh)
         bias_add_f32(d_ig, bias_combined, d_ig, T, G, stream);
@@ -551,21 +386,17 @@ static void bilstm_gpu(const float* d_input, float* d_output,
             const float* h_prev = (step == 0) ? d_h_zero : d_h_all + t_prev * H;
 
             // ig[t] += Whh^T * h_prev  (alpha=1, beta=1 to accumulate)
-            auto fp16_whh = s_fp16_weights.find(whh);
-            if (fp16_whh != s_fp16_weights.end())
-                gemv_tn_f16(fp16_whh->second, H, h_prev, d_ig + t * G, G, H, 1.0f, 1.0f, stream);
-            else
-                gemv_tn_f32(whh, H, h_prev, d_ig + t * G, G, H, 1.0f, 1.0f, stream);
+            gemv_tn_f16(whh_f16, H, h_prev, d_ig + t * G, G, H, 1.0f, 1.0f, stream);
             lstm_gates_f32(d_ig + t * G, d_c, d_c, d_h_all + t * H, H, stream);
         }
     };
 
     // Forward direction
-    run_direction(lstm_w.wih_fwd, lstm_w.whh_fwd,
+    run_direction(lstm_w.wih_fwd_f16, lstm_w.whh_fwd_f16,
                   lstm_w.bias_fwd, d_h_fwd, false);
 
     // Reverse direction
-    run_direction(lstm_w.wih_rev, lstm_w.whh_rev,
+    run_direction(lstm_w.wih_rev_f16, lstm_w.whh_rev_f16,
                   lstm_w.bias_rev, d_h_rev, true);
 
     // Interleave: d_output[t, 0:H] = h_fwd[t], d_output[t, H:2H] = h_rev[t]
@@ -599,7 +430,7 @@ static void adain_1d_forward(const float* x, const float* style,
                               cudaStream_t stream,
                               const float* snake_alpha = nullptr) {
     sgemm_tn(2*C, 1, style_dim,
-             ain_w.fc_w, style_dim, style, style_dim, fc_buf, 2*C, stream);
+             ain_w.fc_w_f16, style_dim, style, style_dim, fc_buf, 2*C, stream);
     bias_add_f32(fc_buf, ain_w.fc_b, fc_buf, 1, 2*C, stream);
 
     instance_norm_style_affine_f32(x, ain_w.norm_w, ain_w.norm_b,
@@ -639,9 +470,9 @@ static void adain_resblk1d_forward(const float* x, const float* style,
                         cudaMemcpyDeviceToDevice, stream);
     }
 
-    gemm_conv1d(residual_buf, blk.conv1_wv, blk.conv1_b, y,
+    gemm_conv1d(residual_buf, blk.conv1_wv_nhwc_f16, blk.conv1_b, y,
                  workspace, workspace_bytes, dim_in, dim_out, T_out, 3,
-                 1, 1, 1, stream);
+                 1, 1, 1, stream, nullptr, blk.conv1_c_in_pad);
     cudaMemcpyAsync(residual_buf, y, dim_out * T_out * sizeof(float),
                     cudaMemcpyDeviceToDevice, stream);
 
@@ -650,7 +481,7 @@ static void adain_resblk1d_forward(const float* x, const float* style,
                      dim_out, T_out, style_dim, stream);
     leaky_relu_f32(residual_buf, residual_buf, dim_out * T_out, 0.2f, stream);
 
-    gemm_conv1d(residual_buf, blk.conv2_wv, blk.conv2_b, y,
+    gemm_conv1d(residual_buf, blk.conv2_wv_nhwc_f16, blk.conv2_b, y,
                  workspace, workspace_bytes, dim_out, dim_out, T_out, 3,
                  1, 1, 1, stream);
 
@@ -663,7 +494,7 @@ static void adain_resblk1d_forward(const float* x, const float* style,
     }
 
     if (blk.has_shortcut) {
-        gemm_conv1d(shortcut_buf, blk.conv1x1_wv, nullptr, residual_buf,
+        gemm_conv1d(shortcut_buf, blk.conv1x1_wv_f16, nullptr, residual_buf,
                      workspace, workspace_bytes, dim_in, dim_out, T_out, 1,
                      1, 0, 1, stream);
         cudaMemcpyAsync(shortcut_buf, residual_buf, dim_out * T_out * sizeof(float),
@@ -677,7 +508,7 @@ static void adain_resblk1d_forward(const float* x, const float* style,
 }
 
 // ---------------------------------------------------------------------------
-// SineGen (CPU, validation-only): F0 [L2] → har_source [T_audio=L2*300]
+// SineGen (CPU, validation-only): F0 [L2] -> har_source [T_audio=L2*300]
 //   Used by --validate path for deterministic comparison against PyTorch.
 //   Inference uses GPU kernels sinegen_phase_f32 + sinegen_source_f32 instead.
 //   rand_ini: if non-null, use these initial phases (for validation).
@@ -695,7 +526,7 @@ static void sinegen_cpu(const float* f0, int L2,
     constexpr float NOISE_STD = 0.003f;
     constexpr float VOICED_THRESH = 10.0f;
 
-    // Step 1: F0 nearest-neighbor upsample [L2] → [T_audio]
+    // Step 1: F0 nearest-neighbor upsample [L2] -> [T_audio]
     std::vector<float> f0_up(T_audio);
     for (int t = 0; t < T_audio; t++)
         f0_up[t] = f0[t / UPSAMPLE];
@@ -745,7 +576,7 @@ static void sinegen_cpu(const float* f0, int L2,
         }
     }
 
-    // Step 5: Cumulative sum → phase [L2, 9]
+    // Step 5: Cumulative sum -> phase [L2, 9]
     for (int h = 0; h < HARMONICS; h++)
         for (int t = 1; t < L2; t++)
             rad_down[t * HARMONICS + h] += rad_down[(t-1) * HARMONICS + h];
@@ -789,7 +620,7 @@ static void sinegen_cpu(const float* f0, int L2,
         }
     }
 
-    // Step 9: Linear combination [T_audio, 9] → [T_audio, 1] + tanh
+    // Step 9: Linear combination [T_audio, 9] -> [T_audio, 1] + tanh
     // l_linear: weight [1, 9], bias [1]
     for (int t = 0; t < T_audio; t++) {
         float sum = l_linear_b[0];
@@ -801,7 +632,7 @@ static void sinegen_cpu(const float* f0, int L2,
 
 // ---------------------------------------------------------------------------
 // AdaINResBlock1 forward (Generator resblocks with Snake activation)
-//   3 rounds of: adain1 → Snake → dilated_conv → adain2 → Snake → conv → residual
+//   3 rounds of: adain1 -> Snake -> dilated_conv -> adain2 -> Snake -> conv -> residual
 //   x: [T, C] in-place, output: [T, C]
 //   Working buffers: xt_buf [T, C], conv_out_buf [T, C], fc_buf [2*C]
 // ---------------------------------------------------------------------------
@@ -825,157 +656,17 @@ static void adain_resblock1_forward(float* x, const float* style,
 
         int d = dilations[j];
         int pad = (K * d - d) / 2;
-        gemm_conv1d(xt_buf, rb.convs1[j].wv, rb.convs1[j].b, conv_out_buf,
+        gemm_conv1d(xt_buf, rb.convs1[j].wv_nhwc_f16, rb.convs1[j].b, conv_out_buf,
                      workspace, workspace_bytes, C, C, T, K, 1, pad, d, stream);
 
         adain_1d_forward(conv_out_buf, style, rb.adain2[j], xt_buf, fc_buf, norm_ws,
                          C, T, style_dim, stream, rb.alpha2[j]);
 
         int pad2 = (K - 1) / 2;
-        gemm_conv1d(xt_buf, rb.convs2[j].wv, rb.convs2[j].b, x,
+        gemm_conv1d(xt_buf, rb.convs2[j].wv_nhwc_f16, rb.convs2[j].b, x,
                      workspace, workspace_bytes, C, C, T, K, 1, pad2, 1, stream,
                      x);  // residual: x = conv(xt_buf) + x, then + bias
     }
-}
-
-// ---------------------------------------------------------------------------
-// WAV file writer (16-bit PCM)
-// ---------------------------------------------------------------------------
-
-void write_wav_to_(std::ostream& f, const float* audio, int n_samples,
-                   int sample_rate) {
-    int16_t bits_per_sample = 16;
-    int16_t num_channels = 1;
-    int32_t byte_rate = sample_rate * num_channels * bits_per_sample / 8;
-    int16_t block_align = num_channels * bits_per_sample / 8;
-    int32_t data_size = n_samples * block_align;
-    int32_t chunk_size = 36 + data_size;
-
-    // RIFF header
-    f.write("RIFF", 4);
-    f.write(reinterpret_cast<char*>(&chunk_size), 4);
-    f.write("WAVE", 4);
-
-    // fmt subchunk
-    f.write("fmt ", 4);
-    int32_t fmt_size = 16;
-    int16_t audio_format = 1;  // PCM
-    f.write(reinterpret_cast<char*>(&fmt_size), 4);
-    f.write(reinterpret_cast<char*>(&audio_format), 2);
-    f.write(reinterpret_cast<char*>(&num_channels), 2);
-    f.write(reinterpret_cast<char*>(&sample_rate), 4);
-    f.write(reinterpret_cast<char*>(&byte_rate), 4);
-    f.write(reinterpret_cast<char*>(&block_align), 2);
-    f.write(reinterpret_cast<char*>(&bits_per_sample), 2);
-
-    // data subchunk
-    f.write("data", 4);
-    f.write(reinterpret_cast<char*>(&data_size), 4);
-
-    // Convert float [-1,1] to int16
-    for (int i = 0; i < n_samples; i++) {
-        float s = audio[i];
-        s = std::max(-1.0f, std::min(1.0f, s));
-        int16_t sample = (int16_t)(s * 32767.0f);
-        f.write(reinterpret_cast<char*>(&sample), 2);
-    }
-}
-
-bool write_wav(const std::string& path, const float* audio, int n_samples,
-               int sample_rate) {
-    if (path == "-") {
-        write_wav_to_(std::cout, audio, n_samples, sample_rate);
-        std::cout.flush();
-        return true;
-    }
-    std::ofstream f(path, std::ios::binary);
-    if (!f) return false;
-    write_wav_to_(f, audio, n_samples, sample_rate);
-    return f.good();
-}
-
-// ---------------------------------------------------------------------------
-// Compute exact decode-arena bytes for given T (tokens) and L (duration frames)
-// Walks every arena.alloc() from the decode phase with 256-byte alignment.
-// ---------------------------------------------------------------------------
-
-size_t compute_decode_bytes(int T, int L) {
-    int L2 = 2 * L;
-    int T_audio = L2 * 300;
-    int har_frames = T_audio / 5 + 1;  // 60*L2 + 1
-
-    // Mimic GpuArena::alloc alignment: aligned = (off + 255) & ~255
-    auto a = [](size_t off, size_t bytes) -> size_t {
-        return ((off + 255) & ~(size_t)255) + bytes;
-    };
-
-    size_t off = 0;
-
-    // Workspace for gemm_conv1d/gemm_conv_transpose1d (first allocation).
-    // Max is generator resblocks: C=128, K=11, T=har_frames → 1408*har_frames floats.
-    size_t max_ws_floats = (size_t)128 * 11 * har_frames;
-    off = a(off, max_ws_floats * sizeof(float));
-
-    // Alignment matrix + expanded encoder + shared LSTM output
-    off = a(off, (size_t)T * L * sizeof(float));        // d_alignment
-    off = a(off, (size_t)L * 640 * sizeof(float));       // d_en_expanded [L, 640]
-    off = a(off, (size_t)L * 512 * sizeof(float));       // d_shared_out [L, 512]
-
-    // F0/N working buffers (shared across both chains)
-    off = a(off, (size_t)512 * L2 * sizeof(float));      // d_res_buf
-    off = a(off, (size_t)512 * L2 * sizeof(float));      // d_sc_buf
-    off = a(off, (size_t)2048 * sizeof(float));           // d_fc_buf (2*C + 2*C norm ws)
-
-    // F0/N predictions
-    off = a(off, (size_t)L2 * sizeof(float));             // d_f0_pred
-    off = a(off, (size_t)L2 * sizeof(float));             // d_n_pred
-
-    // Decoder inputs
-    off = a(off, (size_t)L * 512 * sizeof(float));        // d_asr_aligned [L, 512]
-    off = a(off, (size_t)L * sizeof(float));              // d_f0_down
-    off = a(off, (size_t)L * sizeof(float));              // d_n_down
-    off = a(off, (size_t)L * 514 * sizeof(float));        // d_dec_cat [L, 514]
-
-    // Decoder working buffers
-    int max_ch = 1090;
-    off = a(off, (size_t)max_ch * L2 * sizeof(float));   // d_dec_res
-    off = a(off, (size_t)max_ch * L2 * sizeof(float));   // d_dec_sc
-    off = a(off, (size_t)4 * max_ch * sizeof(float));    // d_dec_fc (2*C + 2*C norm ws)
-
-    // Decoder blocks
-    off = a(off, (size_t)L * 1024 * sizeof(float));       // d_dec_out [L, 1024]
-    off = a(off, (size_t)L * 64 * sizeof(float));         // d_asr_res [L, 64]
-    off = a(off, (size_t)L2 * 1090 * sizeof(float));      // d_dec_in [L2, 1090]
-
-    // Decode blocks 0-2: L*1024 each; block 3: L2*512 (has_upsample)
-    for (int i = 0; i < 3; i++)
-        off = a(off, (size_t)L * 1024 * sizeof(float));
-    off = a(off, (size_t)L2 * 512 * sizeof(float));
-
-    // Generator: d_gen_har_ct [22, har_frames] persists through STFT,
-    // then d_gen_har [har_frames, 22] (transposed) persists for generator.
-    // SineGen temps overlap with gen_har_ct area after restore.
-    off = a(off, (size_t)22 * har_frames * sizeof(float)); // d_gen_har_ct
-    size_t sinegen_off = off;
-    // SineGen temporaries (reclaimed via save/restore)
-    size_t sg = off;
-    sg = a(sg, (size_t)L2 * 9 * sizeof(float));            // d_phase_low
-    sg = a(sg, (size_t)T_audio * sizeof(float));            // d_har_source
-    sg = a(sg, (size_t)9 * sizeof(float));                  // d_rand_ini
-
-    // After sinegen restore, d_gen_har (transposed) is allocated
-    off = a(off, (size_t)har_frames * 22 * sizeof(float));  // d_gen_har [har_frames, 22]
-
-    // Generator working pool: 5 slots of 128*har_frames (buffers reused via liveness)
-    // Must account for max of sinegen temps or gen pool
-    size_t gen_pool_end = a(off, (size_t)5 * 128 * har_frames * sizeof(float));
-    off = (sg > gen_pool_end) ? sg : gen_pool_end;
-    off = a(off, (size_t)512 * sizeof(float));              // d_gen_fc
-
-    // Final audio buffer
-    off = a(off, (size_t)T_audio * sizeof(float));          // d_audio
-
-    return off;
 }
 
 // ---------------------------------------------------------------------------
@@ -997,7 +688,7 @@ static std::unordered_map<int64_t, DecodeGraph> s_decode_graph_cache;
 static float* s_d_rand_ini = nullptr;  // persistent rand_ini on GPU (seed=42)
 
 // ---------------------------------------------------------------------------
-// Rokoko inference: phoneme IDs + style vector → audio
+// Rokoko inference: phoneme IDs + style vector -> audio
 // ---------------------------------------------------------------------------
 
 std::vector<float> rokoko_infer(const Weights& w,
@@ -1055,9 +746,9 @@ std::vector<float> rokoko_infer(const Weights& w,
                         cudaMemcpyDeviceToDevice, stream);
         albert_forward(w, albert_buf, stream, T);
 
-        // bert_encoder: Linear 768→512 → d_en [T, 512]
+        // bert_encoder: Linear 768->512 -> d_en [T, 512]
         sgemm_bias(512, T, 768,
-                   w.bert_enc_w, 768, albert_buf.hidden, 768, d_en, 512,
+                   w.bert_enc_w_f16, 768, albert_buf.hidden, 768, d_en, 512,
                    w.bert_enc_b, stream);
 
         // Text encoder
@@ -1074,7 +765,7 @@ std::vector<float> rokoko_infer(const Weights& w,
 
             auto& aln = w.dur_enc_aln[layer_i];
             sgemm_tn(1024, 1, 128,
-                     aln.fc_w, 128, d_style_prosody, 128, d_ada_fc, 1024, stream);
+                     aln.fc_w_f16, 128, d_style_prosody, 128, d_ada_fc, 1024, stream);
             bias_add_f32(d_ada_fc, aln.fc_b, d_ada_fc, 1, 1024, stream);
             ada_layer_norm_f32(d_lstm_out, d_ada_fc, d_ada_fc + 512,
                                d_x_buf, T, 512, 1e-5f, stream);
@@ -1086,7 +777,7 @@ std::vector<float> rokoko_infer(const Weights& w,
         bilstm_gpu(d_cat_buf, d_dur_lstm_out, w.dur_lstm,
                    T, 640, 256, stream, arena);
         sgemm_bias(50, T, 512,
-                   w.dur_proj_w, 512, d_dur_lstm_out, 512, d_dur_proj, 50,
+                   w.dur_proj_w_f16, 512, d_dur_lstm_out, 512, d_dur_proj, 50,
                    w.dur_proj_b, stream);
         sigmoid_sum_f32(d_dur_proj, d_durations, T, 50, stream);
         round_clamp_durations_f32(d_durations, d_int_durations, d_L, T, stream);
@@ -1102,7 +793,7 @@ std::vector<float> rokoko_infer(const Weights& w,
         cudaGraphLaunch(git->second, stream);
     }
 
-    // Sync for L only (4 bytes) — needed for decode arena sizing
+    // Sync for L only (4 bytes) -- needed for decode arena sizing
     int L;
     CUDA_CHECK(cudaMemcpyAsync(&L, d_L, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1114,12 +805,12 @@ std::vector<float> rokoko_infer(const Weights& w,
     static constexpr int DECODE_L_BUCKET = 32;
     L = ((L + DECODE_L_BUCKET - 1) / DECODE_L_BUCKET) * DECODE_L_BUCKET;
     L2 = 2 * L;
-    int T_audio = L2 * 300;  // padded — used by decode operations
+    int T_audio = L2 * 300;  // padded -- used by decode operations
 
     // ===== DECODE PHASE: exact-sized arena =====
     size_t decode_bytes = compute_decode_bytes(T, L);
     if (decode_arena.capacity < decode_bytes) {
-        // Arena grows — invalidate all cached decode graphs
+        // Arena grows -- invalidate all cached decode graphs
         for (auto& [k, dg] : s_decode_graph_cache)
             cudaGraphExecDestroy(dg.exec);
         s_decode_graph_cache.clear();
@@ -1166,24 +857,24 @@ std::vector<float> rokoko_infer(const Weights& w,
     float* d_alignment = decode_arena.alloc<float>(T * L);
     build_alignment_f32(d_int_durations, d_alignment, T, L, stream);
 
-    // Expand encoder output: alignment^T [L, T] × d_cat_buf [T, 640] → [L, 640]
+    // Expand encoder output: alignment^T [L, T] x d_cat_buf [T, 640] -> [L, 640]
     // d_cat_buf is [T, 640] row-major = col-major [640, T]
     // alignment is [T, L] row-major = col-major [L, T]
     // We want result [L, 640] row-major = col-major [640, L]
     // GEMM: C[640,L] = A[640,T] * B[T,L]
     //   A = d_cat_buf row-major [T,640] = col-major [640,T], lda=640
-    //   B = d_alignment row-major [T,L] = col-major [L,T], transposed → [T,L], ldb=L
+    //   B = d_alignment row-major [T,L] = col-major [L,T], transposed -> [T,L], ldb=L
     float* d_en_expanded = decode_arena.alloc<float>(L * 640);
     sgemm_nt(640, L, T,
              d_cat_buf, 640, d_alignment, L, d_en_expanded, 640, stream);
 
-    // Shared LSTM: d_en_expanded [L, 640] already row-major — no transpose
+    // Shared LSTM: d_en_expanded [L, 640] already row-major -- no transpose
     float* d_shared_out = decode_arena.alloc<float>(L * 512);
     bilstm_gpu(d_en_expanded, d_shared_out, w.shared_lstm,
                L, 640, 256, stream, decode_arena);
 
     // F0 and N prediction chains
-    // Both: [L, 512] → 3 AdainResBlk1d → Conv1d proj → [2L, 1]
+    // Both: [L, 512] -> 3 AdainResBlk1d -> Conv1d proj -> [2L, 1]
     float* d_res_buf = decode_arena.alloc<float>(512 * L2);
     float* d_sc_buf  = decode_arena.alloc<float>(512 * L2);
     float* d_fc_buf  = decode_arena.alloc<float>(2048);  // 2*C for gamma/beta + 2*C for norm reduction
@@ -1194,30 +885,30 @@ std::vector<float> rokoko_infer(const Weights& w,
         size_t chain_save = decode_arena.save();
         float* d_fx = decode_arena.alloc<float>(512 * L2);
         float* d_fo = decode_arena.alloc<float>(512 * L2);
-        // d_shared_out is [L, 512] — already [T, C] layout, no transpose
+        // d_shared_out is [L, 512] -- already [T, C] layout, no transpose
         cudaMemcpyAsync(d_fx, d_shared_out, L * 512 * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
 
-        // block 0: [L, 512] → [L, 512]
+        // block 0: [L, 512] -> [L, 512]
         adain_resblk1d_forward(d_fx, d_style_prosody, blocks[0],
                                 d_res_buf, d_sc_buf, d_fc_buf, d_fo,
                                 512, 512, L, 128, stream,
                                 d_dec_workspace, dec_ws_bytes);
-        // block 1: [L, 512] → [2L, 256] (upsample)
+        // block 1: [L, 512] -> [2L, 256] (upsample)
         cudaMemcpyAsync(d_fx, d_fo, 512 * L * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
         adain_resblk1d_forward(d_fx, d_style_prosody, blocks[1],
                                 d_res_buf, d_sc_buf, d_fc_buf, d_fo,
                                 512, 256, L, 128, stream,
                                 d_dec_workspace, dec_ws_bytes);
-        // block 2: [2L, 256] → [2L, 256]
+        // block 2: [2L, 256] -> [2L, 256]
         cudaMemcpyAsync(d_fx, d_fo, 256 * L2 * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
         adain_resblk1d_forward(d_fx, d_style_prosody, blocks[2],
                                 d_res_buf, d_sc_buf, d_fc_buf, d_fo,
                                 256, 256, L2, 128, stream,
                                 d_dec_workspace, dec_ws_bytes);
-        // Projection: Conv1d(256→1, k=1) → [2L, 1]
+        // Projection: Conv1d(256->1, k=1) -> [2L, 1]
         conv1d_f32(d_fo, proj_w, proj_b, d_pred, 256, 1, L2, 1, stream);
         decode_arena.restore(chain_save);
     };
@@ -1228,22 +919,22 @@ std::vector<float> rokoko_infer(const Weights& w,
     run_f0n_chain(w.n_blocks, w.n_proj_w, w.n_proj_b, d_n_pred);
 
     // ---- Decoder ----
-    // Build asr_aligned: alignment^T [L, T] × te_buf.emb [T, 512] → [L, 512]
+    // Build asr_aligned: alignment^T [L, T] x te_buf.emb [T, 512] -> [L, 512]
     float* d_asr_aligned = decode_arena.alloc<float>(L * 512);
     sgemm_nt(512, L, T,
              te_buf.emb, 512, d_alignment, L, d_asr_aligned, 512, stream);
 
-    // F0/N downsampling: Conv1d(1,1,k=3,s=2,p=1) on [2L, 1] → [L, 1]
+    // F0/N downsampling: Conv1d(1,1,k=3,s=2,p=1) on [2L, 1] -> [L, 1]
     float* d_f0_down = decode_arena.alloc<float>(L);
     float* d_n_down  = decode_arena.alloc<float>(L);
 
-    // F0/N downsample — wv has precomputed weight
+    // F0/N downsample -- wv has precomputed weight
     conv1d_general_f32(d_f0_pred, w.dec_f0_conv_wv, w.dec_f0_conv_b,
                        d_f0_down, 1, 1, L2, 3, 2, 1, 1, stream);
     conv1d_general_f32(d_n_pred, w.dec_n_conv_wv, w.dec_n_conv_b,
                        d_n_down, 1, 1, L2, 3, 2, 1, 1, stream);
 
-    // Concatenate [asr_aligned, F0_down, N_down] → [L, 514]
+    // Concatenate [asr_aligned, F0_down, N_down] -> [L, 514]
     float* d_dec_cat = decode_arena.alloc<float>(L * 514);
     concat3_channels_f32(d_asr_aligned, d_f0_down, d_n_down,
                           d_dec_cat, L, 512, 1, 1, stream);
@@ -1254,14 +945,14 @@ std::vector<float> rokoko_infer(const Weights& w,
     float* d_dec_sc  = decode_arena.alloc<float>(max_ch * L2);
     float* d_dec_fc  = decode_arena.alloc<float>(4 * max_ch);  // 2*C gamma/beta + 2*C norm reduction
 
-    // Encode: AdainResBlk1d(514→1024) [L, 514] → [L, 1024]
+    // Encode: AdainResBlk1d(514->1024) [L, 514] -> [L, 1024]
     float* d_dec_out = decode_arena.alloc<float>(L * 1024);
     adain_resblk1d_forward(d_dec_cat, d_style_acoustic, w.dec_encode,
                             d_dec_res, d_dec_sc, d_dec_fc, d_dec_out,
                             514, 1024, L, 128, stream,
                             d_dec_workspace, dec_ws_bytes);
 
-    // asr_res: Conv1d(512→64, k=1) — wv has precomputed weight
+    // asr_res: Conv1d(512->64, k=1) -- wv has precomputed weight
     float* d_asr_res = decode_arena.alloc<float>(L * 64);
     conv1d_f32(d_asr_aligned, w.dec_asr_res_wv, w.dec_asr_res_b, d_asr_res,
                512, 64, L, 1, stream);
@@ -1279,7 +970,7 @@ std::vector<float> rokoko_infer(const Weights& w,
 
         if (res_flag) {
             // Concatenate: d_dec_x [T_blk, 1024] + d_asr_res [T_blk, 64]
-            //            + d_f0_down [T_blk, 1] + d_n_down [T_blk, 1] → [T_blk, 1090]
+            //            + d_f0_down [T_blk, 1] + d_n_down [T_blk, 1] -> [T_blk, 1090]
             concat4_channels_f32(d_dec_x, d_asr_res, d_f0_down, d_n_down,
                                   d_dec_in, T_blk, 1024, 64, 1, 1, stream);
         } else {
@@ -1302,10 +993,10 @@ std::vector<float> rokoko_infer(const Weights& w,
             L = T_blk_out;  // update L after upsample
         }
     }
-    // d_dec_x is now [L2, 512] — generator input
+    // d_dec_x is now [L2, 512] -- generator input
 
     // ---- Generator ----
-    // SineGen: F0 → harmonic source → STFT → har [22, frames]
+    // SineGen: F0 -> harmonic source -> STFT -> har [22, frames]
     // STFT output is inherently [n_fft/2+1, n_frames] = [C, T] layout.
     // gen_har stays in [C, T] layout; the generator noise_convs kernels
     // use [T, C] layout, so we'll transpose gen_har to [T, C] for them.
@@ -1331,7 +1022,7 @@ std::vector<float> rokoko_infer(const Weights& w,
         decode_arena.restore(sinegen_save);
     }
 
-    // Transpose gen_har from [22, har_frames] → [har_frames, 22] for [T,C] layout
+    // Transpose gen_har from [22, har_frames] -> [har_frames, 22] for [T,C] layout
     // Reuse sinegen temps area (already restored)
     float* d_gen_har = decode_arena.alloc<float>(har_frames * 22);
     transpose_f32(d_gen_har_ct, d_gen_har, 22, har_frames, stream);
@@ -1367,16 +1058,17 @@ std::vector<float> rokoko_infer(const Weights& w,
 
         leaky_relu_f32(d_gen_x, d_gen_x, C_in * T_loop, 0.1f, stream);
 
-        // noise_convs[i]: gen_har [har_frames, 22] → slot1 [src_T, C_out]
+        // noise_convs[i]: gen_har [har_frames, 22] -> slot1 [src_T, C_out]
         float* d_gen_src = slot1;
         if (i == 0) {
-            gemm_conv1d(d_gen_har, w.gen_noise_convs[i].w,
-                         w.gen_noise_convs[i].b, d_gen_src,
+            gemm_conv1d(d_gen_har, w.gen_noise_convs[0].w_nhwc_f16,
+                         w.gen_noise_convs[0].b, d_gen_src,
                          d_dec_workspace, dec_ws_bytes,
-                         22, C_out, har_frames, 12, 6, 3, 1, stream);
+                         22, C_out, har_frames, 12, 6, 3, 1, stream,
+                         nullptr, w.gen_noise_convs[0].c_in_pad);
         } else {
-            gemm_conv1d(d_gen_har, w.gen_noise_convs[i].w,
-                         w.gen_noise_convs[i].b, d_gen_src,
+            gemm_conv1d(d_gen_har, w.gen_noise_convs[1].w_f16,
+                         w.gen_noise_convs[1].b, d_gen_src,
                          d_dec_workspace, dec_ws_bytes,
                          22, C_out, har_frames, 1, 1, 0, 1, stream);
         }
@@ -1390,14 +1082,14 @@ std::vector<float> rokoko_infer(const Weights& w,
                                 src_T, 128, stream,
                                 d_dec_workspace, dec_ws_bytes);
 
-        // ups[i]: gen_x (slot0) → slot4 (gen_tmp)
+        // ups[i]: gen_x (slot0) -> slot4 (gen_tmp)
         float* d_gen_tmp = slot4;
         int T_ups = (T_loop - 1) * us - 2 * up + uk;
-        gemm_conv_transpose1d(d_gen_x, w.gen_ups[i].wv, w.gen_ups[i].b,
+        gemm_conv_transpose1d(d_gen_x, w.gen_ups[i].wv_f16, w.gen_ups[i].b,
                                d_gen_tmp, d_dec_workspace, dec_ws_bytes,
                                C_in, C_out, T_loop, uk, us, up, 0, stream);
 
-        // Copy/pad tmp → gen_x
+        // Copy/pad tmp -> gen_x
         if (i == 1) {
             reflection_pad_1d_f32(d_gen_tmp, d_gen_x, C_out, T_ups, 1, 0, stream);
             T_ups += 1;
@@ -1428,24 +1120,36 @@ std::vector<float> rokoko_infer(const Weights& w,
         T_loop = T_ups;
     }
 
-    // Post: LeakyReLU(0.01) + conv_post(128→22, k=7)
-    // Result is [T_loop, 22] in [T,C] layout
+    // Post: LeakyReLU(0.01) + conv_post(128->22, k=7)
+    // conv_post: C_out=22 misaligned for Cutlass conv, use im2col + FP16 GEMM.
+    // im2col output is large (128*7*T_loop), so cast into workspace directly
+    // instead of s_fp16_buf which may be too small.
     float* d_gen_tmp = slot4;
     leaky_relu_f32(d_gen_x, d_gen_x, 128 * T_loop, 0.01f, stream);
-    gemm_conv1d(d_gen_x, w.gen_conv_post_wv, w.gen_conv_post_b, d_gen_tmp,
-                 d_dec_workspace, dec_ws_bytes, 128, 22, T_loop, 7, 1, 3, 1, stream);
+    im2col_1d_f32(d_gen_x, d_dec_workspace, 128, T_loop, 7, 1, 3, 1, T_loop, stream);
+    {
+        int CK = 128 * 7;
+        size_t col_floats = (size_t)CK * T_loop;
+        // Cast im2col FP32 output to FP16 after the FP32 data in the workspace
+        __half* col_f16 = (__half*)(d_dec_workspace + col_floats);
+        cast_f32_to_f16(d_dec_workspace, col_f16, (int)col_floats, stream);
+        cutlass_gemm_tn_f16(22, T_loop, CK, w.gen_conv_post_wv_f16, CK,
+                             col_f16, CK, d_gen_tmp, 22, 1.0f, 0.0f,
+                             s_workspace, s_workspace_bytes, stream);
+    }
+    channel_bias_add_f32(d_gen_tmp, w.gen_conv_post_b, 22, T_loop, stream);
 
-    // Transpose [T_loop, 22] → [22, T_loop] for STFT boundary (channels-first)
+    // Transpose [T_loop, 22] -> [22, T_loop] for STFT boundary (channels-first)
     float* d_gen_ct = d_gen_x;  // reuse slot0 (128*har_frames >> 22*T_loop)
     transpose_f32(d_gen_tmp, d_gen_ct, T_loop, 22, stream);
 
-    // spec = exp(x[:11,:]), phase = sin(x[11:,:]) — in [C,T] layout
+    // spec = exp(x[:11,:]), phase = sin(x[11:,:]) -- in [C,T] layout
     int n_freqs = 11;
     exp_f32(d_gen_ct, d_gen_tmp, n_freqs * T_loop, stream);
     sin_f32(d_gen_ct + n_freqs * T_loop, d_gen_tmp + n_freqs * T_loop,
             n_freqs * T_loop, stream);
 
-    // iSTFT → audio (operates on [n_freqs, T_loop] channels-first)
+    // iSTFT -> audio (operates on [n_freqs, T_loop] channels-first)
     float* d_audio = decode_arena.alloc<float>(T_audio);
     istft_f32(d_gen_tmp, d_gen_tmp + n_freqs * T_loop, d_audio,
               T_loop, 20, 5, T_audio, stream);
@@ -1471,380 +1175,28 @@ std::vector<float> rokoko_infer(const Weights& w,
 }
 
 // ---------------------------------------------------------------------------
-// Precompute all weight norms: wv[o,:] = wg[o] * wv[o,:] / ||wv[o,:]||
-// Call once after upload. After this, wv contains the materialized weight
-// and weight_norm_f32 calls in inference can be skipped.
+// Precompute weight norms: v2 file has everything pre-baked.
+// Just assign FP16 pointers and allocate staging buffer.
 // ---------------------------------------------------------------------------
 
 void precompute_weight_norms(Weights& w, cudaStream_t stream) {
-    auto wn = [&](float* wg, float* wv, int C_out, int fan_in) {
-        weight_norm_f32(wg, wv, wv, C_out, fan_in, stream);  // in-place
-    };
-
-    // Text encoder conv blocks (3x)
-    for (int i = 0; i < 3; i++)
-        wn(w.text_conv[i].conv_wg, w.text_conv[i].conv_wv, 512, 512 * 5);
-
-    // F0/N blocks (3x AdainResBlk1d each):
-    //   [0] 512→512, [1] 512→256 (upsample+shortcut), [2] 256→256
-    {
-        int dim_in[]  = {512, 512, 256};
-        int dim_out[] = {512, 256, 256};
-        for (auto* blocks : {w.f0_blocks, w.n_blocks}) {
-            for (int i = 0; i < 3; i++) {
-                auto& b = blocks[i];
-                wn(b.conv1_wg, b.conv1_wv, dim_out[i], dim_in[i] * 3);
-                wn(b.conv2_wg, b.conv2_wv, dim_out[i], dim_out[i] * 3);
-                if (b.has_shortcut)
-                    wn(b.conv1x1_wg, b.conv1x1_wv, dim_out[i], dim_in[i] * 1);
-                if (b.has_upsample)
-                    wn(b.pool_wg, b.pool_wv, dim_in[i], 3);
-            }
-        }
-    }
-
-    // Decoder: F0_conv, N_conv, asr_res
-    wn(w.dec_f0_conv_wg, w.dec_f0_conv_wv, 1, 1 * 3);
-    wn(w.dec_n_conv_wg, w.dec_n_conv_wv, 1, 1 * 3);
-    wn(w.dec_asr_res_wg, w.dec_asr_res_wv, 64, 512 * 1);
-
-    // Decoder: encode block (AdainResBlk1d 514→1024)
-    {
-        auto& b = w.dec_encode;
-        wn(b.conv1_wg, b.conv1_wv, 1024, 514 * 3);
-        wn(b.conv2_wg, b.conv2_wv, 1024, 1024 * 3);
-        if (b.has_shortcut)
-            wn(b.conv1x1_wg, b.conv1x1_wv, 1024, 514 * 1);
-        if (b.has_upsample)
-            wn(b.pool_wg, b.pool_wv, 514, 3);
-    }
-
-    // Decoder: decode blocks (4x AdainResBlk1d)
-    for (int i = 0; i < Weights::DEC_N_DECODE; i++) {
-        auto& b = w.dec_decode[i];
-        int dim_in = 1090;  // all blocks take 1090 (1024+64+2)
-        int dim_out = (i < 3) ? 1024 : 512;
-        wn(b.conv1_wg, b.conv1_wv, dim_out, dim_in * 3);
-        wn(b.conv2_wg, b.conv2_wv, dim_out, dim_out * 3);
-        if (b.has_shortcut)
-            wn(b.conv1x1_wg, b.conv1x1_wv, dim_out, dim_in * 1);
-        if (b.has_upsample)
-            wn(b.pool_wg, b.pool_wv, dim_in, 3);
-    }
-
-    // Generator: ups (ConvTranspose1d with weight_norm)
-    // ups[0]: 512→256 k=20, ups[1]: 256→128 k=12
-    // weight: [C_in, C_out, K], so C_out_wn = C_in, fan_in = C_out * K
-    int up_cin[]  = {512, 256};
-    int up_cout[] = {256, 128};
-    int up_k[]    = {20, 12};
-    for (int i = 0; i < Weights::GEN_N_UPS; i++)
-        wn(w.gen_ups[i].wg, w.gen_ups[i].wv, up_cin[i], up_cout[i] * up_k[i]);
-
-    // Generator: resblocks (6x AdaINResBlock1) — use stored channels/kernel_size
-    for (int i = 0; i < Weights::GEN_N_RESBLOCKS; i++) {
-        auto& rb = w.gen_resblocks[i];
-        int C = rb.channels, K = rb.kernel_size;
-        for (int j = 0; j < 3; j++) {
-            wn(rb.convs1[j].wg, rb.convs1[j].wv, C, C * K);
-            wn(rb.convs2[j].wg, rb.convs2[j].wv, C, C * K);
-        }
-    }
-
-    // Generator: noise_res (2x AdaINResBlock1) — use stored channels/kernel_size
-    for (int i = 0; i < Weights::GEN_N_UPS; i++) {
-        auto& rb = w.gen_noise_res[i];
-        int C = rb.channels, K = rb.kernel_size;
-        for (int j = 0; j < 3; j++) {
-            wn(rb.convs1[j].wg, rb.convs1[j].wv, C, C * K);
-            wn(rb.convs2[j].wg, rb.convs2[j].wv, C, C * K);
-        }
-    }
-
-    // Generator: conv_post (128→22, k=7)
-    wn(w.gen_conv_post_wg, w.gen_conv_post_wv, 22, 128 * 7);
-
-    // Precompute LSTM biases: bias = bih + bhh for each direction
-    auto precompute_lstm_bias = [&](Weights::BiLSTMWeights& lw, int H) {
-        int G = 4 * H;
-        CUDA_CHECK(cudaMalloc(&lw.bias_fwd, G * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&lw.bias_rev, G * sizeof(float)));
-        add_f32(lw.bih_fwd, lw.bhh_fwd, lw.bias_fwd, G, stream);
-        add_f32(lw.bih_rev, lw.bhh_rev, lw.bias_rev, G, stream);
-    };
-
-    // Text encoder LSTM (H=256)
-    // Build temporary BiLSTMWeights for text encoder since it uses flat fields
-    {
-        w.text_lstm_bias_fwd = nullptr;
-        w.text_lstm_bias_rev = nullptr;
-        CUDA_CHECK(cudaMalloc(&w.text_lstm_bias_fwd, 1024 * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&w.text_lstm_bias_rev, 1024 * sizeof(float)));
-        add_f32(w.text_lstm_bih_fwd, w.text_lstm_bhh_fwd, w.text_lstm_bias_fwd, 1024, stream);
-        add_f32(w.text_lstm_bih_rev, w.text_lstm_bhh_rev, w.text_lstm_bias_rev, 1024, stream);
-    }
-
-    // Prosody predictor LSTMs
-    for (int i = 0; i < 3; i++)
-        precompute_lstm_bias(w.dur_enc_lstm[i], 256);
-    precompute_lstm_bias(w.dur_lstm, 256);
-    precompute_lstm_bias(w.shared_lstm, 256);
-
-    // ---- Precompute NHWC weights for Cutlass implicit GEMM ----
-    // Reshape [C_out, C_in, K] → [C_out, K, C_in] for Conv1d weights with K>1.
-    // K=1 convolutions are just GEMMs and don't benefit from implicit GEMM.
-    auto make_nhwc = [&](float* wv, int C_out, int C_in, int K) {
-        if (K <= 1) return;
-        float* w_nhwc = nullptr;
-        CUDA_CHECK(cudaMalloc(&w_nhwc, (size_t)C_out * C_in * K * sizeof(float)));
-        cutlass_reshape_weights(wv, w_nhwc, C_out, C_in, K, stream);
-        s_w_nhwc[wv] = w_nhwc;
-    };
-
-    // Text encoder conv blocks (K=5)
-    for (int i = 0; i < 3; i++)
-        make_nhwc(w.text_conv[i].conv_wv, 512, 512, 5);
-
-    // F0/N AdainResBlk1d conv weights (K=3)
-    {
-        int dim_in[]  = {512, 512, 256};
-        int dim_out[] = {512, 256, 256};
-        for (auto* blocks : {w.f0_blocks, w.n_blocks}) {
-            for (int i = 0; i < 3; i++) {
-                make_nhwc(blocks[i].conv1_wv, dim_out[i], dim_in[i], 3);
-                make_nhwc(blocks[i].conv2_wv, dim_out[i], dim_out[i], 3);
-            }
-        }
-    }
-
-    // Decoder F0/N downsample (K=3)
-    make_nhwc(w.dec_f0_conv_wv, 1, 1, 3);
-    make_nhwc(w.dec_n_conv_wv, 1, 1, 3);
-
-    // Decoder encode block (K=3)
-    make_nhwc(w.dec_encode.conv1_wv, 1024, 514, 3);
-    make_nhwc(w.dec_encode.conv2_wv, 1024, 1024, 3);
-
-    // Decoder decode blocks (K=3)
-    for (int i = 0; i < Weights::DEC_N_DECODE; i++) {
-        int dim_in = 1090;
-        int dim_out = (i < 3) ? 1024 : 512;
-        make_nhwc(w.dec_decode[i].conv1_wv, dim_out, dim_in, 3);
-        make_nhwc(w.dec_decode[i].conv2_wv, dim_out, dim_out, 3);
-    }
-
-    // Generator resblocks (K varies: 3, 7, 11)
-    for (int i = 0; i < Weights::GEN_N_RESBLOCKS; i++) {
-        auto& rb = w.gen_resblocks[i];
-        int C = rb.channels, K = rb.kernel_size;
-        for (int j = 0; j < 3; j++) {
-            make_nhwc(rb.convs1[j].wv, C, C, K);
-            make_nhwc(rb.convs2[j].wv, C, C, K);
-        }
-    }
-
-    // Generator noise_res (K varies)
-    for (int i = 0; i < Weights::GEN_N_UPS; i++) {
-        auto& rb = w.gen_noise_res[i];
-        int C = rb.channels, K = rb.kernel_size;
-        for (int j = 0; j < 3; j++) {
-            make_nhwc(rb.convs1[j].wv, C, C, K);
-            make_nhwc(rb.convs2[j].wv, C, C, K);
-        }
-    }
-
-    // Generator conv_post (K=7)
-    make_nhwc(w.gen_conv_post_wv, 22, 128, 7);
-
-    // Generator noise_convs (not weight-normed, use .w not .wv)
-    make_nhwc(w.gen_noise_convs[0].w, 128, 22, 12);  // K=12, stride=6
-    // noise_convs[1] has K=1, skip
-
-    // ---- Convert weight matrices to FP16 ----
-    // Creates half-precision copies for FP16 Tensor Core GEMM/Conv.
-    // Biases, norms, embeddings, style vectors stay FP32.
-
-    auto make_fp16 = [&](const float* w_ptr, size_t n_elements) {
-        if (!w_ptr || n_elements == 0) return;
-        __half* w_f16 = nullptr;
-        CUDA_CHECK(cudaMalloc(&w_f16, n_elements * sizeof(__half)));
-        cast_f32_to_f16(w_ptr, w_f16, (int)n_elements, stream);
-        s_fp16_weights[w_ptr] = w_f16;
-    };
-
-    // NHWC FP16 for Cutlass conv (reshape + cast in one kernel)
-    auto make_nhwc_f16 = [&](float* wv, int C_out, int C_in, int K) {
-        if (K <= 1) return;
-        if (C_in % 8 != 0 || C_out % 4 != 0) return;  // alignment required
-        __half* w_f16 = nullptr;
-        CUDA_CHECK(cudaMalloc(&w_f16, (size_t)C_out * C_in * K * sizeof(__half)));
-        cutlass_reshape_weights_f16(wv, w_f16, C_out, C_in, K, stream);
-        s_w_nhwc_f16[wv] = w_f16;
-    };
-
-    // Padded NHWC FP16 for conv weights with unaligned C_in.
-    // Pads C_in to next multiple of 8, creates padded FP32 temp, reshapes to NHWC FP16.
-    auto make_nhwc_f16_padded = [&](float* wv, int C_out, int C_in, int K) {
-        if (K <= 1) return;
-        if (C_in % 8 == 0) return;  // already aligned, use normal path
-        if (C_out % 4 != 0) return;
-        int C_in_pad = (C_in + 7) & ~7;
-        // Pad weight: [C_out, C_in, K] → [C_out, C_in_pad, K]
-        float* w_padded = nullptr;
-        CUDA_CHECK(cudaMalloc(&w_padded, (size_t)C_out * C_in_pad * K * sizeof(float)));
-        pad_blocks_f32(wv, w_padded, C_out, C_in * K, C_in_pad * K, stream);
-        // Reshape padded weight to NHWC and cast to FP16
-        __half* w_f16 = nullptr;
-        CUDA_CHECK(cudaMalloc(&w_f16, (size_t)C_out * C_in_pad * K * sizeof(__half)));
-        cutlass_reshape_weights_f16(w_padded, w_f16, C_out, C_in_pad, K, stream);
-        cudaFree(w_padded);  // temp
-        s_w_nhwc_f16_padded[wv] = {w_f16, C_in_pad};
-    };
-
-    // ALBERT linear weights
-    make_fp16(w.bert_proj_w, 768 * 128);
-    make_fp16(w.albert.q_w, 768 * 768);
-    make_fp16(w.albert.k_w, 768 * 768);
-    make_fp16(w.albert.v_w, 768 * 768);
-    make_fp16(w.albert.dense_w, 768 * 768);
-    make_fp16(w.albert.ffn_w, 2048 * 768);
-    make_fp16(w.albert.ffn_out_w, 768 * 2048);
-    make_fp16(w.bert_enc_w, 512 * 768);
-
-    // Text encoder conv weights (after weight norm): [512, 512, 5]
-    for (int i = 0; i < 3; i++) {
-        make_fp16(w.text_conv[i].conv_wv, 512 * 512 * 5);
-        make_nhwc_f16(w.text_conv[i].conv_wv, 512, 512, 5);
-    }
-
-    // LSTM weights: wih and whh for all directions
-    auto make_lstm_fp16 = [&](const Weights::BiLSTMWeights& lw,
-                               int input_size, int hidden_size) {
-        int G = 4 * hidden_size;
-        make_fp16(lw.wih_fwd, G * input_size);
-        make_fp16(lw.whh_fwd, G * hidden_size);
-        make_fp16(lw.wih_rev, G * input_size);
-        make_fp16(lw.whh_rev, G * hidden_size);
-    };
-
-    // Text encoder LSTM (input=512, hidden=256)
-    {
-        Weights::BiLSTMWeights te_lw;
-        te_lw.wih_fwd = w.text_lstm_wih_fwd;
-        te_lw.whh_fwd = w.text_lstm_whh_fwd;
-        te_lw.wih_rev = w.text_lstm_wih_rev;
-        te_lw.whh_rev = w.text_lstm_whh_rev;
-        make_lstm_fp16(te_lw, 512, 256);
-    }
-
-    // Duration encoder LSTMs (input=640, hidden=256)
-    for (int i = 0; i < 3; i++)
-        make_lstm_fp16(w.dur_enc_lstm[i], 640, 256);
-
-    // Duration LSTM (input=640, hidden=256)
-    make_lstm_fp16(w.dur_lstm, 640, 256);
-
-    // Shared LSTM (input=640, hidden=256)
-    make_lstm_fp16(w.shared_lstm, 640, 256);
-
-    // Duration projection: [50, 512]
-    make_fp16(w.dur_proj_w, 50 * 512);
-
-    // AdaLayerNorm FC weights: [1024, 128]
-    for (int i = 0; i < 3; i++)
-        make_fp16(w.dur_enc_aln[i].fc_w, 1024 * 128);
-
-    // AdaIN1d FC weights for F0/N blocks, decoder encode/decode, generator
-    auto make_adain_fp16 = [&](const Weights::AdaIN1dWeights& ain, int C, int style_dim) {
-        make_fp16(ain.fc_w, 2 * C * style_dim);
-    };
-
-    auto make_resblk_fp16 = [&](const Weights::AdainResBlk1dWeights& blk,
-                                 int dim_in, int dim_out) {
-        make_fp16(blk.conv1_wv, dim_out * dim_in * 3);
-        make_fp16(blk.conv2_wv, dim_out * dim_out * 3);
-        make_nhwc_f16(blk.conv1_wv, dim_out, dim_in, 3);
-        make_nhwc_f16(blk.conv2_wv, dim_out, dim_out, 3);
-        // Padded FP16 for unaligned C_in (e.g., 514→520, 1090→1096)
-        make_nhwc_f16_padded(blk.conv1_wv, dim_out, dim_in, 3);
-        make_adain_fp16(blk.norm1, dim_in, 128);
-        make_adain_fp16(blk.norm2, dim_out, 128);
-        if (blk.has_shortcut)
-            make_fp16(blk.conv1x1_wv, dim_out * dim_in * 1);
-    };
-
-    // F0/N blocks
-    {
-        int dim_in[]  = {512, 512, 256};
-        int dim_out[] = {512, 256, 256};
-        for (auto* blocks : {w.f0_blocks, w.n_blocks})
-            for (int i = 0; i < 3; i++)
-                make_resblk_fp16(blocks[i], dim_in[i], dim_out[i]);
-    }
-
-    // Decoder encode: 514→1024
-    make_resblk_fp16(w.dec_encode, 514, 1024);
-
-    // Decoder decode blocks
-    for (int i = 0; i < Weights::DEC_N_DECODE; i++) {
-        int dim_in = 1090;
-        int dim_out = (i < 3) ? 1024 : 512;
-        make_resblk_fp16(w.dec_decode[i], dim_in, dim_out);
-    }
-
-    // Generator ups (ConvTranspose1d): [C_in, C_out, K]
-    {
-        int up_cin[]  = {512, 256};
-        int up_cout[] = {256, 128};
-        int up_k[]    = {20, 12};
-        for (int i = 0; i < Weights::GEN_N_UPS; i++)
-            make_fp16(w.gen_ups[i].wv, up_cin[i] * up_cout[i] * up_k[i]);
-    }
-
-    // Generator resblocks (AdaINResBlock1)
-    auto make_resblock1_fp16 = [&](const Weights::AdaINResBlock1Weights& rb) {
-        int C = rb.channels, K = rb.kernel_size;
-        for (int j = 0; j < 3; j++) {
-            make_fp16(rb.convs1[j].wv, C * C * K);
-            make_fp16(rb.convs2[j].wv, C * C * K);
-            make_nhwc_f16(rb.convs1[j].wv, C, C, K);
-            make_nhwc_f16(rb.convs2[j].wv, C, C, K);
-            make_adain_fp16(rb.adain1[j], C, 128);
-            make_adain_fp16(rb.adain2[j], C, 128);
-        }
-    };
-
-    for (int i = 0; i < Weights::GEN_N_RESBLOCKS; i++)
-        make_resblock1_fp16(w.gen_resblocks[i]);
-
-    for (int i = 0; i < Weights::GEN_N_UPS; i++)
-        make_resblock1_fp16(w.gen_noise_res[i]);
-
-    // Generator conv_post: [22, 128, 7]
-    make_fp16(w.gen_conv_post_wv, 22 * 128 * 7);
-    make_nhwc_f16(w.gen_conv_post_wv, 22, 128, 7);
-
-    // Generator noise_convs (not weight-normed): [C_out, C_in, K]
-    make_fp16(w.gen_noise_convs[0].w, 128 * 22 * 12);
-    make_nhwc_f16(w.gen_noise_convs[0].w, 128, 22, 12);
-
-    // Decoder asr_res: Conv1d(512→64, k=1)
-    make_fp16(w.dec_asr_res_wv, 64 * 512);
-
-    // ---- Allocate FP16 activation staging buffer ----
-    // Sized for the largest activation cast: generator resblock conv at ~36k frames
-    // 128 channels * 40000 frames * sizeof(half) ≈ 10 MB; allocate 16 MB
-    s_fp16_buf_size = 16 * 1024 * 1024;
+    w.assign_v2_fp16_pointers();
+    // Staging buffer sized for largest activation cast: generator resblock conv
+    // at max ~90k frames * 128 channels * sizeof(half) ≈ 23 MB. Allocate 64 MB.
+    s_fp16_buf_size = 64 * 1024 * 1024;
     CUDA_CHECK(cudaMalloc(&s_fp16_buf, s_fp16_buf_size));
 
-    cudaStreamSynchronize(stream);
-
-    fprintf(stderr, "  FP16 weights: %zu matrices converted, %.1f MB\n",
-            s_fp16_weights.size(),
-            [&]() {
-                size_t total = 0;
-                for (auto& [k, v] : s_fp16_weights) { (void)k; (void)v; total++; }
-                // Rough estimate: average 0.5M params * 2 bytes = 1 MB per entry
-                return s_fp16_weights.size() * 0.5;  // placeholder
-            }());
+    // Verify FP16 pointers were populated
+    int n_f16 = 0;
+    auto chk = [&](const __half* p) { if (p) n_f16++; };
+    chk(w.bert_proj_w_f16);
+    chk(w.albert.q_w_f16); chk(w.albert.k_w_f16); chk(w.albert.v_w_f16);
+    chk(w.albert.dense_w_f16); chk(w.albert.ffn_w_f16); chk(w.albert.ffn_out_w_f16);
+    chk(w.bert_enc_w_f16);
+    for (int i = 0; i < 3; i++) chk(w.text_conv[i].conv_wv_nhwc_f16);
+    chk(w.text_lstm_wih_fwd_f16); chk(w.text_lstm_whh_fwd_f16);
+    chk(w.dur_proj_w_f16);
+    chk(w.dec_encode.conv1_wv_nhwc_f16);
+    for (int i = 0; i < 6; i++) chk(w.gen_resblocks[i].convs1[0].wv_nhwc_f16);
+    fprintf(stderr, "  FP16 binary: %d key pointers set, staging=64 MB\n", n_f16);
 }

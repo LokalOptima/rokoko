@@ -23,7 +23,7 @@
 
 #include <cuda_runtime.h>
 
-#include "weights.h"
+#include "rokoko_common.h"
 #include "kernels.h"
 #include "normalize.h"
 #include "g2p.h"
@@ -392,6 +392,7 @@ int main(int argc, char** argv) {
             "  --serve [port]      HTTP server with web UI (default: 8080)\n"
             "  --host <addr>       Server bind address (default: 0.0.0.0)\n"
             "  --bundle <file>     Model bundle (default: ~/.cache/rokoko/rokoko.bundle)\n"
+            "  --weights <file>    Standalone .koko weight file (overrides bundle weights)\n"
             "  --help              Show this help\n"
             "\n"
             "Examples:\n"
@@ -411,6 +412,7 @@ int main(int argc, char** argv) {
 
     std::string home = std::getenv("HOME") ? std::getenv("HOME") : ".";
     std::string bundle_path = home + "/.cache/rokoko/rokoko.bundle";
+    std::string weights_path;  // standalone .koko file (overrides bundle weights)
     std::string text_input;
     std::string voice_name = "af_heart";
     std::string output_path = "output.wav";
@@ -421,6 +423,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--bundle" && i + 1 < argc)       bundle_path = argv[++i];
+        else if (arg == "--weights" && i + 1 < argc) weights_path = argv[++i];
         else if (arg == "--voice" && i + 1 < argc)   voice_name = argv[++i];
         else if (arg == "-o" && i + 1 < argc)        output_path = argv[++i];
         else if (arg == "--stdout")                   output_path = "-";
@@ -506,7 +509,11 @@ int main(int argc, char** argv) {
     // --- Load TTS weights (prefetch in background) + init CUDA ---
     Weights prefetched;
     std::thread prefetch_thread([&]() {
-        prefetched = Weights::prefetch(weights_span.data, weights_span.size);
+        if (!weights_path.empty()) {
+            prefetched = Weights::prefetch(weights_path);
+        } else {
+            prefetched = Weights::prefetch(weights_span.data, weights_span.size);
+        }
     });
     cudaFree(0); // lazy CUDA init
     prefetch_thread.join();

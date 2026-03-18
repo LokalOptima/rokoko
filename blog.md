@@ -3379,3 +3379,146 @@ Removed ~400 lines of dead code accumulated from optimization iterations:
 - Saves ~30s compile time (2 fewer Cutlass template instantiations)
 
 **Stale comments**: Updated cuBLAS references across `tts.cpp`, `weights.h`, `kernels.h`, `cutlass_conv.cu`, `cutlass_gemm.cu`, `main.cu`.
+
+---
+
+## Round 11: FP16 Mixed-Precision Weights
+
+**Goal**: Use FP16 Tensor Cores (175.8 TFLOPS on RTX 5070 Ti) instead of TF32 (43.9 TFLOPS). Convert weight matrices to half precision; keep activations/accumulator/output in FP32.
+
+### Approach
+
+1. After weight norms, cast 191 weight matrices to FP16 (~95 MB extra GPU memory)
+2. Before each GEMM/Conv, cast FP32 activations to FP16 into a 16 MB staging buffer
+3. Use FP16 MMA instruction `GemmShape<16,8,16>` (vs TF32 `<16,8,8>`)
+4. Accumulator and output stay FP32 — no quality loss in non-linear ops
+5. GEMV (LSTM Whh) reads FP16 weights with FP32 x directly — memory-bound, no cast needed
+
+**Graceful fallback**: Convolutions with unaligned channels (C_in % 8 ≠ 0: 1090, 514, 22) automatically fall back to TF32 path.
+
+### New files
+
+| File | Purpose |
+|------|---------|
+| `src/cutlass_gemm_f16.cu` | FP16 GEMM: TN, NN, TN+bias, tiered dispatch (Large/Small/Align1/SIMT) |
+| `src/cutlass_conv_f16.cu` | FP16 implicit GEMM Conv1d + fused reshape+cast kernel for NHWC weights |
+| `scripts/compare_wav.py` | Mel spectrogram SNR comparison (80-bin log mel, n_fft=1024, hop=256) |
+
+### nsys Profiling (medium text, 5.7s audio)
+
+| Kernel category | FP32 time | FP16 time | Change |
+|----------------|-----------|-----------|--------|
+| Cutlass Conv Large (48 calls) | 8.7ms | 4.5ms | **−48%** |
+| Cutlass Conv SIMT→FP16 Small (88 calls) | 3.4ms | 1.8ms | **−47%** |
+| Cutlass GEMM (FP16-eligible) | 4.3ms | 2.6ms | **−40%** |
+| cast_f32_to_f16 overhead | — | +1.7ms | 519 calls × 3.2μs |
+| GEMV FP16 (LSTM Whh, 1826 calls) | 2.5ms | 2.3ms | −8% |
+| **Net kernel savings** | | | **5.8ms** |
+
+**Still on TF32** (unaligned channels): 3.5ms of Conv/GEMM can't use FP16 due to C_in=1090/514/22.
+
+### Verification
+
+- **Paraketto STT**: 3/3 texts PASS (short/medium/long) — identical transcriptions
+- **Mel spectrogram SNR**: 29.2 dB (positive control noise floor: 35 dB, negative control: −1.7 dB)
+
+### bench.sh Results
+
+| Text | FP32 TTS | FP16 TTS | Speedup | FP32 RTFx | FP16 RTFx |
+|------|----------|----------|---------|-----------|-----------|
+| Short (1.6s) | 9.48ms | 8.07ms | 15% | 150x | 159x |
+| Medium (5.7s) | 22.73ms | 18.25ms | 20% | 229x | 271x |
+| Long (18.8s) | 58.08ms | 52.77ms | 9% | 296x | 324x |
+
+### Waste identified (next steps)
+
+1. **cast_f32_to_f16: 1.7ms** (519 calls) — 30% of savings eaten by activation casting. Fix: keep activations in FP16 throughout pipeline, or fuse cast into preceding kernels.
+2. **TF32 fallback for unaligned channels: 3.5ms** — decoder bottleneck at 1090/514 channels. Fix: pad channels to alignment boundary.
+3. **GEMV FP16: marginal** — 1826 LSTM Whh calls at 1.3μs each are launch-overhead-bound. FP16 only saves 8%. Not worth optimizing further.
+
+---
+
+## Round 12: Pad Unaligned Decoder Channels
+
+**Problem**: 14 decoder conv1 calls with C_in=514 or C_in=1090 can't use FP16 TensorOp (requires C_in % 8 == 0). They fall back to TF32 Cutlass, costing 3.9ms on medium text.
+
+**Fix**: Pad weights at startup and activations at cast time:
+- New `pad_blocks_f32` kernel: zero-pads conv weight C_in from 514→520, 1090→1096 (one-time at init)
+- New `cast_f32_to_f16_pad` kernel: casts `[T, C_old]` FP32 → `[T, C_new]` FP16 with zero-padded channels
+- `gemm_conv1d` gains a padded FP16 path: when C_in % 8 ≠ 0 and a padded NHWC FP16 weight exists, uses the pad+cast path
+- `s_w_nhwc_f16_padded` map: stores padded NHWC FP16 weights alongside C_in_pad
+
+Only the conv1 weights in each block need padding (conv2 inputs are already aligned, shortcut is K=1 GEMM).
+
+### bench.sh Results
+
+| Text | Before | After | Delta |
+|------|--------|-------|-------|
+| Short (1.6s) | 8.07ms | 6.45ms | −1.62ms (−20%) |
+| Medium (5.7s) | 18.25ms | 16.57ms | −1.68ms (−9%) |
+| Long (18.8s) | 52.77ms | 51.43ms | −1.34ms (−3%) |
+
+STT 3/3 PASS.
+
+---
+
+## Round 13: FP16 Binary (Two Binaries, Two Weight Formats)
+
+**Goal**: Eliminate all runtime weight preparation. Pre-bake weight norm, NHWC reshape, channel padding, FP16 casting, and LSTM bias precomputation into a v2 weight file. The FP16 binary loads v2 weights and calls Cutlass FP16 directly — no maps, no fallback, zero startup compute.
+
+### Architecture
+
+Two binaries, two weight files:
+```
+make rokoko       # FP32 binary, loads v1 weights (runtime conversion)
+make rokoko.fp16  # FP16 binary, loads v2 weights (pre-baked FP16)
+```
+
+Both link the same `main.o`. The linker resolves `rokoko_infer()` and `precompute_weight_norms()` from whichever `.cpp` is linked.
+
+### File layout
+
+| File | Purpose |
+|------|---------|
+| `src/rokoko.cpp` | FP32 inference: GEMM wrappers with map-based FP16 dispatch + fallback chain |
+| `src/rokoko_f16.cpp` | FP16 inference: direct Cutlass FP16 calls, no maps, no fallback |
+| `src/rokoko_common.h` | Shared: WAV I/O, `compute_decode_bytes`, buffer structs |
+| `src/weights.h` | `__half*` companion fields alongside `float*` for all weight matrices |
+| `src/weights.cpp` | `assign_v2_fp16_pointers()`: suffix-matching over v2 tensor names |
+| `scripts/convert_v2.py` | Standalone Python converter: v1 KOKO → v2 KOKO (numpy, no GPU) |
+
+### KOKO v2 Weight Format
+
+Same structure as v1 but version=2 and mixed dtypes per tensor:
+```
+[4B "KOKO"] [4B version=2] [8B header_len]
+[text header: "name offset size_bytes dtype shape..."]
+[padding to 4096]
+[data blob: 256-byte aligned tensors]
+```
+
+Tensor suffixes: `.f16` (FP16 GEMM), `.nhwc_f16` (NHWC FP16 conv), `.nhwc_f16_pad{N}` (padded NHWC FP16), `.bias_combined_fwd/rev` (precomputed LSTM bias).
+
+The Python converter applies all transforms on CPU: weight norm, NHWC reshape, channel padding (514→520, 1090→1096, 22→24), FP16 cast, LSTM bias = bih + bhh. 966 tensors total (688 base + 192 FP16 + 74 NHWC + 12 bias), 589 MB on disk.
+
+### Key differences in rokoko_f16.cpp
+
+- **GEMM wrappers take `const __half*`**: always call Cutlass FP16, no `s_fp16_weights` map lookup
+- **`gemm_conv1d` takes `const __half*` NHWC weight**: K=1 → GEMM, K>1 → Cutlass FP16 conv. Optional `C_in_pad` for padded channels
+- **`precompute_weight_norms`**: just `w.assign_v2_fp16_pointers()` + staging buffer alloc. Zero GPU compute
+- **conv_post (C_out=22)**: im2col + FP16 GEMM directly (workspace-based staging, not s_fp16_buf)
+- **bilstm_gpu**: takes `__half*` wih/whh directly from struct, always FP16 GEMV
+
+### bench.sh Results
+
+| Text | FP32 (v1 weights) | FP16 (v2 weights) | Delta |
+|------|-------|-------|-------|
+| Short (1.6s) | 6.44ms | 6.45ms | ~same |
+| Medium (5.7s) | 16.59ms | 16.66ms | ~same |
+| Long (18.8s) | 51.49ms | 48.02ms | **−3.47ms (−6.7%)** |
+
+RTFx: 347x (long, FP16 binary). STT 3/3 PASS on both binaries.
+
+The long text improvement comes from slightly more efficient CUDA graph capture (no fallback dispatch logic baked in). Init time for precompute_weight_norms drops from ~80ms to ~0ms (pointer assignment only), but this is offset by the larger v2 file upload (589 MB vs 327 MB). Net init is similar.
+
+**Next step**: strip redundant FP32 weight matrices from v2 file (keep only biases/norms/embeddings in FP32). This would cut v2 to ~260 MB and make init genuinely faster.
