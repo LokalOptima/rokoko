@@ -1,4 +1,4 @@
-// cutlass_gemm.cu — Cutlass GEMM replacing cuBLAS/cuBLASLt
+// cutlass_gemm.cu — Cutlass GEMM kernels for all linear algebra
 //
 // Three layout combinations (TN, NT, NN) × two TF32 tile sizes + SIMT fallback.
 // Batched variants for attention (TN, NN).
@@ -41,7 +41,7 @@ using Arch    = cutlass::arch::Sm80;
 // ---------------------------------------------------------------------------
 // GEMM kernel type definitions
 //   Naming: Gemm{LayoutA}{LayoutB}_{OpClass}_{Tile}
-//   TN = A RowMajor (cuBLAS OP_T on col-major), B ColumnMajor (cuBLAS OP_N)
+//   TN = A RowMajor, B ColumnMajor
 //   NT = A ColumnMajor, B RowMajor
 //   NN = A ColumnMajor, B ColumnMajor
 // ---------------------------------------------------------------------------
@@ -160,14 +160,6 @@ using GemmBatchedTN_TF32 = cutlass::gemm::device::GemmBatched<
     cutlass::gemm::GemmShape<16, 8, 8>,
     EpilogueTF32, BatchedSwizzle, 3>;
 
-using GemmBatchedTN_SIMT = cutlass::gemm::device::GemmBatched<
-    Element, LayoutRM, Element, LayoutCM, Element, LayoutCM, Accumulator,
-    cutlass::arch::OpClassSimt, Arch,
-    cutlass::gemm::GemmShape<64, 64, 8>,
-    cutlass::gemm::GemmShape<32, 32, 8>,
-    cutlass::gemm::GemmShape<1, 1, 1>,
-    EpilogueSIMT, BatchedSwizzle, 4>;
-
 // ---- Batched NN (attention scores*V) ----
 
 using GemmBatchedNN_TF32 = cutlass::gemm::device::GemmBatched<
@@ -177,14 +169,6 @@ using GemmBatchedNN_TF32 = cutlass::gemm::device::GemmBatched<
     cutlass::gemm::GemmShape<32, 32, 16>,
     cutlass::gemm::GemmShape<16, 8, 8>,
     EpilogueTF32, BatchedSwizzle, 3>;
-
-using GemmBatchedNN_SIMT = cutlass::gemm::device::GemmBatched<
-    Element, LayoutCM, Element, LayoutCM, Element, LayoutCM, Accumulator,
-    cutlass::arch::OpClassSimt, Arch,
-    cutlass::gemm::GemmShape<64, 64, 8>,
-    cutlass::gemm::GemmShape<32, 32, 8>,
-    cutlass::gemm::GemmShape<1, 1, 1>,
-    EpilogueSIMT, BatchedSwizzle, 4>;
 
 // ---------------------------------------------------------------------------
 // Operator caches
@@ -246,9 +230,7 @@ struct BatchedKeyHash {
 };
 
 static std::unordered_map<BatchedKey, GemmBatchedTN_TF32, BatchedKeyHash> s_batched_tn_tf32;
-static std::unordered_map<BatchedKey, GemmBatchedTN_SIMT, BatchedKeyHash> s_batched_tn_simt;
 static std::unordered_map<BatchedKey, GemmBatchedNN_TF32, BatchedKeyHash> s_batched_nn_tf32;
-static std::unordered_map<BatchedKey, GemmBatchedNN_SIMT, BatchedKeyHash> s_batched_nn_simt;
 
 // ---------------------------------------------------------------------------
 // Tile selection threshold
@@ -310,9 +292,9 @@ static bool tf32_align1(int K) {
 
 // ---------------------------------------------------------------------------
 // cutlass_gemm_tn: C = alpha * A^T * B + beta * C
-//   cuBLAS convention: A stored [K, M] col-major → RowMajor [M, K]
-//                      B stored [K, N] col-major → ColumnMajor [K, N]
-//                      C stored [M, N] col-major → ColumnMajor [M, N]
+//   A stored [K, M] col-major → RowMajor [M, K]
+//   B stored [K, N] col-major → ColumnMajor [K, N]
+//   C stored [M, N] col-major → ColumnMajor [M, N]
 // ---------------------------------------------------------------------------
 
 extern "C"

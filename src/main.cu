@@ -531,28 +531,43 @@ int main(int argc, char** argv) {
             prop.name, ms(t_start, t_init),
             prefetched.gpu_data_size / 1e6, g2p.param_bytes() / 1e6);
 
-    // --- cuBLAS handles ---
     // --- Voice map ---
     VoiceMap voices = build_voice_map(bundle);
+
+    // --- Pre-allocate arenas + workspace ---
+    static constexpr size_t ENCODE_ARENA_BYTES = 64 * 1024 * 1024;  // 64 MB
+    static constexpr size_t WORKSPACE_BYTES    = 128 * 1024 * 1024; // 128 MB
+
+    GpuArena encode_arena;
+    encode_arena.init(ENCODE_ARENA_BYTES);
+    GpuArena decode_arena;  // starts empty, grows on first use
+    float* d_workspace;
+    CUDA_CHECK(cudaMalloc(&d_workspace, WORKSPACE_BYTES));
+
+    // --- Pre-warm: populate Cutlass operator caches + CUDA graphs ---
+    {
+        auto vit = voices.find("af_heart");
+        if (vit != voices.end()) {
+            const float* voice_data = reinterpret_cast<const float*>(vit->second.start);
+            const float* style = voice_data;  // row 0
+            auto warmup_ipa = g2p.infer("Warmup.", stream);
+            auto warmup_tokens = to_tokens(warmup_ipa.empty() ? "." : warmup_ipa);
+            rokoko_infer(prefetched, warmup_tokens.data(), (int)warmup_tokens.size(),
+                         style, stream, encode_arena, decode_arena,
+                         d_workspace, WORKSPACE_BYTES);
+            cudaStreamSynchronize(stream);
+        }
+        auto t_warm = clk::now();
+        fprintf(stderr, "Pre-warm: %.0f ms\n", ms(t_init, t_warm));
+    }
+
+    fprintf(stderr, "Encode arena: %.0f MB | Workspace: %.0f MB | Decode arena: on demand\n",
+            ENCODE_ARENA_BYTES / 1e6, WORKSPACE_BYTES / 1e6);
 
     // =======================================================================
     // Server mode
     // =======================================================================
     if (serve_mode) {
-        // Pre-allocate arenas + workspace
-        static constexpr size_t ENCODE_ARENA_BYTES = 64 * 1024 * 1024;  // 64 MB
-        static constexpr size_t WORKSPACE_BYTES    = 128 * 1024 * 1024; // 128 MB
-
-        GpuArena encode_arena;
-        encode_arena.init(ENCODE_ARENA_BYTES);
-        GpuArena decode_arena;  // starts empty, grows on first use
-
-        float* d_workspace;
-        CUDA_CHECK(cudaMalloc(&d_workspace, WORKSPACE_BYTES));
-
-        fprintf(stderr, "Encode arena: %.0f MB | Workspace: %.0f MB | Decode arena: on demand\n",
-                ENCODE_ARENA_BYTES / 1e6, WORKSPACE_BYTES / 1e6);
-
         TtsPipeline pipeline{prefetched, g2p, stream,
                              encode_arena, decode_arena, d_workspace, WORKSPACE_BYTES, voices};
 
@@ -605,16 +620,6 @@ int main(int argc, char** argv) {
 
     // --- TTS infer per chunk ---
     std::vector<float> all_audio;
-
-    // Pre-allocate encode arena + workspace (shared across chunks)
-    static constexpr size_t ENCODE_ARENA_BYTES = 64 * 1024 * 1024;  // 64 MB
-    static constexpr size_t WORKSPACE_BYTES    = 128 * 1024 * 1024; // 128 MB
-
-    GpuArena encode_arena;
-    encode_arena.init(ENCODE_ARENA_BYTES);
-    GpuArena decode_arena;  // starts empty, grows on first use
-    float* d_workspace;
-    CUDA_CHECK(cudaMalloc(&d_workspace, WORKSPACE_BYTES));
 
     for (size_t c = 0; c < chunks.size(); c++) {
         auto& chunk = chunks[c];

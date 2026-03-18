@@ -1,6 +1,6 @@
 // cutlass_conv.cu — Cutlass implicit GEMM Conv1d (via Conv2d with H=1)
 //
-// Replaces im2col + cuBLAS SGEMM with a single Cutlass kernel launch.
+// Cutlass implicit GEMM Conv1d: single fused kernel per convolution.
 // Two TF32 TensorOp tile sizes: 128x128 (large problems) and 64x64 (small).
 // SIMT fallback for unaligned channels (C not divisible by 4).
 // Fuses per-channel bias into the GEMM epilogue.

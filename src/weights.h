@@ -2,7 +2,6 @@
 //
 // Defines:
 //   Weights  — pointers into GPU weight allocation (loaded from weights.bin)
-//   CudaModel — pre-allocated buffers + cuBLAS handle for forward passes
 
 #pragma once
 

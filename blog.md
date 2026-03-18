@@ -3122,6 +3122,68 @@ Across rounds 5-7, Cutlass implicit GEMM went from **1.8x slower** to **exact pa
 
 ---
 
+## 2026-03-15: Optimization Round 8 — Dual-Tile Cutlass + Depthwise Fix
+
+### Tile Selection
+
+The 128x128 TF32 tile from Round 7 left 94% of SMs idle on short text — only 4 CTAs for 70 SMs. Added a 64x64x16 TF32 tile that fires when `ceil(C_out/128)*ceil(T_out/128) < SM_COUNT`. This 4x increase in CTA count recovers SM occupancy on small problems while keeping the high-throughput 128x128 tile for large ones.
+
+Also fixed `conv_transpose1d_depthwise` — was launching 1 thread per block instead of 256 threads. This was a silent correctness bug (output was correct but slow).
+
+### Results
+
+```
+=== Dual-Tile (bench.sh, 30 runs) ===
+  Short:   9.76ms / 146x RTFx  (was 11.8ms — 1.21x faster)
+  Medium: 26.50ms / 201x RTFx  (was 27.5ms — 1.04x faster)
+  Long:   71.37ms / 248x RTFx  (was 71.9ms — holds)
+```
+
+---
+
+## 2026-03-15: Optimization Round 9 — Residual Fusion + Snake Fusion
+
+### Residual Add → Cutlass Epilogue
+
+In generator resblocks, the pattern was: `conv → add(conv_out, residual)`. Extended `cutlass_conv1d_fprop` with a `residual` pointer parameter — Cutlass accumulates directly into the residual buffer (`C=residual, beta=1`), then `channel_bias_add` handles bias separately. Eliminates 27 `add_f32` kernels per inference and 33% less memory traffic per fused site.
+
+### Snake → Instance Norm Kernel
+
+Snake activation (`x + sin²(αx)/α`) always followed the AdaIN instance norm in generator resblocks. Added optional `snake_alpha` parameter to `instnorm_style_norm_kernel` — computes norm + snake in a single memory pass instead of separate write + read/write. Eliminates 48 kernel launches.
+
+### Results
+
+```
+Long: 68.2ms → 65.6ms (269x RTFx, +41% vs cuBLAS baseline)
+STT: short PASS, medium PASS, long PASS
+```
+
+---
+
+## 2026-03-15: Optimization Round 10 — CUDA Graph Decode + L-Bucketing
+
+### Decode Graph
+
+Wrapped the entire decode phase in a CUDA graph — captured on first inference, replayed on subsequent calls with the same `(T, L_bucketed)` key. L is rounded up to the nearest multiple of 32 so different utterances that produce similar frame counts share a single cached graph.
+
+Key changes:
+- Decode graph cache keyed by `(T, L_padded)`, with arena-base invalidation when the decode arena grows
+- SineGen `rand_ini` moved to a persistent device buffer (`seed=42`) to avoid per-call randomness that prevents graph replay
+- Async `cudaMemcpyAsync` for host→device token upload, overlapped with graph dispatch
+
+### Results
+
+```
+=== CUDA Graph Decode (bench.sh, 30 runs) ===
+  Short:   8.13ms / 173x RTFx
+  Medium: 23.81ms / 222x RTFx
+  Long:   60.79ms / 289x RTFx
+```
+
+Compared to Round 8 (dual-tile): 1.2x faster on short, 1.1x on medium, 1.17x on long. The biggest win is on short text where launch overhead was a larger fraction of total time.
+
+---
+
 ## 2026-03-17: LSTM Fusion — Four Approaches, Zero Improvement
 
 ### Motivation
@@ -3224,3 +3286,96 @@ The fundamental reason: **CUDA graph node dispatch overhead on RTX 5070 Ti is ne
 4. **CUDA graphs on modern GPUs have very low per-node overhead.** The RTX 5070 Ti (SM120/Blackwell) dispatches graph nodes at ~0.3μs each. This makes "reduce graph node count" a much weaker optimization lever than expected.
 
 5. **Always A/B test against the actual baseline.** Comparing against stale benchmark numbers can produce phantom improvements. The proper comparison revealed our Approach 4 was a wash, not the "1.5x speedup" initially measured against outdated numbers.
+
+---
+
+## 2026-03-18: Dropping cuBLAS — Cutlass + Custom Kernels Only
+
+### Motivation
+
+With Cutlass implicit GEMM for convolutions and Cutlass batched GEMM for G2P attention already in place, cuBLAS was only used for:
+- `cublasSgemm` for TTS linear layers (ALBERT attention, text encoder projections, predictor)
+- `cublasSgemv` for small matrix-vector products (style FC layers, [D, 128] × [128])
+- `cublasSgemmBatched` for G2P attention (already migrated in the GEMM work)
+
+The goal: eliminate the last `libcublas`/`libcublasLt` dependency entirely.
+
+### Cutlass GEMM: The Full Tiered Architecture
+
+Created `cutlass_gemm.cu` with three layout combinations (TN, NT, NN) × four fallback tiers:
+
+1. **TF32 Large** (128×128×16): high per-CTA throughput for large problems
+2. **TF32 Small** (64×64×16): 4× more CTAs for small problems where Large under-fills the GPU
+3. **TF32 Align1**: handles M not divisible by 4 (SIMT epilogue with align-1 stores, but TF32 MMA compute)
+4. **SIMT**: no alignment requirements at all, for K not divisible by 4
+
+Plus batched variants (TN, NN) for G2P multi-head attention, and `cutlass_gemm_tn_bias` with stride-0 C source for fused bias broadcast.
+
+The tier selection is automatic — each `cutlass_gemm_*` function tries tiers in order and falls back on `can_implement()` failure. All use the same operator caching pattern from Round 6.
+
+### Custom GEMV Kernel
+
+For N=1 cases (style FC: [D, 128] × [128] → [D]), cuBLAS `Sgemv` was replaced with a custom `gemv_tn_f32` kernel. One warp per output row, 8 rows per block (256 threads total), warp-shuffle reduction over K. This handles the ~100 small matrix-vector products in the predictor.
+
+### The Alignment Bug
+
+Initial Cutlass GEMM integration produced NaN outputs and verification failures. Root cause: G2P workspace pointers were only 4-byte aligned, but Cutlass TensorOp requires 256-byte alignment for vectorized 128-bit loads. Fixed by adding `align256()` to all workspace pointer assignments in `g2p.h`.
+
+### Bias Fusion
+
+Added `cutlass_gemm_tn_bias()` using stride-0 C source layout — the same technique as `cutlass_conv.cu` residual fusion. The bias vector [M] is broadcast across all N columns via `LayoutCM(0)` (zero stride = same column repeated). This eliminates ~100 separate `channel_bias_add_f32` kernel launches per TTS inference.
+
+### G2P Graph Capture Fix
+
+Cutlass `initialize()` allocates internal state and can't run inside CUDA graph capture. Solution: first call for each input length T runs kernels directly (populates operator caches), graph capture deferred to the second call when all operators hit cache. Third+ calls replay the graph.
+
+### Results
+
+Performance matches the cuBLAS baseline within measurement noise — the goal was dependency elimination, not speedup:
+
+| Metric | cuBLAS | Cutlass |
+|--------|--------|---------|
+| Short (1.6s audio) | 8.13ms / 173x | ~8ms / ~175x |
+| Long (18.8s audio) | 60.79ms / 289x | ~60ms / ~290x |
+| Binary dependencies | libcublas + libcublasLt | none (Cutlass is header-only) |
+
+### What We Removed
+
+- `libcublas`, `libcublasLt` from linker flags
+- All `cublas*.h` includes
+- `cublasHandle_t` creation/destruction in `main.cu`
+- 2 shared libraries (~120 MB on disk) no longer loaded at runtime
+
+### Files Changed
+
+| File | Changes |
+|---|---|
+| `src/cutlass_gemm.cu` | New — TN/NT/NN × 4 tiers + batched + bias fusion |
+| `src/kernels.cu` | Added `gemv_tn_f32` kernel |
+| `src/kernels.h` | Added GEMV declaration |
+| `src/tts.cpp` | Replaced cuBLAS wrappers with Cutlass GEMM calls |
+| `src/g2p.h` | 256-byte workspace alignment, deferred graph capture |
+| `Makefile` | Removed `-lcublas -lcublasLt` |
+
+---
+
+## 2026-03-18: Code Cleanup
+
+Removed ~400 lines of dead code accumulated from optimization iterations:
+
+**Dead kernels** (9 removed from `kernels.cu` + `kernels.h`):
+- `fused_lstm_f32` — failed LSTM fusion attempt (Round LSTM)
+- `sigmoid_f32` — replaced by fused `sigmoid_sum_f32`
+- `cast_i64_to_i32` — token IDs are int32 now
+- `instance_norm_1d_f32` — replaced by `instance_norm_style_affine_f32`
+- `style_affine_1d_f32` — fused into instance_norm
+- `snake_f32` — fused into instance_norm via snake_alpha (Round 9)
+- `conv_transpose1d_f32` — replaced by `gemm_conv_transpose1d`
+- `upsample_nearest_f32` — replaced by `upsample_nearest_1d_2x_f32`
+- `tanh_f32` — no callers
+
+**Dead Cutlass types** (2 removed from `cutlass_gemm.cu`):
+- `GemmBatchedTN_SIMT`, `GemmBatchedNN_SIMT` — batched SIMT fallback never instantiated (fallback uses loop of single GEMMs instead)
+- Saves ~30s compile time (2 fewer Cutlass template instantiations)
+
+**Stale comments**: Updated cuBLAS references across `tts.cpp`, `weights.h`, `kernels.h`, `cutlass_conv.cu`, `cutlass_gemm.cu`, `main.cu`.

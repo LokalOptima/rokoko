@@ -53,7 +53,7 @@ static float* s_workspace = nullptr;
 static size_t s_workspace_bytes = 0;
 
 // ---------------------------------------------------------------------------
-// GEMM wrappers: drop-in replacements for the old cuBLAS wrappers
+// GEMM wrappers (Cutlass)
 // ---------------------------------------------------------------------------
 
 // C = alpha * A^T * B + beta * C
@@ -121,8 +121,7 @@ extern "C" void cutlass_reshape_weights(const float* src, float* dst,
 static std::unordered_map<const float*, float*> s_w_nhwc;
 
 // ---------------------------------------------------------------------------
-// Conv1d forward: tries Cutlass implicit GEMM first (w_nhwc), falls back to
-// im2col + cuBLAS SGEMM (w in original [C_out, C_in, K] layout).
+// Conv1d forward: Cutlass implicit GEMM (w_nhwc), falls back to im2col + GEMM.
 // ---------------------------------------------------------------------------
 
 // gemm_conv1d: Conv1d forward.
@@ -173,7 +172,7 @@ static void gemm_conv1d(const float* x, const float* w, const float* bias,
     }
 }
 
-// im2col + cuBLAS ConvTranspose1d: GEMM + col2im
+// im2col + GEMM ConvTranspose1d: GEMM + col2im
 //   x[T_in, C_in] * w[C_in, C_out, K] → y[T_out, C_out]
 //   T_out = (T_in - 1) * stride - 2*padding + K + output_padding
 static void gemm_conv_transpose1d(const float* x, const float* w, const float* bias,
@@ -379,7 +378,7 @@ static void text_encoder_forward(const Weights& w, TextEncoderBuffers& buf,
 }
 
 // ---------------------------------------------------------------------------
-// GPU BiLSTM: cuBLAS SGEMM for gate pre-computation + kernel for nonlinearities
+// GPU BiLSTM: Cutlass GEMM for gate pre-computation + kernel for nonlinearities
 //   input: [T, input_size] on GPU, output: [T, 2*hidden_size] on GPU
 //
 //   1) Pre-compute input gates for all T at once:
@@ -1039,20 +1038,9 @@ std::vector<float> rokoko_infer(const Weights& w,
     // d_cat_buf is [T, 640] row-major = col-major [640, T]
     // alignment is [T, L] row-major = col-major [L, T]
     // We want result [L, 640] row-major = col-major [640, L]
-    // cuBLAS: C[640,L] = A[640,T] * B[T,L]
-    //   A=d_cat_buf (col-major [640,T]), OP_N
-    //   B=d_alignment (col-major [L,T]), OP_T → [T,L]
-    // Wait — alignment col-major [L,T] transposed gives [T,L] which is wrong.
-    // alignment row-major [T,L] = col-major [L,T], we want alignment^T = [L,T].
-    // cuBLAS: C[640,L] = A[640,T] × B[T,L]
-    //   B = alignment^T in row-major = [L,T], but alignment is stored col-major [L,T]
-    //   So OP_N on alignment gives [L,T] → that's T columns, but we need [T,L].
-    // Let me think in cuBLAS col-major terms:
-    //   Result: row-major [L, 640] = col-major [640, L], so m=640, n=L
-    //   C[640,L] = A[640,T] * B[T,L]
-    //   A = d_cat_buf stored as col-major [640, T], lda=640 → BUT d_cat_buf is row-major [T,640]
-    //     = col-major [640, T] with lda=640. YES.
-    //   B = d_alignment stored as col-major [L, T]. We need [T, L] so transb=OP_T, ldb=L
+    // GEMM: C[640,L] = A[640,T] * B[T,L]
+    //   A = d_cat_buf row-major [T,640] = col-major [640,T], lda=640
+    //   B = d_alignment row-major [T,L] = col-major [L,T], transposed → [T,L], ldb=L
     float* d_en_expanded = decode_arena.alloc<float>(L * 640);
     sgemm_nt(640, L, T,
              d_cat_buf, 640, d_alignment, L, d_en_expanded, 640, stream);

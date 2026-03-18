@@ -6,7 +6,6 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <cstdint>
 
 // ---------------------------------------------------------------------------
 // Embedding gather: y[i, :] = table[ids[i], :]
@@ -49,11 +48,6 @@ void gelu_f32(const float* x, float* y, int N, cudaStream_t stream);
 // ---------------------------------------------------------------------------
 void leaky_relu_f32(const float* x, float* y, int N, float alpha,
                     cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Sigmoid: y = 1 / (1 + exp(-x))
-// ---------------------------------------------------------------------------
-void sigmoid_f32(const float* x, float* y, int N, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Softmax over last dimension: y[n, :] = softmax(x[n, :])
@@ -100,29 +94,6 @@ void layer_norm_channels_first_f32(const float* x, const float* gamma,
                                     const float* beta, float* y,
                                     int C, int T, float eps,
                                     cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Convert int64 array to int32 (for phoneme IDs from Python)
-// ---------------------------------------------------------------------------
-void cast_i64_to_i32(const int64_t* src, int* dst, int N,
-                     cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Instance normalization 1D: normalize each channel across time
-//   x, y: [T, C], weight, bias: [C]
-//   For each c: y[t,c] = weight[c] * (x[t,c] - mean_c) / sqrt(var_c + eps) + bias[c]
-// ---------------------------------------------------------------------------
-void instance_norm_1d_f32(const float* x, const float* weight, const float* bias,
-                           float* y, float* workspace,  // [2*C] reduction buffer
-                           int C, int T, float eps,
-                           cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Style affine 1D: y[t,c] = (1 + gamma[c]) * x[t,c] + beta[c]
-//   x, y: [T, C], gamma, beta: [C]
-// ---------------------------------------------------------------------------
-void style_affine_1d_f32(const float* x, const float* gamma, const float* beta,
-                           float* y, int C, int T, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Fused InstanceNorm + StyleAffine: single-pass AdaIN
@@ -200,31 +171,6 @@ void conv1d_general_f32(const float* x, const float* w, const float* bias,
                         cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// ConvTranspose1d (non-depthwise, groups=1)
-//   x: [T_in, C_in], w: [C_in, C_out, K], b: [C_out] or nullptr
-//   y: [T_out, C_out]
-//   T_out = (T_in - 1) * stride - 2*padding + K + output_padding
-// ---------------------------------------------------------------------------
-void conv_transpose1d_f32(const float* x, const float* w, const float* bias,
-                          float* y, int C_in, int C_out, int T_in, int K,
-                          int stride, int padding, int output_padding,
-                          cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Snake activation: y = x + (1/alpha) * sin(alpha * x)^2
-//   x, y: [T, C], alpha: [C] (one per channel)
-// ---------------------------------------------------------------------------
-void snake_f32(const float* x, const float* alpha, float* y,
-               int C, int T, cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Nearest-neighbor upsampling with arbitrary integer factor
-//   x: [T_in, C], y: [T_in * factor, C]
-// ---------------------------------------------------------------------------
-void upsample_nearest_f32(const float* x, float* y, int C, int T_in,
-                           int factor, cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
 // Reflection pad 1D: pad left by pad_left, right by pad_right
 //   x: [T, C], y: [T + pad_left + pad_right, C]
 // ---------------------------------------------------------------------------
@@ -241,11 +187,6 @@ void exp_f32(const float* x, float* y, int N, cudaStream_t stream);
 // Element-wise sin: y = sin(x)
 // ---------------------------------------------------------------------------
 void sin_f32(const float* x, float* y, int N, cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Element-wise tanh: y = tanh(x)
-// ---------------------------------------------------------------------------
-void tanh_f32(const float* x, float* y, int N, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // STFT forward: compute magnitude and phase spectrograms
@@ -276,17 +217,7 @@ void lstm_gates_f32(const float* gates, const float* c_prev,
                      cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Fused LSTM: run ALL timesteps in a single kernel launch
-//   Whh: [4H, H], ig_all: [T, 4H] (pre-computed input gates)
-//   h_all: [T, H] output. reverse=1 for backward direction.
-// ---------------------------------------------------------------------------
-void fused_lstm_f32(const float* Whh, const float* ig_all,
-                     float* h_all, int T, int H, int reverse,
-                     cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
 // GEMV: y[M] = A[K, M]^T * x[K]  (A stored col-major [K, M])
-//   Replaces cuBLAS cublasSgemv(OP_T, K, M, ...) for small GEMV.
 //   alpha/beta: y = alpha * A^T * x + beta * y
 // ---------------------------------------------------------------------------
 void gemv_tn_f32(const float* A, int lda, const float* x,
