@@ -373,7 +373,6 @@ Weights Weights::prefetch(const std::string& path) {
     }
 
     w.gpu_data_size = total_data;
-    w.version = version;
     w.prefetch_base = (const uint8_t*)mapped + data_start;
     w.mmap_ptr = mapped;
     w.mmap_size = file_size;
@@ -426,7 +425,6 @@ Weights Weights::prefetch(const void* data, size_t size) {
     }
 
     w.gpu_data_size = total_data;
-    w.version = version;
     w.prefetch_base = base + data_start;
     // mmap_ptr stays nullptr — we don't own the mapping
     return w;

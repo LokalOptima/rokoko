@@ -8,10 +8,6 @@
 
 set -e
 
-# Take exclusive GPU lock for the entire benchmark so nothing else interferes
-exec 9>/tmp/gpu.lock
-flock --exclusive 9
-
 BINARY="${1:-./rokoko}"
 WARMUP="${2:-10}"
 RUNS="${3:-30}"
