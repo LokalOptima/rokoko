@@ -1663,7 +1663,7 @@ void precompute_weight_norms(Weights& w, cudaStream_t stream) {
 
     cudaStreamSynchronize(stream);
 
-    fprintf(stderr, "  FP16 weights: %zu matrices converted, %.1f MB\n",
+    vlog("  FP16 weights: %zu matrices converted, %.1f MB\n",
             s_fp16_weights.size(),
             [&]() {
                 size_t total = 0;

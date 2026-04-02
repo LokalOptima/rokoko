@@ -684,8 +684,8 @@ const std::vector<int>* Weights::get_shape(const std::string& name) const {
 // ---------------------------------------------------------------------------
 
 void Weights::print_info() const {
-    fprintf(stderr, "weights: %zu tensors, %.1f MB GPU\n",
-            tensors.size(), gpu_data_size / (1024.0 * 1024.0));
+    vlog("weights: %zu tensors, %.1f MB GPU\n",
+         tensors.size(), gpu_data_size / (1024.0 * 1024.0));
 
     int missing = 0;
     auto check = [&](const char* label, const float* ptr) {
@@ -746,6 +746,6 @@ void Weights::print_info() const {
     if (missing) {
         fprintf(stderr, "  %d weight(s) missing!\n", missing);
     } else {
-        fprintf(stderr, "  all key weights found\n");
+        vlog("  all key weights found\n");
     }
 }

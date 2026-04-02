@@ -668,9 +668,9 @@ inline bool G2PModelCuda::load_from_file_(FILE* f, const char* label, cudaStream
 
     cudaStreamSynchronize(stream);
 
-    fprintf(stderr, "g2p_cuda: loaded %s (d=%d, %d layers, %d heads, %d ff, %dx up, %.1f MB, ws=%.1f MB)\n",
-            label, d_, n_layers_, heads_, ff_, up_,
-            total_bytes_ / (1024.0f * 1024.0f), workspace_bytes_ / (1024.0f * 1024.0f));
+    vlog("g2p_cuda: loaded %s (d=%d, %d layers, %d heads, %d ff, %dx up, %.1f MB, ws=%.1f MB)\n",
+         label, d_, n_layers_, heads_, ff_, up_,
+         total_bytes_ / (1024.0f * 1024.0f), workspace_bytes_ / (1024.0f * 1024.0f));
     return true;
 }
 

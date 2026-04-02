@@ -30,6 +30,8 @@
 #include "bundle.h"
 #include "server.h"
 
+bool g_verbose = false;
+
 // Backend-specific: each binary provides its own bundle URL + filename
 extern const char* default_bundle_url();
 extern const char* default_bundle_filename();
@@ -315,14 +317,14 @@ struct TtsPipeline {
         std::string preprocessed = text_norm::preprocess_text(text);
         auto t1 = clk::now();
         last_preprocess_ms = ms(t0, t1);
-        fprintf(stderr, "Preprocess: \"%s\" (%.1f ms)\n", preprocessed.c_str(), last_preprocess_ms);
+        vlog("Preprocess: \"%s\" (%.1f ms)\n", preprocessed.c_str(), last_preprocess_ms);
 
         // G2P
         t0 = clk::now();
         std::string ipa = g2p.infer(preprocessed, stream);
         t1 = clk::now();
         last_g2p_ms = ms(t0, t1);
-        fprintf(stderr, "G2P: \"%s\" (%.1f ms)\n", ipa.c_str(), last_g2p_ms);
+        vlog("G2P: \"%s\" (%.1f ms)\n", ipa.c_str(), last_g2p_ms);
 
         if (ipa.empty())
             return "G2P produced no output";
@@ -351,8 +353,8 @@ struct TtsPipeline {
             auto audio = rokoko_infer(weights, chunk.tokens.data(), T, style,
                                        stream, encode_arena,
                                        decode_arena, d_workspace, ws_bytes);
-            fprintf(stderr, "  chunk %zu: T=%d, %zu samples (%.2fs), decode arena=%.1f MB\n",
-                    c, T, audio.size(), audio.size()/24000.0, decode_arena.offset/1e6);
+            vlog("  chunk %zu: T=%d, %zu samples (%.2fs), decode arena=%.1f MB\n",
+                 c, T, audio.size(), audio.size()/24000.0, decode_arena.offset/1e6);
             total_samples += audio.size();
             if (!on_chunk(audio.data(), audio.size()))
                 return "";
@@ -362,8 +364,8 @@ struct TtsPipeline {
 
         double audio_sec = total_samples / 24000.0;
         double rtfx = audio_sec / (last_tts_ms / 1000.0);
-        fprintf(stderr, "TTS: %.3f sec in %.1f ms (%.0fx realtime, %zu chunks)\n",
-                audio_sec, last_tts_ms, rtfx, chunks.size());
+        vlog("TTS: %.3f sec in %.1f ms (%.0fx realtime, %zu chunks)\n",
+             audio_sec, last_tts_ms, rtfx, chunks.size());
 
         return "";
     }
@@ -392,18 +394,21 @@ int main(int argc, char** argv) {
             "Options:\n"
             "  --voice <name>      Voice (default: af_heart)\n"
             "  -o <file>           Output WAV (default: output.wav)\n"
+            "  --say               Play audio through speakers\n"
             "  --stdout            Write WAV to stdout\n"
             "  --serve [port]      HTTP server with web UI (default: 8080)\n"
             "  --host <addr>       Server bind address (default: 0.0.0.0)\n"
             "  --bundle <file>     Model bundle (default: ~/.cache/rokoko/rokoko.bundle)\n"
             "  --weights <file>    Standalone .koko weight file (overrides bundle weights)\n"
+            "  -v                  Verbose output (timings, IPA, GPU info)\n"
             "  --help              Show this help\n"
             "\n"
             "Examples:\n"
             "  %s \"Hello world.\" -o hello.wav\n"
+            "  %s \"Hello world.\" --say\n"
             "  %s \"Hello world.\" --stdout | aplay\n"
             "  %s --serve 8080\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0]);
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
     };
 
     if (argc < 2) { print_usage(); return 1; }
@@ -420,6 +425,7 @@ int main(int argc, char** argv) {
     std::string text_input;
     std::string voice_name = "af_heart";
     std::string output_path = "output.wav";
+    bool say_mode = false;
     bool serve_mode = false;
     int serve_port = 8080;
     std::string serve_host = "0.0.0.0";
@@ -431,6 +437,8 @@ int main(int argc, char** argv) {
         else if (arg == "--voice" && i + 1 < argc)   voice_name = argv[++i];
         else if (arg == "-o" && i + 1 < argc)        output_path = argv[++i];
         else if (arg == "--stdout")                   output_path = "-";
+        else if (arg == "--say")                     say_mode = true;
+        else if (arg == "-v" || arg == "--verbose")  g_verbose = true;
         else if (arg == "--host" && i + 1 < argc)    serve_host = argv[++i];
         else if (arg == "--serve") {
             serve_mode = true;
@@ -537,9 +545,9 @@ int main(int argc, char** argv) {
 
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
-    fprintf(stderr, "GPU: %s | Init: %.0f ms | TTS: %.0f MB | G2P: %.1f MB\n",
-            prop.name, ms(t_start, t_init),
-            prefetched.gpu_data_size / 1e6, g2p.param_bytes() / 1e6);
+    vlog("GPU: %s | Init: %.0f ms | TTS: %.0f MB | G2P: %.1f MB\n",
+         prop.name, ms(t_start, t_init),
+         prefetched.gpu_data_size / 1e6, g2p.param_bytes() / 1e6);
 
     // --- Voice map ---
     VoiceMap voices = build_voice_map(bundle);
@@ -568,11 +576,11 @@ int main(int argc, char** argv) {
             cudaStreamSynchronize(stream);
         }
         auto t_warm = clk::now();
-        fprintf(stderr, "Pre-warm: %.0f ms\n", ms(t_init, t_warm));
+        vlog("Pre-warm: %.0f ms\n", ms(t_init, t_warm));
     }
 
-    fprintf(stderr, "Encode arena: %.0f MB | Workspace: %.0f MB | Decode arena: on demand\n",
-            ENCODE_ARENA_BYTES / 1e6, WORKSPACE_BYTES / 1e6);
+    vlog("Encode arena: %.0f MB | Workspace: %.0f MB | Decode arena: on demand\n",
+         ENCODE_ARENA_BYTES / 1e6, WORKSPACE_BYTES / 1e6);
 
     // =======================================================================
     // Server mode
@@ -601,13 +609,13 @@ int main(int argc, char** argv) {
     auto t_pre0 = clk::now();
     std::string preprocessed = text_norm::preprocess_text(text_input);
     auto t_pre1 = clk::now();
-    fprintf(stderr, "Preprocess: \"%s\" (%.1f ms)\n", preprocessed.c_str(), ms(t_pre0, t_pre1));
+    vlog("Preprocess: \"%s\" (%.1f ms)\n", preprocessed.c_str(), ms(t_pre0, t_pre1));
 
     // --- G2P infer ---
     auto t_g2p0 = clk::now();
     std::string ipa = g2p.infer(preprocessed, stream);
     auto t_g2p1 = clk::now();
-    fprintf(stderr, "G2P: \"%s\" (%.1f ms)\n", ipa.c_str(), ms(t_g2p0, t_g2p1));
+    vlog("G2P: \"%s\" (%.1f ms)\n", ipa.c_str(), ms(t_g2p0, t_g2p1));
 
     if (ipa.empty()) {
         fprintf(stderr, "Error: G2P produced no output\n");
@@ -616,7 +624,7 @@ int main(int argc, char** argv) {
 
     // --- Tokenize + chunk ---
     auto chunks = chunk_ipa(ipa);
-    fprintf(stderr, "Chunks: %zu (total %zu IPA codepoints)\n", chunks.size(), utf8_len(ipa));
+    vlog("Chunks: %zu (total %zu IPA codepoints)\n", chunks.size(), utf8_len(ipa));
 
     // --- Voice pack ---
     auto vit = voices.find(voice_name);
@@ -635,7 +643,7 @@ int main(int argc, char** argv) {
         auto& chunk = chunks[c];
         int T = (int)chunk.tokens.size();
 
-        fprintf(stderr, "Chunk %zu: \"%s\" (%d tokens)\n", c, chunk.phonemes.c_str(), T);
+        vlog("Chunk %zu: \"%s\" (%d tokens)\n", c, chunk.phonemes.c_str(), T);
 
         // Style vector: index by phoneme count (T - 2 excludes BOS/EOS)
         int phoneme_count = T - 2;
@@ -652,8 +660,8 @@ int main(int argc, char** argv) {
         double gen_ms = ms(t0, t1);
         double audio_sec = audio.size() / 24000.0;
         double rtfx = audio_sec / (gen_ms / 1000.0);
-        fprintf(stderr, "  Generated %.3f sec in %.1f ms (%.0fx realtime), decode arena=%.1f MB\n",
-                audio_sec, gen_ms, rtfx, decode_arena.offset/1e6);
+        vlog("  Generated %.3f sec in %.1f ms (%.0fx realtime), decode arena=%.1f MB\n",
+             audio_sec, gen_ms, rtfx, decode_arena.offset/1e6);
 
         all_audio.insert(all_audio.end(), audio.begin(), audio.end());
     }
@@ -663,9 +671,15 @@ int main(int argc, char** argv) {
     encode_arena.destroy();
 
     // --- Write output ---
-    write_wav(output_path, all_audio.data(), all_audio.size(), 24000);
-    fprintf(stderr, "Output: %s (%.3f sec, %zu samples)\n",
-            output_path.c_str(), all_audio.size() / 24000.0, all_audio.size());
+    if (say_mode) {
+        if (!play_wav(all_audio.data(), all_audio.size(), 24000)) return 1;
+        vlog("Played %.3f sec (%zu samples)\n",
+             all_audio.size() / 24000.0, all_audio.size());
+    } else {
+        write_wav(output_path, all_audio.data(), all_audio.size(), 24000);
+        vlog("Output: %s (%.3f sec, %zu samples)\n",
+             output_path.c_str(), all_audio.size() / 24000.0, all_audio.size());
+    }
 
     // Cleanup
     g2p.free();

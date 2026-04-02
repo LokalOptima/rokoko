@@ -1191,7 +1191,7 @@ void precompute_weight_norms(Weights& w, cudaStream_t stream) {
     chk(w.dur_proj_w_f16);
     chk(w.dec_encode.conv1_wv_nhwc_f16);
     for (int i = 0; i < 6; i++) chk(w.gen_resblocks[i].convs1[0].wv_nhwc_f16);
-    fprintf(stderr, "  FP16 binary: %d key pointers set, staging=64 MB\n", n_f16);
+    vlog("  FP16 binary: %d key pointers set, staging=64 MB\n", n_f16);
 }
 
 // FP16 binary: self-contained bundle with v2 weights + G2P + voices
