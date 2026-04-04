@@ -7,7 +7,8 @@ Fast text-to-speech on GPU. Neural G2P + Kokoro TTS in a single CUDA binary.
 Requires CUDA 13+ and a C++17 compiler.
 
 ```bash
-make rokoko
+make rokoko          # FP32 inference
+make rokoko.fp16     # FP16 inference (half the download, same quality)
 ```
 
 Set `CUDA_HOME` if CUDA isn't at `/usr/local/cuda-13.1`:
@@ -18,23 +19,23 @@ make rokoko CUDA_HOME=/usr/local/cuda-12.6
 
 ## Usage
 
-On first run, model files (~364 MB weights + ~33 MB G2P + ~2 MB voices) are auto-downloaded from GitHub releases to `~/.cache/rokoko/`.
+On first run, model files are auto-downloaded from GitHub releases to `~/.cache/rokoko/` (~200 MB for FP16, ~400 MB for FP32).
 
 ```bash
-# Text to WAV file
-./rokoko "Hello world." -o hello.wav
+# Text to speech (plays through speakers)
+./rokoko.fp16 "Hello world." --say
 
-# Play directly (Linux)
-./rokoko "Hello world." --stdout | aplay
+# Save to WAV file
+./rokoko.fp16 "Hello world." -o hello.wav
 
-# Play directly (with FFmpeg)
-./rokoko "Hello world." --stdout | ffplay -nodisp -autoexit -
+# Pipe to audio player
+./rokoko.fp16 "Hello world." --stdout | aplay
 
 # Different voice
-./rokoko "Hello world." --voice af_bella
+./rokoko.fp16 "Hello world." --say --voice af_bella
 
 # Web UI
-./rokoko --serve 8080
+./rokoko.fp16 --serve 8080
 ```
 
 Available voices: `af_heart` (default), `af_bella`, `af_sky`, `af_nicole`.
@@ -44,10 +45,12 @@ Available voices: `af_heart` (default), `af_bella`, `af_sky`, `af_nicole`.
 ```
 --voice <name>      Voice (default: af_heart)
 -o <file>           Output WAV (default: output.wav)
+--say               Play audio through speakers
 --stdout            Write WAV to stdout
 --serve [port]      HTTP server with web UI (default: 8080)
 --host <addr>       Server bind address (default: 0.0.0.0)
---weights <file>    TTS weight file (default: ~/.cache/rokoko/weights.bin)
---g2p <file>        G2P model file (default: ~/.cache/rokoko/g2p.bin)
---voices <dir>      Voice directory (default: ~/.cache/rokoko/voices)
+--weights <file>    TTS weight file
+--g2p <file>        G2P model file
+--voices <dir>      Voice directory
+-v                  Verbose output (timings, IPA, GPU info)
 ```
