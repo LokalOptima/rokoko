@@ -30,7 +30,7 @@ src/cutlass_conv_f16.o: src/cutlass_conv_f16.cu
 	$(NVCC) $(NVFLAGS) -I$(CUTLASS) -c $< -o $@
 
 src/main.o: src/main.cu src/g2p.h src/normalize.h src/weights.h src/rokoko_common.h \
-            src/kernels.h src/bundle.h src/server.h src/cpp-httplib/httplib.h
+            src/kernels.h src/server.h src/cpp-httplib/httplib.h
 	$(NVCC) $(NVFLAGS) -c $< -o $@
 
 rokoko: src/main.o src/rokoko.cpp src/weights.cpp src/weights.h $(SHARED_OBJS)

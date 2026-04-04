@@ -373,7 +373,6 @@ struct Weights {
     // -----------------------------------------------------------------------
 
     static Weights prefetch(const std::string& path);
-    static Weights prefetch(const void* data, size_t size);
     void upload(cudaStream_t stream = nullptr);
     static Weights load(const std::string& path, cudaStream_t stream = nullptr);
     void free();

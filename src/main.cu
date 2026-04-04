@@ -3,7 +3,7 @@
 // Pipeline: text → preprocess → G2P infer → tokenize → chunk → TTS infer → WAV
 //
 // Build: make rokoko
-// Usage: ./rokoko --text "Hello world." -o output.wav --voice af_heart
+// Usage: ./rokoko "Hello world." -o output.wav --voice af_heart
 //        ./rokoko --serve 8080
 
 #include <chrono>
@@ -17,8 +17,11 @@
 #include <unordered_map>
 #include <vector>
 
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <cuda_runtime.h>
@@ -27,30 +30,72 @@
 #include "kernels.h"
 #include "normalize.h"
 #include "g2p.h"
-#include "bundle.h"
 #include "server.h"
 
 bool g_verbose = false;
 
-// Backend-specific: each binary provides its own bundle URL + filename
-extern const char* default_bundle_url();
-extern const char* default_bundle_filename();
+// Backend-specific: each binary provides its own weights filename + expected size
+extern const char* default_weights_filename();
+extern size_t default_weights_size();
+
+// Release base URL — single source of truth for all downloads
+static const char* RELEASE_BASE = "https://github.com/lfrati/rokoko/releases/download/v2.0.0/";
+
+static const char* G2P_FILENAME = "g2p.bin";
+static const size_t G2P_SIZE = 34641552;
+static const char* VOICE_NAMES[] = {"af_heart", "af_bella", "af_nicole", "af_sky"};
+static const size_t VOICE_SIZE = 522240;  // all voices are the same size
+
+static std::string release_url(const std::string& filename) {
+    return std::string(RELEASE_BASE) + filename;
+}
 
 // ---------------------------------------------------------------------------
-// Voice map (populated from bundle)
+// Voice map (populated by mmapping individual voice files)
 // ---------------------------------------------------------------------------
 
 struct VoicePack { const char* start; const char* end; };
 using VoiceMap = std::unordered_map<std::string, VoicePack>;
 
-static VoiceMap build_voice_map(const Bundle& bundle) {
+struct VoiceMmap { void* ptr; size_t size; };
+
+static VoiceMap load_voices(const std::string& voices_dir,
+                            std::vector<VoiceMmap>& mmaps) {
     VoiceMap voices;
-    for (auto& [name, span] : bundle.entries) {
-        if (name.rfind("voice/", 0) == 0) {
-            std::string vname = name.substr(6); // strip "voice/"
-            voices[vname] = {span.data, span.data + span.size};
+    DIR* dir = opendir(voices_dir.c_str());
+    if (!dir) return voices;
+
+    struct dirent* ent;
+    while ((ent = readdir(dir)) != nullptr) {
+        std::string fname = ent->d_name;
+        if (fname.size() < 5 || fname.substr(fname.size() - 4) != ".bin")
+            continue;
+        std::string vname = fname.substr(0, fname.size() - 4);
+        std::string path = voices_dir + "/" + fname;
+
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            fprintf(stderr, "Warning: cannot open voice %s\n", path.c_str());
+            continue;
         }
+        struct stat st;
+        fstat(fd, &st);
+        if (st.st_size == 0) {
+            fprintf(stderr, "Warning: voice %s is empty\n", path.c_str());
+            close(fd);
+            continue;
+        }
+        void* mapped = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (mapped == MAP_FAILED) {
+            fprintf(stderr, "Warning: mmap failed for voice %s\n", path.c_str());
+            continue;
+        }
+
+        mmaps.push_back({mapped, (size_t)st.st_size});
+        voices[vname] = {(const char*)mapped, (const char*)mapped + st.st_size};
     }
+    closedir(dir);
     return voices;
 }
 
@@ -284,6 +329,58 @@ static std::vector<Chunk> chunk_ipa(const std::string& ipa) {
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
+// File download helper
+// ---------------------------------------------------------------------------
+
+static void mkdirs(const std::string& path) {
+    std::string dir = path;
+    for (size_t p = 1; p < dir.size(); p++) {
+        if (dir[p] == '/') {
+            dir[p] = '\0';
+            mkdir(dir.c_str(), 0755);
+            dir[p] = '/';
+        }
+    }
+    mkdir(dir.c_str(), 0755);
+}
+
+// Check file exists and optionally matches expected size (0 = skip size check).
+// Returns true if file is present and valid.
+static bool file_ok(const std::string& path, size_t expected_size = 0) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return false;
+    if (expected_size > 0 && (size_t)st.st_size != expected_size) {
+        fprintf(stderr, "Warning: %s has wrong size (%zu, expected %zu) — re-downloading\n",
+                path.c_str(), (size_t)st.st_size, expected_size);
+        unlink(path.c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool download_file(const std::string& url, const std::string& dest) {
+    mkdirs(dest.substr(0, dest.rfind('/')));
+
+    std::string tmp = dest + ".tmp";
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("curl", "curl", "-fL", "-#", "-o", tmp.c_str(), url.c_str(), nullptr);
+        _exit(127);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        unlink(tmp.c_str());
+        return false;
+    }
+    if (rename(tmp.c_str(), dest.c_str()) != 0) {
+        unlink(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // TTS Pipeline — wraps all persistent state for server mode
 // ---------------------------------------------------------------------------
 
@@ -398,8 +495,9 @@ int main(int argc, char** argv) {
             "  --stdout            Write WAV to stdout\n"
             "  --serve [port]      HTTP server with web UI (default: 8080)\n"
             "  --host <addr>       Server bind address (default: 0.0.0.0)\n"
-            "  --bundle <file>     Model bundle (default: ~/.cache/rokoko/rokoko.bundle)\n"
-            "  --weights <file>    Standalone .koko weight file (overrides bundle weights)\n"
+            "  --weights <file>    TTS weight file (default: ~/.cache/rokoko/%s)\n"
+            "  --g2p <file>        G2P model file (default: ~/.cache/rokoko/g2p.bin)\n"
+            "  --voices <dir>      Voice directory (default: ~/.cache/rokoko/voices)\n"
             "  -v                  Verbose output (timings, IPA, GPU info)\n"
             "  --help              Show this help\n"
             "\n"
@@ -408,7 +506,8 @@ int main(int argc, char** argv) {
             "  %s \"Hello world.\" --say\n"
             "  %s \"Hello world.\" --stdout | aplay\n"
             "  %s --serve 8080\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+            argv[0], argv[0], default_weights_filename(),
+            argv[0], argv[0], argv[0], argv[0]);
     };
 
     if (argc < 2) { print_usage(); return 1; }
@@ -419,9 +518,12 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::string home = std::getenv("HOME") ? std::getenv("HOME") : ".";
-    std::string bundle_path = home + "/.cache/rokoko/" + default_bundle_filename();
-    std::string weights_path;  // standalone .koko file (overrides bundle weights)
+    const char* home_env = std::getenv("HOME");
+    std::string home = home_env ? home_env : ".";
+    std::string cache_dir = home + "/.cache/rokoko";
+    std::string weights_path = cache_dir + "/" + default_weights_filename();
+    std::string g2p_path = cache_dir + "/" + G2P_FILENAME;
+    std::string voices_dir = cache_dir + "/voices";
     std::string text_input;
     std::string voice_name = "af_heart";
     std::string output_path = "output.wav";
@@ -432,14 +534,15 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--bundle" && i + 1 < argc)       bundle_path = argv[++i];
-        else if (arg == "--weights" && i + 1 < argc) weights_path = argv[++i];
-        else if (arg == "--voice" && i + 1 < argc)   voice_name = argv[++i];
-        else if (arg == "-o" && i + 1 < argc)        output_path = argv[++i];
-        else if (arg == "--stdout")                   output_path = "-";
-        else if (arg == "--say")                     say_mode = true;
-        else if (arg == "-v" || arg == "--verbose")  g_verbose = true;
-        else if (arg == "--host" && i + 1 < argc)    serve_host = argv[++i];
+        if (arg == "--weights" && i + 1 < argc)      weights_path = argv[++i];
+        else if (arg == "--g2p" && i + 1 < argc)     g2p_path = argv[++i];
+        else if (arg == "--voices" && i + 1 < argc)   voices_dir = argv[++i];
+        else if (arg == "--voice" && i + 1 < argc)    voice_name = argv[++i];
+        else if (arg == "-o" && i + 1 < argc)         output_path = argv[++i];
+        else if (arg == "--stdout")                    output_path = "-";
+        else if (arg == "--say")                      say_mode = true;
+        else if (arg == "-v" || arg == "--verbose")   g_verbose = true;
+        else if (arg == "--host" && i + 1 < argc)     serve_host = argv[++i];
         else if (arg == "--serve") {
             serve_mode = true;
             if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
@@ -459,45 +562,26 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // --- Auto-download bundle if missing ---
+    // --- Auto-download missing or corrupt files ---
     {
-        struct stat st;
-        if (stat(bundle_path.c_str(), &st) != 0) {
-            // Create parent directory
-            std::string dir = bundle_path.substr(0, bundle_path.rfind('/'));
-            for (size_t p = 1; p < dir.size(); p++) {
-                if (dir[p] == '/') {
-                    dir[p] = '\0';
-                    mkdir(dir.c_str(), 0755);
-                    dir[p] = '/';
+        struct Download { std::string path; std::string url; std::string label; size_t expected_size; };
+        std::vector<Download> needed;
+        needed.push_back({weights_path, release_url(default_weights_filename()),
+                          "weights", default_weights_size()});
+        needed.push_back({g2p_path, release_url(G2P_FILENAME), "g2p", G2P_SIZE});
+        for (size_t i = 0; i < std::size(VOICE_NAMES); i++)
+            needed.push_back({voices_dir + "/" + VOICE_NAMES[i] + ".bin",
+                              release_url(std::string(VOICE_NAMES[i]) + ".bin"),
+                              std::string("voice ") + VOICE_NAMES[i], VOICE_SIZE});
+
+        for (auto& f : needed) {
+            if (!file_ok(f.path, f.expected_size)) {
+                fprintf(stderr, "%s not found at %s — downloading...\n", f.label.c_str(), f.path.c_str());
+                if (!download_file(f.url, f.path)) {
+                    fprintf(stderr, "Error: failed to download %s\n", f.label.c_str());
+                    return 1;
                 }
             }
-            mkdir(dir.c_str(), 0755);
-
-            fprintf(stderr, "Bundle not found at %s — downloading...\n", bundle_path.c_str());
-
-            const char* url = default_bundle_url();
-
-            // Download to temp file, then rename atomically
-            std::string tmp_path = bundle_path + ".tmp";
-            pid_t pid = fork();
-            if (pid == 0) {
-                execlp("curl", "curl", "-L", "-#", "-o", tmp_path.c_str(), url, nullptr);
-                _exit(127);
-            }
-            int status;
-            waitpid(pid, &status, 0);
-            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-                fprintf(stderr, "Error: download failed\n");
-                unlink(tmp_path.c_str());
-                return 1;
-            }
-            if (rename(tmp_path.c_str(), bundle_path.c_str()) != 0) {
-                fprintf(stderr, "Error: failed to move downloaded bundle\n");
-                unlink(tmp_path.c_str());
-                return 1;
-            }
-            fprintf(stderr, "Download complete.\n");
         }
     }
 
@@ -507,24 +591,10 @@ int main(int argc, char** argv) {
         return std::chrono::duration<double, std::milli>(b - a).count();
     };
 
-    // --- Load bundle ---
-    Bundle bundle = Bundle::load(bundle_path);
-
-    auto weights_span = bundle.get("weights");
-    auto g2p_span = bundle.get("g2p");
-    if (!weights_span.data || !g2p_span.data) {
-        fprintf(stderr, "Error: bundle missing 'weights' or 'g2p' entry\n");
-        return 1;
-    }
-
     // --- Load TTS weights (prefetch in background) + init CUDA ---
     Weights prefetched;
     std::thread prefetch_thread([&]() {
-        if (!weights_path.empty()) {
-            prefetched = Weights::prefetch(weights_path);
-        } else {
-            prefetched = Weights::prefetch(weights_span.data, weights_span.size);
-        }
+        prefetched = Weights::prefetch(weights_path);
     });
     cudaFree(0); // lazy CUDA init
     prefetch_thread.join();
@@ -532,12 +602,20 @@ int main(int argc, char** argv) {
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     prefetched.upload(stream);
-    precompute_weight_norms(prefetched, stream);
 
-    // --- Load G2P model ---
+    // --- Load G2P model (overlapped with weight norm precomputation) ---
     G2PModelCuda g2p;
-    if (!g2p.load(g2p_span.data, g2p_span.size, stream)) {
-        fprintf(stderr, "Error: failed to load G2P model from bundle\n");
+    bool g2p_ok = false;
+    cudaStream_t g2p_stream;
+    CUDA_CHECK(cudaStreamCreate(&g2p_stream));
+    std::thread g2p_thread([&]() {
+        g2p_ok = g2p.load(g2p_path.c_str(), g2p_stream);
+    });
+    precompute_weight_norms(prefetched, stream);
+    g2p_thread.join();
+    CUDA_CHECK(cudaStreamDestroy(g2p_stream));
+    if (!g2p_ok) {
+        fprintf(stderr, "Error: failed to load G2P model from %s\n", g2p_path.c_str());
         return 1;
     }
 
@@ -550,7 +628,13 @@ int main(int argc, char** argv) {
          prefetched.gpu_data_size / 1e6, g2p.param_bytes() / 1e6);
 
     // --- Voice map ---
-    VoiceMap voices = build_voice_map(bundle);
+    std::vector<VoiceMmap> voice_mmaps;
+    VoiceMap voices = load_voices(voices_dir, voice_mmaps);
+    if (voices.empty()) {
+        fprintf(stderr, "Error: no voices found in %s\n", voices_dir.c_str());
+        return 1;
+    }
+    vlog("Voices: %zu loaded from %s\n", voices.size(), voices_dir.c_str());
 
     // --- Pre-allocate arenas + workspace ---
     static constexpr size_t ENCODE_ARENA_BYTES = 64 * 1024 * 1024;  // 64 MB
@@ -595,6 +679,8 @@ int main(int argc, char** argv) {
         cudaFree(d_workspace);
         decode_arena.destroy();
         encode_arena.destroy();
+        for (auto& vm : voice_mmaps)
+            if (vm.ptr) munmap(vm.ptr, vm.size);
         g2p.free();
         prefetched.free();
         CUDA_CHECK(cudaStreamDestroy(stream));
@@ -682,6 +768,8 @@ int main(int argc, char** argv) {
     }
 
     // Cleanup
+    for (auto& vm : voice_mmaps)
+        if (vm.ptr) munmap(vm.ptr, vm.size);
     g2p.free();
     prefetched.free();
     CUDA_CHECK(cudaStreamDestroy(stream));

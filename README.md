@@ -18,7 +18,7 @@ make rokoko CUDA_HOME=/usr/local/cuda-12.6
 
 ## Usage
 
-On first run, the model bundle (~364 MB) is auto-downloaded from GitHub releases to `~/.cache/rokoko/`.
+On first run, model files (~364 MB weights + ~33 MB G2P + ~2 MB voices) are auto-downloaded from GitHub releases to `~/.cache/rokoko/`.
 
 ```bash
 # Text to WAV file
@@ -47,5 +47,7 @@ Available voices: `af_heart` (default), `af_bella`, `af_sky`, `af_nicole`.
 --stdout            Write WAV to stdout
 --serve [port]      HTTP server with web UI (default: 8080)
 --host <addr>       Server bind address (default: 0.0.0.0)
---bundle <file>     Model bundle (default: ~/.cache/rokoko/rokoko.bundle)
+--weights <file>    TTS weight file (default: ~/.cache/rokoko/weights.bin)
+--g2p <file>        G2P model file (default: ~/.cache/rokoko/g2p.bin)
+--voices <dir>      Voice directory (default: ~/.cache/rokoko/voices)
 ```

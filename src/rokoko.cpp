@@ -1673,8 +1673,6 @@ void precompute_weight_norms(Weights& w, cudaStream_t stream) {
             }());
 }
 
-// FP32 binary: self-contained bundle with v1 weights + G2P + voices
-const char* default_bundle_url() {
-    return "https://github.com/lfrati/rokoko/releases/download/v1.0.0/rokoko.bundle";
-}
-const char* default_bundle_filename() { return "rokoko.bundle"; }
+// FP32 binary: v1 weights (KOKO format)
+const char* default_weights_filename() { return "weights.bin"; }
+size_t default_weights_size() { return 327296512; }

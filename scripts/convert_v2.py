@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Convert FP32 rokoko.bundle → FP16 rokoko.fp16.bundle.
+"""Convert FP32 weights → FP16 weights.
 
-Reads the original bundle (G2P + voices + v1 weights), converts weights to v2
-(pre-baked weight-norm, FP16, NHWC, padded, LSTM bias), then packs everything
-into a new ROKO bundle.
+Reads the v1 KOKO weight file, converts weights to v2 (pre-baked weight-norm,
+FP16, NHWC, padded, LSTM bias), and writes a standalone v2 KOKO file.
 
 Usage:
-    uv run scripts/convert_v2.py -o rokoko.fp16.bundle
-    uv run scripts/convert_v2.py --bundle path/to/rokoko.bundle -o out.bundle
+    uv run scripts/convert_v2.py -o weights.fp16.bin
+    uv run scripts/convert_v2.py --weights path/to/weights.bin -o out.bin
 """
 
 import argparse
-import io
 import mmap
 import struct
 import sys
@@ -23,28 +21,12 @@ import numpy as np
 # ── KOKO file I/O ──────────────────────────────────────────────────────────
 
 KOKO_MAGIC = 0x4F4B4F4B  # "KOKO" LE
-ROKO_MAGIC = 0x4F4B4F52  # "ROKO" LE
 
 
-def read_bundle_entries(path: str) -> dict[str, bytes]:
-    """Extract all entries from a .bundle file as {name: raw_bytes}."""
-    with open(path, "rb") as f:
-        data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-    magic = struct.unpack_from("<I", data, 0)[0]
-    if magic != ROKO_MAGIC:
-        raise ValueError(f"Not a bundle: bad magic {magic:#x}")
-    _version, count = struct.unpack_from("<II", data, 4)
-    entries = {}
-    for i in range(count):
-        off = 16 + i * 72
-        name = data[off : off + 56].split(b"\x00", 1)[0].decode()
-        entry_off, entry_sz = struct.unpack_from("<QQ", data, off + 56)
-        entries[name] = bytes(data[entry_off : entry_off + entry_sz])
-    return entries
-
-
-def parse_koko(raw: bytes):
-    """Parse a KOKO v1 weight blob. Returns {name: {array, dtype, shape}}."""
+def parse_koko(path: str):
+    """Parse a KOKO v1 weight file. Returns {name: ndarray}."""
+    f = open(path, "rb")
+    raw = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
     magic = struct.unpack_from("<I", raw, 0)[0]
     assert magic == KOKO_MAGIC, f"Bad KOKO magic {magic:#x}"
     version = struct.unpack_from("<I", raw, 4)[0]
@@ -64,15 +46,17 @@ def parse_koko(raw: bytes):
         buf = raw[data_start + offset : data_start + offset + size_bytes]
         ndt = np.float32 if dtype == "fp32" else np.float16
         tensors[name] = np.frombuffer(buf, dtype=ndt).reshape(shape).copy()
+    raw.close()
+    f.close()
     return tensors
 
 
-def write_koko_v2_bytes(entries: list[tuple[str, np.ndarray]]) -> bytes:
-    """Build a KOKO v2 weight blob in memory. entries = [(name, array), ...]."""
+def write_koko_v2(path: str, entries: list[tuple[str, np.ndarray]]):
+    """Write a standalone KOKO v2 weight file."""
     header_lines = []
     offset = 0
     for name, arr in entries:
-        dtype_str = "fp32" if arr.dtype == np.float32 else "float16"
+        dtype_str = "fp32" if arr.dtype == np.float32 else "fp16"
         size_bytes = arr.nbytes
         shape_str = " ".join(str(s) for s in arr.shape)
         header_lines.append(f"{name} {offset} {size_bytes} {dtype_str} {shape_str}")
@@ -82,53 +66,15 @@ def write_koko_v2_bytes(entries: list[tuple[str, np.ndarray]]) -> bytes:
     header_len = len(header_text)
     data_start = ((16 + header_len + 4095) // 4096) * 4096
 
-    buf = io.BytesIO()
-    buf.write(struct.pack("<I", KOKO_MAGIC))
-    buf.write(struct.pack("<I", 2))  # version=2
-    buf.write(struct.pack("<Q", header_len))
-    buf.write(header_text)
-    buf.write(b"\x00" * (data_start - buf.tell()))
-
-    for _name, arr in entries:
-        data = arr.tobytes()
-        buf.write(data)
-        rem = len(data) % 256
-        if rem:
-            buf.write(b"\x00" * (256 - rem))
-
-    return buf.getvalue()
-
-
-def write_roko_bundle(path: str, entries: list[tuple[str, bytes]]):
-    """Write a ROKO bundle. entries = [(name, raw_bytes), ...]."""
-    count = len(entries)
-    toc_end = 16 + count * 72
-    data_start = ((toc_end + 4095) // 4096) * 4096
-
-    # Compute data offsets (256-byte aligned)
-    offsets = []
-    pos = data_start
-    for _name, data in entries:
-        offsets.append(pos)
-        pos = ((pos + len(data) + 255) // 256) * 256
-
     with open(path, "wb") as f:
-        # Header: magic + version + count + padding
-        f.write(struct.pack("<III", ROKO_MAGIC, 1, count))
-        f.write(b"\x00" * 4)
-
-        # TOC: 72 bytes per entry (56-byte name + 8-byte offset + 8-byte size)
-        for i, (name, data) in enumerate(entries):
-            name_bytes = name.encode()[:56].ljust(56, b"\x00")
-            f.write(name_bytes)
-            f.write(struct.pack("<QQ", offsets[i], len(data)))
-
-        # Pad to data_start
+        f.write(struct.pack("<I", KOKO_MAGIC))
+        f.write(struct.pack("<I", 2))  # version=2
+        f.write(struct.pack("<Q", header_len))
+        f.write(header_text)
         f.write(b"\x00" * (data_start - f.tell()))
 
-        # Data
-        for i, (_name, data) in enumerate(entries):
-            assert f.tell() == offsets[i]
+        for _name, arr in entries:
+            data = arr.tobytes()
             f.write(data)
             rem = len(data) % 256
             if rem:
@@ -407,31 +353,25 @@ def convert(tensors: dict[str, np.ndarray]) -> list[tuple[str, np.ndarray]]:
 
 
 def main():
-    p = argparse.ArgumentParser(description="Convert FP32 bundle → FP16 bundle")
-    p.add_argument("--bundle", type=str, help="Path to source .bundle file")
-    p.add_argument("-o", "--output", type=str, required=True, help="Output .bundle path")
+    p = argparse.ArgumentParser(description="Convert FP32 weights.bin → FP16 weights.fp16.bin")
+    p.add_argument("--weights", type=str, help="Path to source weight file")
+    p.add_argument("-o", "--output", type=str, required=True, help="Output path")
     args = p.parse_args()
 
-    bundle_path = args.bundle
-    if not bundle_path:
+    weights_path = args.weights
+    if not weights_path:
         home = Path.home()
-        default = home / ".cache/rokoko/rokoko.bundle"
+        default = home / ".cache/rokoko/weights.bin"
         if default.exists():
-            bundle_path = str(default)
+            weights_path = str(default)
         else:
-            p.error("Provide --bundle or ensure ~/.cache/rokoko/rokoko.bundle exists")
+            p.error("Provide --weights or ensure ~/.cache/rokoko/weights.bin exists")
 
-    print(f"Reading bundle: {bundle_path}")
-    all_entries = read_bundle_entries(bundle_path)
-    print(f"  {len(all_entries)} entries: {', '.join(sorted(all_entries))}")
-
-    # Extract and convert weights
-    raw_weights = all_entries.pop("weights")
-    print("Parsing v1 tensors...")
-    tensors = parse_koko(raw_weights)
+    print(f"Reading weights: {weights_path}")
+    tensors = parse_koko(weights_path)
     print(f"  {len(tensors)} tensors loaded")
 
-    print("Converting to v2...")
+    print("Converting to v2 (FP16)...")
     v2_entries = convert(tensors)
 
     n_base = sum(1 for n, _ in v2_entries if ".f16" not in n and ".nhwc" not in n and ".bias_combined" not in n)
@@ -442,18 +382,8 @@ def main():
     print(f"  {len(v2_entries)} tensors: {n_base} base, {n_f16} .f16, {n_nhwc} .nhwc_f16, {n_bias} .bias_combined")
     print(f"  Total weight data: {total_bytes / 1e6:.1f} MB")
 
-    # Build v2 weights blob
-    v2_blob = write_koko_v2_bytes(v2_entries)
-    print(f"  KOKO v2 blob: {len(v2_blob) / 1e6:.1f} MB")
-
-    # Pack into bundle: weights first, then g2p + voices
-    bundle_out: list[tuple[str, bytes]] = [("weights", v2_blob)]
-    for name in sorted(all_entries):
-        bundle_out.append((name, all_entries[name]))
-    print(f"  Bundle entries: {', '.join(n for n, _ in bundle_out)}")
-
-    print(f"Writing bundle: {args.output}")
-    write_roko_bundle(args.output, bundle_out)
+    print(f"Writing: {args.output}")
+    write_koko_v2(args.output, v2_entries)
     print(f"  Done: {Path(args.output).stat().st_size / 1e6:.1f} MB on disk")
 
 

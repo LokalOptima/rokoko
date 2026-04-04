@@ -371,7 +371,6 @@ __global__ void g2p_bias_ctc_argmax_kernel(const float* __restrict__ logits,
 
 struct G2PModelCuda {
     bool load(const char* path, cudaStream_t stream);
-    bool load(const void* data, size_t size, cudaStream_t stream);
     std::string infer(const std::string& text, cudaStream_t stream) const;
     void free();
 
@@ -429,14 +428,6 @@ private:
 };
 
 // ── Implementation ──────────────────────────────────────────────────────────
-
-inline bool G2PModelCuda::load(const void* data, size_t size, cudaStream_t stream) {
-    FILE* f = fmemopen(const_cast<void*>(data), size, "rb");
-    if (!f) return false;
-    bool ok = load_from_file_(f, "<bundle:g2p>", stream);
-    fclose(f);
-    return ok;
-}
 
 inline bool G2PModelCuda::load(const char* path, cudaStream_t stream) {
     FILE* f = fopen(path, "rb");

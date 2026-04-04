@@ -1194,8 +1194,6 @@ void precompute_weight_norms(Weights& w, cudaStream_t stream) {
     vlog("  FP16 binary: %d key pointers set, staging=64 MB\n", n_f16);
 }
 
-// FP16 binary: self-contained bundle with v2 weights + G2P + voices
-const char* default_bundle_url() {
-    return "https://github.com/lfrati/rokoko/releases/download/v1.0.0/rokoko.fp16.bundle";
-}
-const char* default_bundle_filename() { return "rokoko.fp16.bundle"; }
+// FP16 binary: v2 weights (KOKO format, pre-baked FP16)
+const char* default_weights_filename() { return "weights.fp16.bin"; }
+size_t default_weights_size() { return 163390976; }
