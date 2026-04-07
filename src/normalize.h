@@ -1235,6 +1235,15 @@ inline std::string preprocess_text(const std::string& input) {
         }
     }
 
+    // Short utterances without final punctuation produce bad TTS output.
+    while (!sc.out.empty() && sc.out.back() == ' ')
+        sc.out.pop_back();
+    if (!sc.out.empty()) {
+        char last = sc.out.back();
+        if (last != '.' && last != '!' && last != '?')
+            sc.out.push_back('.');
+    }
+
     return std::move(sc.out);
 }
 

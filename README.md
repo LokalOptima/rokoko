@@ -40,6 +40,12 @@ On first run, model files are auto-downloaded from GitHub releases to `~/.cache/
 
 Available voices: `af_heart` (default), `af_bella`, `af_sky`, `af_nicole`.
 
+## Acknowledgments
+
+- **[Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)** by hexgrad — the original TTS model that this project reimplements in C++/CUDA (Apache 2.0 License)
+- **[CUTLASS](https://github.com/NVIDIA/cutlass)** by NVIDIA — CUDA GEMM templates (BSD-3-Clause License, Copyright 2017-2026 NVIDIA Corporation & Affiliates)
+- **[cpp-httplib](https://github.com/yhirose/cpp-httplib)** by yhirose — HTTP server for web UI (MIT License)
+
 ## Options
 
 ```
