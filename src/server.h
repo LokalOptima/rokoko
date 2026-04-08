@@ -17,6 +17,8 @@
 #include "cpp-httplib/httplib.h"
 #include "weights.h"
 
+using namespace rokoko;
+
 static inline std::string json_escape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 8);

@@ -13,6 +13,8 @@
 
 #include "weights.h"
 
+namespace rokoko {
+
 // ---------------------------------------------------------------------------
 // Buffer structs (arena-allocated, deterministic per T)
 // ---------------------------------------------------------------------------
@@ -225,3 +227,5 @@ inline size_t compute_decode_bytes(int T, int L) {
 
     return off;
 }
+
+} // namespace rokoko

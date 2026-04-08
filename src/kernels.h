@@ -7,6 +7,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+namespace rokoko {
+
 // ---------------------------------------------------------------------------
 // FP32→FP16 cast: dst[i] = __float2half(src[i])
 // ---------------------------------------------------------------------------
@@ -324,3 +326,5 @@ void round_clamp_durations_f32(const float* durations, int* int_durations,
 // ---------------------------------------------------------------------------
 void build_alignment_f32(const int* int_durations, float* alignment,
                           int T, int L, cudaStream_t stream);
+
+} // namespace rokoko

@@ -36,6 +36,8 @@ extern bool g_verbose;
         }                                                                      \
     } while (0)
 
+namespace rokoko {
+
 // ---------------------------------------------------------------------------
 // GPU scratch arena: single allocation, bump pointer, reset per inference
 // ---------------------------------------------------------------------------
@@ -412,3 +414,5 @@ void write_wav_to_(std::ostream& f, const float* audio,
 
 /// Precompute weight norms (called once after weight upload).
 void precompute_weight_norms(Weights& w, cudaStream_t stream);
+
+} // namespace rokoko

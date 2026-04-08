@@ -369,6 +369,8 @@ __global__ void g2p_bias_ctc_argmax_kernel(const float* __restrict__ logits,
 
 // ── Model struct ────────────────────────────────────────────────────────────
 
+namespace rokoko {
+
 struct G2PModelCuda {
     bool load(const char* path, cudaStream_t stream);
     std::string infer(const std::string& text, cudaStream_t stream) const;
@@ -880,3 +882,5 @@ inline std::string G2PModelCuda::infer(const std::string& text,
 
     return result;
 }
+
+} // namespace rokoko

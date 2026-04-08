@@ -6,6 +6,8 @@
 #include <cmath>
 #include <vector>
 
+namespace rokoko {
+
 // ---------------------------------------------------------------------------
 // Embedding gather: y[i, :] = table[ids[i], :]
 // ---------------------------------------------------------------------------
@@ -1501,3 +1503,5 @@ void build_alignment_f32(const int* int_durations, float* alignment,
     build_alignment_kernel<<<1, T, 0, stream>>>(
         int_durations, alignment, T, L);
 }
+
+} // namespace rokoko

@@ -65,6 +65,8 @@ extern "C" int cutlass_gemm_nn_f16(int M, int N, int K,
     float* C, int ldc, float alpha, float beta,
     float* workspace, size_t workspace_bytes, cudaStream_t stream);
 
+namespace rokoko {
+
 // Workspace pointer + size, threaded through all functions
 static float* s_workspace = nullptr;
 static size_t s_workspace_bytes = 0;
@@ -1672,6 +1674,8 @@ void precompute_weight_norms(Weights& w, cudaStream_t stream) {
                 return s_fp16_weights.size() * 0.5;  // placeholder
             }());
 }
+
+} // namespace rokoko
 
 // FP32 binary: v1 weights (KOKO format)
 const char* default_weights_filename() { return "weights.bin"; }
