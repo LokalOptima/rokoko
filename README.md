@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="rokoko.png" width="256" alt="rokoko">
+</p>
+
 # Rokoko
 
 Fast text-to-speech on GPU. Neural G2P + Kokoro TTS in a single CUDA binary.
