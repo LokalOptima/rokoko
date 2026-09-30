@@ -67,3 +67,31 @@ The before mixed workload had 15 sentences; the after workload had 250. Their ag
 - Large-word CPU splitting is checked; arbitrary repeated-character gibberish can be rejected by the neural G2P rather than producing speech.
 - Clean-cache release downloads were not validated: the required release assets have not been published by this task. Runtime models must be provided at the approved hashes. No release was published.
 - These runs cover the recorded machine and single-context serialized use. Concurrency, other devices and long memory soaks remain outside this increment.
+
+
+## Consolidation validation (2026-09-30)
+
+The consolidated checkout was built from source with CUDA 13.1 and the existing
+CUTLASS headers on the same RTX 5070 Ti. Production inference source is unchanged
+from original commit `12c606c`; training and export now live alongside it.
+
+- `make test`: all 14 CPU checks passed.
+- `make test-frontend`: 115/115 handwritten normalizer cases, 991/1000 lenient
+  and 980/1000 exact G2P cases, 113/115 end-to-end cases and 450/450 snapshots.
+  The previously documented pronunciation misses remain.
+- `make test-gpu`: both precision variants passed the runtime, reference and
+  source-mutation checks using freshly exported artifacts.
+- `make test-training`: V11 checkpoint export is byte-identical to the approved
+  G2P artifact; Python/native predictions agree on 12 sentences. Shared
+  normalization, preparation, provenance and refusal to overwrite data passed.
+- The recovered FP32 exporter, FP16 converter and voice export reproduce all
+  approved asset SHA-256 hashes. The independent artifact audit passed all 688
+  FP32 and 585 FP16 tensors plus corruption controls. The converter's FP16
+  header spelling was aligned with the shipped format; tensor bytes did not change.
+- A bounded one-epoch training run on 128 existing short examples completed and
+  wrote a checkpoint and verified input/source hashes. This exercises training
+  plumbing only; it is not a quality result or a replacement for the shipped V11.
+
+Consolidation logs are saved under `tests/results/consolidation/`. Model files,
+checkpoints and original data remain outside source history. No new quality or
+performance equivalence claim is made, and no GitHub history was rewritten.

@@ -1,0 +1,42 @@
+{
+  "date": "2026-04-04 02:53:13",
+  "data": "data/base.tsv,data/augment_heuristic.tsv:5,data/augment_llm.tsv:5",
+  "model": {
+    "d": 256,
+    "heads": 4,
+    "layers": 8,
+    "ff": 1024,
+    "up": 3,
+    "kernel_size": 31,
+    "inter_ctc_layer": 0,
+    "use_rope": true,
+    "use_qk_norm": false,
+    "use_conv": false,
+    "use_rmsnorm": true
+  },
+  "training": {
+    "epochs": 50,
+    "lr": 0.001,
+    "max_tokens": 0,
+    "batch_size": 64,
+    "dropout": 0.1,
+    "label_smoothing": 0.0,
+    "weight_decay": 0.01,
+    "muon": true,
+    "muon_lr": 0.02,
+    "compile": true,
+    "amp": true,
+    "val_fraction": 0.1
+  },
+  "data_stats": {
+    "train_pairs": 869913,
+    "val_pairs": 76113,
+    "char_vocab_size": 96,
+    "phone_vocab_size": 62
+  },
+  "resume": null,
+  "device": "cuda",
+  "torch_version": "2.11.0+cu130",
+  "cuda_version": "13.0",
+  "gpu": "NVIDIA GeForce RTX 5070 Ti"
+}

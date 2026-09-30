@@ -6,6 +6,10 @@
 
 Fast text-to-speech on GPU. Neural G2P + Kokoro TTS in a single CUDA binary.
 
+This is the consolidated home for inference, G2P training, model export and
+regression tests. The executable uses no Python at runtime. Model assets remain
+separate files.
+
 ## Build
 
 Requires CUDA 13+ and a C++17 compiler. CUTLASS (headers only) isn't in the repo:
@@ -25,10 +29,11 @@ Set `CUDA_HOME` if CUDA isn't at `/usr/local/cuda-13.1`:
 make rokoko CUDA_HOME=/usr/local/cuda-12.6
 ```
 
-Text frontend tests (normalizer + G2P), see [tests/frontend](tests/frontend/README.md):
+Checks and setup are documented in [tests/README.md](tests/README.md):
 
 ```bash
-make test-frontend
+make test             # fast offline CPU helper/frontend checks
+make test-frontend    # normalizer + native GPU G2P
 ```
 
 ## Usage
@@ -71,3 +76,23 @@ The supported voice is **`af_heart`**, the highest-graded English voice in [Koko
 --voices <dir>      Directory containing af_heart.bin
 -v                  Verbose output (timings, IPA, GPU info)
 ```
+
+## Development and model export
+
+- [G2P training, export and provenance](training/g2p/README.md)
+- [Regression checks and reference environment](tests/README.md)
+- [Retained history and repository layout](docs/HISTORY.md)
+
+Export TTS assets from the pinned official files prepared by `tests/prepare.py`:
+
+```sh
+.venv-tests/bin/python scripts/export_weights.py \
+  --official tests/models/Kokoro-82M -o /path/to/models/weights.bin \
+  --voice-output /path/to/models/voices/af_heart.bin
+.venv-tests/bin/python scripts/convert_v2.py \
+  --weights /path/to/models/weights.bin -o /path/to/models/weights.fp16.bin
+```
+
+Use explicit `--weights`, `--g2p` and `--voices` paths to test exported assets.
+The Python tools are optional development dependencies. Keep datasets,
+checkpoints, model weights and generated audio outside Git.

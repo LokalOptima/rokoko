@@ -97,3 +97,10 @@ test-gpu: rokoko rokoko.fp16 tests/runtime tests/runtime.fp16
 tests/audio: tests/audio.cpp src/audio.h
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Isrc $< -o $@
 test-cpu: tests/audio
+
+# Training dependencies are optional and shared with the reference-test environment.
+TRAINING_PYTHON ?= $(REFERENCE_PYTHON)
+.PHONY: test-training
+test-training: tests/frontend/normalize_cli tests/frontend/g2p_check
+	@test -n "$(G2P_CHECKPOINT)" || { echo 'Set G2P_CHECKPOINT to the V11 best_exact.pt file'; exit 1; }
+	$(TRAINING_PYTHON) tests/training.py --checkpoint "$(G2P_CHECKPOINT)"

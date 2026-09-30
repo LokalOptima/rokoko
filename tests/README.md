@@ -133,3 +133,6 @@ Only `af_heart` is supported. The suite also checks that retired voices are reje
 even when old voice files remain in an existing cache. Style replay coverage uses
 different rows of the same approved pack. Historical multi-voice results in REPORT.md
 are retained as evidence of the earlier run.
+
+`make test-training G2P_CHECKPOINT=/path/to/best_exact.pt` checks the consolidated
+G2P training/export boundary. See [training/g2p](../training/g2p/README.md).

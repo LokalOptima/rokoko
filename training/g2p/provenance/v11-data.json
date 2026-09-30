@@ -1,0 +1,59 @@
+{
+  "version": "v11",
+  "created": "2026-04-03T18:16:13.055578",
+  "pipeline": "raw_text -> normalize_cli -> misaki.en.G2P(fallback=espeak, unk=\"\") -> TSV",
+  "normalizer_md5": "6337118120f3c9f91e1172c4bada2a72",
+  "normalize_cli_md5": "70c6e6db0111d912f784bdd2d6ca8491",
+  "phonemizer": {
+    "package": "misaki==0.9.4",
+    "constructor": "misaki.en.G2P(trf=False, british=False, fallback=espeak.EspeakFallback(british=False), unk='')",
+    "fallback": "espeak-ng via espeakng_loader",
+    "python": "3.12.3"
+  },
+  "tsv_format": "normalized_text\tphonemes (col1 is normalize_cli output, not raw)",
+  "files": {
+    "base": {
+      "path": "data/base.tsv",
+      "source": "raw/natural/all_sentences.txt",
+      "lines": 713417,
+      "oversample": 1,
+      "effective_lines": 713417,
+      "text_chars": 89281204,
+      "phone_chars": 91086613,
+      "md5": "dee1db3247a85d197d1935136f933221",
+      "source_md5": "3e83969c40c52077ecb2c8c9eb8062ff",
+      "question_marks": 0
+    },
+    "augment_heuristic": {
+      "path": "data/augment_heuristic.tsv",
+      "source": "raw/synthetic/augment_heuristic.txt",
+      "lines": 33476,
+      "oversample": 5,
+      "effective_lines": 167380,
+      "text_chars": 1726570,
+      "phone_chars": 1816332,
+      "md5": "4a8710e190c2e79de1f11c55f4b7e8a2",
+      "source_md5": "d9428e6e24818a960e5c8b56be8a7c2b",
+      "question_marks": 0
+    },
+    "augment_llm": {
+      "path": "data/augment_llm.tsv",
+      "source": "raw/synthetic/augment_llm_combined.txt",
+      "lines": 17874,
+      "oversample": 5,
+      "effective_lines": 89370,
+      "text_chars": 1018530,
+      "phone_chars": 1063341,
+      "md5": "2449fe74b69f9ab8e8c70ace525e06aa",
+      "source_md5": "daa4fc1900182c4dbec281f39f3cf22e",
+      "question_marks": 0
+    }
+  },
+  "training": {
+    "architecture": "8 layers, d=256, 4 heads, ff=1024, RoPE+RMSNorm, no conv, no QK-norm, CTC upsample=3",
+    "data_arg": "data/base.tsv,data/augment_heuristic.tsv:5,data/augment_llm.tsv:5",
+    "flags": "--nlayers 8 --no-conv --no-qk-norm --muon --compile --epochs 50"
+  },
+  "total_lines": 764767,
+  "total_effective_lines": 970167
+}

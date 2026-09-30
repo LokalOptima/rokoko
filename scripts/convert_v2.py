@@ -56,7 +56,7 @@ def write_koko_v2(path: str, entries: list[tuple[str, np.ndarray]]):
     header_lines = []
     offset = 0
     for name, arr in entries:
-        dtype_str = "fp32" if arr.dtype == np.float32 else "fp16"
+        dtype_str = "fp32" if arr.dtype == np.float32 else "float16"
         size_bytes = arr.nbytes
         shape_str = " ".join(str(s) for s in arr.shape)
         header_lines.append(f"{name} {offset} {size_bytes} {dtype_str} {shape_str}")

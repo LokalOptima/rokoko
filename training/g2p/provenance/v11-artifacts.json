@@ -1,0 +1,15 @@
+{
+  "source_repository": "LokalOptima/rokoko-g2p",
+  "source_commit": "936e25b",
+  "checkpoint": {
+    "file": "training/v11/best_exact.pt",
+    "sha256": "abb194fdd66c73fe0708f51e4e2bb40b92750700df1ade74a755b36d7bad6c89"
+  },
+  "export": {
+    "file": "g2p.bin",
+    "sha256": "dfea20100c01c33d2ad3fa32e8ae09289b9ff3b3abf66ffe50686b4e44d7fd48",
+    "md5": "98dbb7bb697565d131a565ac644ae5da"
+  },
+  "original_training_data_reproducible": false,
+  "reason": "base.tsv and augment_heuristic.tsv were regenerated after V11 training. v11-data.json records the historical input hashes, not the regenerated files."
+}
