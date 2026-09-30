@@ -8,13 +8,11 @@
 
 set -e
 
-# Take exclusive GPU lock for the entire benchmark so nothing else interferes
-exec 9>/tmp/gpu.lock
-flock --exclusive 9
-
 BINARY="${1:-./rokoko}"
 WARMUP="${2:-10}"
 RUNS="${3:-30}"
+shift 3 2>/dev/null || true
+EXTRA_ARGS="$@"
 PORT=8097
 PARAKETTO="$HOME/git/LokalOptima/paraketto/paraketto.fp8"
 
@@ -34,7 +32,7 @@ pkill -f "rokoko --serve" 2>/dev/null || true
 sleep 0.5
 
 # Start server
-"$BINARY" --serve "$PORT" 2>/dev/null &
+"$BINARY" --serve "$PORT" $EXTRA_ARGS 2>/dev/null &
 SERVER_PID=$!
 
 # Wait for server
