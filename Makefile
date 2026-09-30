@@ -11,7 +11,7 @@ LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lpthread
 SHARED_OBJS = src/kernels.o src/cutlass_conv.o src/cutlass_gemm.o \
               src/cutlass_gemm_f16.o src/cutlass_conv_f16.o
 
-.PHONY: clean bench bench-fp16
+.PHONY: clean bench bench-fp16 test-frontend
 .DEFAULT_GOAL := rokoko
 
 src/kernels.o: src/kernels.cu src/kernels.h
@@ -42,6 +42,20 @@ rokoko.fp16: src/main.o src/rokoko_f16.cpp src/weights.cpp src/weights.h $(SHARE
 	$(CXX) $(CXXFLAGS) -mavx2 -mfma \
 		src/main.o src/rokoko_f16.cpp src/weights.cpp \
 		$(SHARED_OBJS) $(LDFLAGS) -o $@
+
+# --- Text frontend checks (see tests/frontend/README.md) ---
+
+FRONTEND = tests/frontend
+G2P ?= $(HOME)/.cache/rokoko/g2p.bin
+
+$(FRONTEND)/normalize_cli: $(FRONTEND)/normalize_cli.cpp src/normalize.h
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Isrc $< -o $@
+
+$(FRONTEND)/g2p_check: $(FRONTEND)/g2p_check.cu src/g2p.h src/normalize.h src/cutlass_gemm.o src/kernels.o
+	$(NVCC) $(NVFLAGS) $< src/cutlass_gemm.o src/kernels.o -o $@
+
+test-frontend: $(FRONTEND)/normalize_cli $(FRONTEND)/g2p_check
+	uv run $(FRONTEND)/eval_frontend.py --g2p $(G2P)
 
 bench: rokoko
 	./bench.sh ./rokoko 3 10

@@ -38,10 +38,10 @@ extern const char* default_weights_filename();
 extern size_t default_weights_size();
 
 // Release base URL — single source of truth for all downloads
-static const char* RELEASE_BASE = "https://github.com/LokalOptima/rokoko/releases/download/v2.0.1/";
+static const char* RELEASE_BASE = "https://github.com/LokalOptima/rokoko/releases/download/v2.1.0/";
 
 static const char* G2P_FILENAME = "g2p.bin";
-static const size_t G2P_SIZE = 34641552;
+static const size_t G2P_SIZE = 34630156;  // G2P V11 (md5 98dbb7bb697565d131a565ac644ae5da)
 static const char* VOICE_NAMES[] = {"af_heart", "af_bella", "af_nicole", "af_sky"};
 static const size_t VOICE_SIZE = 522240;  // all voices are the same size
 
@@ -95,6 +95,9 @@ int main(int argc, char** argv) {
     std::string weights_path = cache + "/" + default_weights_filename();
     std::string g2p_path = cache + "/" + G2P_FILENAME;
     std::string voices_dir = cache + "/voices";
+    // Files given explicitly are used as-is: never size-checked, deleted or
+    // replaced by a download (a G2P model of a different size is not corrupt).
+    bool user_weights = false, user_g2p = false, user_voices = false;
     std::string text_input;
     std::string voice_name = "af_heart";
     std::string output_path = "output.wav";
@@ -105,9 +108,9 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--weights" && i + 1 < argc)      weights_path = argv[++i];
-        else if (arg == "--g2p" && i + 1 < argc)     g2p_path = argv[++i];
-        else if (arg == "--voices" && i + 1 < argc)   voices_dir = argv[++i];
+        if (arg == "--weights" && i + 1 < argc)      { weights_path = argv[++i]; user_weights = true; }
+        else if (arg == "--g2p" && i + 1 < argc)     { g2p_path = argv[++i]; user_g2p = true; }
+        else if (arg == "--voices" && i + 1 < argc)   { voices_dir = argv[++i]; user_voices = true; }
         else if (arg == "--voice" && i + 1 < argc)    voice_name = argv[++i];
         else if (arg == "-o" && i + 1 < argc)         output_path = argv[++i];
         else if (arg == "--stdout")                    output_path = "-";
@@ -135,17 +138,24 @@ int main(int argc, char** argv) {
 
     // --- Auto-download missing or corrupt files ---
     {
-        struct Download { std::string path; std::string url; std::string label; size_t expected_size; };
+        struct Download { std::string path; std::string url; std::string label; size_t expected_size; bool user_given; };
         std::vector<Download> needed;
         needed.push_back({weights_path, release_url(default_weights_filename()),
-                          "weights", default_weights_size()});
-        needed.push_back({g2p_path, release_url(G2P_FILENAME), "g2p", G2P_SIZE});
+                          "weights", default_weights_size(), user_weights});
+        needed.push_back({g2p_path, release_url(G2P_FILENAME), "g2p", G2P_SIZE, user_g2p});
         for (size_t i = 0; i < std::size(VOICE_NAMES); i++)
             needed.push_back({voices_dir + "/" + VOICE_NAMES[i] + ".bin",
                               release_url(std::string(VOICE_NAMES[i]) + ".bin"),
-                              std::string("voice ") + VOICE_NAMES[i], VOICE_SIZE});
+                              std::string("voice ") + VOICE_NAMES[i], VOICE_SIZE, user_voices});
 
         for (auto& f : needed) {
+            if (f.user_given) {
+                if (!file_ok(f.path)) {
+                    fprintf(stderr, "Error: %s file not found: %s\n", f.label.c_str(), f.path.c_str());
+                    return 1;
+                }
+                continue;
+            }
             if (!file_ok(f.path, f.expected_size)) {
                 fprintf(stderr, "%s not found at %s — downloading...\n", f.label.c_str(), f.path.c_str());
                 if (!download_file(f.url, f.path)) {

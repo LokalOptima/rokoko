@@ -8,3 +8,5 @@ weights/
 scripts/
 bench.sh
 scratch/
+tests/frontend/normalize_cli
+tests/frontend/g2p_check

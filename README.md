@@ -8,7 +8,11 @@ Fast text-to-speech on GPU. Neural G2P + Kokoro TTS in a single CUDA binary.
 
 ## Build
 
-Requires CUDA 13+ and a C++17 compiler.
+Requires CUDA 13+ and a C++17 compiler. CUTLASS (headers only) isn't in the repo:
+
+```bash
+git clone --depth 1 --branch v4.4.1 https://github.com/NVIDIA/cutlass third_party/cutlass
+```
 
 ```bash
 make rokoko          # FP32 inference
@@ -19,6 +23,12 @@ Set `CUDA_HOME` if CUDA isn't at `/usr/local/cuda-13.1`:
 
 ```bash
 make rokoko CUDA_HOME=/usr/local/cuda-12.6
+```
+
+Text frontend tests (normalizer + G2P), see [tests/frontend](tests/frontend/README.md):
+
+```bash
+make test-frontend
 ```
 
 ## Usage

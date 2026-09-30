@@ -134,6 +134,25 @@ inline void emit_year_to_words(std::string& out, int year) {
     else { out += ' '; emit_two_digit(out, lo); }
 }
 
+// Bare 4-digit numbers in this range are read as years ("1969" → "nineteen
+// sixty nine"). Round thousands stay cardinal ("2000" → "two thousand").
+inline bool is_year_like(long long v) { return v >= 1001 && v <= 2099 && v % 1000 != 0; }
+
+// "ninety" → "nineties", "hundred" → "hundreds" (for decades: "the 1990s").
+inline void pluralize_last_word(std::string& out) {
+    if (!out.empty() && out.back() == 'y') { out.pop_back(); out.append("ies"); }
+    else out += 's';
+}
+
+// Denominators we read as fractions. Anything else ("9/11") is not a fraction.
+inline bool is_common_denom(int d) {
+    switch (d) {
+        case 2: case 3: case 4: case 5: case 6: case 8: case 10:
+        case 12: case 16: case 32: case 64: case 100: return true;
+        default: return false;
+    }
+}
+
 inline bool emit_denom_word(std::string& out, int d, bool plural) {
     if (d >= 2 && d <= 20) { out.append(plural ? DENOM_PLUR[d] : DENOM_SING[d]); return true; }
     if (d > 20 && d < 100 && d % 10 != 0) {
@@ -329,6 +348,26 @@ inline bool try_money(Scanner& sc, const CurrencyInfo& ci) {
     size_t end = off + amt.consumed;
     if (sc.has(end) && std::isalpha((unsigned char)sc.s[sc.pos + end])) return false;
 
+    // Scaled amounts: "$2.5 million" → "two point five million dollars"
+    static const char* SCALES[] = {"thousand", "million", "billion", "trillion"};
+    if (sc.at(end) == ' ') {
+        for (const char* scale : SCALES) {
+            size_t slen = std::strlen(scale);
+            if (!sc.match_str(end + 1, scale) || !sc.word_end(end + 1 + slen)) continue;
+            emit_number_to_words(sc.out, (int)amt.whole);
+            if (amt.has_decimal) {
+                sc.emit(" point");
+                size_t j = off;
+                while (sc.at(j) != '.') j++;
+                for (j++; j < end; j++) { sc.emit_char(' '); sc.emit(DIGIT_WORDS[sc.at(j) - '0']); }
+            }
+            sc.emit_char(' '); sc.emit(scale);
+            sc.emit_char(' '); sc.emit(ci.plur);
+            sc.advance(end + 1 + slen);
+            return true;
+        }
+    }
+
     // Build expansion
     bool has_whole = amt.whole > 0;
     bool has_cents = amt.cents > 0 && ci.csing[0] != '\0';
@@ -447,7 +486,42 @@ inline bool try_date_dmy_sep(Scanner& sc, char sep) {
     sc.advance(total);
     return true;
 }
-inline bool try_date_dmy(Scanner& sc) { return try_date_dmy_sep(sc, '/'); }
+// A/B/YYYY. Expanded only when the order is unambiguous (one part > 12):
+// "2/18/1975" and "18/2/1975" are both February eighteenth. When both parts
+// are <= 12 ("4/5/1926") we don't guess: "four slash five slash nineteen
+// twenty six".
+inline bool try_date_slash(Scanner& sc) {
+    if (!sc.word_start()) return false;
+    auto a = sc.scan_digits(0);
+    if (a.count < 1 || a.count > 2 || sc.at(a.count) != '/') return false;
+    auto b = sc.scan_digits(a.count + 1);
+    if (b.count < 1 || b.count > 2) return false;
+    int off2 = a.count + 1 + b.count;
+    if (sc.at(off2) != '/') return false;
+    int y = sc.scan_fixed_digits(off2 + 1, 4);
+    if (y < 0) return false;
+    int total = off2 + 5;
+    if (!sc.word_end(total)) return false;
+    int A = (int)a.val, B = (int)b.val;
+    if (A > 12 && B <= 12) {
+        if (!valid_date(B, A, y)) return false;
+        emit_date(sc, B, A, y);
+    } else if (B > 12 && A <= 12) {
+        if (!valid_date(A, B, y)) return false;
+        emit_date(sc, A, B, y);
+    } else if (A <= 12 && B <= 12) {
+        if (A < 1 || B < 1 || !valid_date(1, 1, y)) return false;
+        emit_number_to_words(sc.out, A);
+        sc.emit(" slash ");
+        emit_number_to_words(sc.out, B);
+        sc.emit(" slash ");
+        emit_year_to_words(sc.out, y);
+    } else {
+        return false;
+    }
+    sc.advance(total);
+    return true;
+}
 
 inline bool try_date_iso(Scanner& sc) {
     // YYYY-MM-DD
@@ -496,21 +570,54 @@ inline bool try_date_textual(Scanner& sc) {
     off += sc.skip_space(off);
     if (!sc.is_digit(off)) return false;
     auto day = sc.scan_digits(off);
-    if (day.count < 1 || day.count > 2) return false;
+    if (day.count < 1 || day.count > 2 || day.val < 1 || day.val > 31) return false;
     off += day.count;
-    // Optional comma
+    size_t day_end = off;
+    // Optional comma, then space and a 4-digit year
     if (sc.at(off) == ',') off++;
-    // Must have space before year
     int sp = sc.skip_space(off);
-    if (sp == 0) return false;
-    off += sp;
-    int year = sc.scan_fixed_digits(off, 4);
-    if (year < 0) return false;
-    off += 4;
-    if (!sc.word_end(off)) return false;
-    if (!valid_date(mm.month, (int)day.val, year)) return false;
-    emit_date(sc, mm.month, (int)day.val, year);
-    sc.advance(off);
+    int year = sp > 0 ? sc.scan_fixed_digits(off + sp, 4) : -1;
+    if (year >= 0 && sc.word_end(off + sp + 4) && valid_date(mm.month, (int)day.val, year)) {
+        emit_date(sc, mm.month, (int)day.val, year);
+        sc.advance(off + sp + 4);
+        return true;
+    }
+    // No year: "April 5" → "April fifth" (but not "May 5:30" or "May 5.5")
+    if (!sc.word_end(day_end) || sc.at(day_end) == ':' ||
+        (sc.at(day_end) == '.' && sc.is_digit(day_end + 1)))
+        return false;
+    sc.emit(MONTH_NAMES[mm.month - 1]);
+    sc.emit_char(' ');
+    sc.emit(DAY_ORDINALS[day.val]);
+    sc.advance(day_end);
+    return true;
+}
+
+// "7 October 2012" / "7 Oct 2012" / "7 October" → "the seventh of October twenty twelve"
+inline bool try_date_day_month(Scanner& sc) {
+    if (!sc.word_start()) return false;
+    auto day = sc.scan_digits(0);
+    if (day.count < 1 || day.count > 2 || day.val < 1 || day.val > 31) return false;
+    if (sc.at(day.count) != ' ') return false;
+    size_t off = day.count + 1;
+    auto mm = match_month_full(sc, off);
+    if (mm.month == 0) mm = match_month_abbrev(sc, off);
+    if (mm.month == 0) return false;
+    // "May" is also a verb: "5 May be" — require a year or sentence punctuation after it
+    size_t mend = off + mm.len;
+    int year = -1;
+    size_t yoff = mend + (sc.at(mend) == ',' ? 1 : 0);
+    if (sc.at(yoff) == ' ') {
+        int y = sc.scan_fixed_digits(yoff + 1, 4);
+        if (y >= 0 && sc.word_end(yoff + 5) && valid_date(mm.month, (int)day.val, y)) { year = y; mend = yoff + 5; }
+    }
+    if (year < 0 && mm.month == 5 && !(sc.at(mend) == '.' || sc.at(mend) == ',' || !sc.has(mend))) return false;
+    sc.emit("the ");
+    sc.emit(DAY_ORDINALS[day.val]);
+    sc.emit(" of ");
+    sc.emit(MONTH_NAMES[mm.month - 1]);
+    if (year >= 0) { sc.emit_char(' '); emit_year_to_words(sc.out, year); }
+    sc.advance(mend);
     return true;
 }
 
@@ -549,6 +656,28 @@ inline bool try_time(Scanner& sc) {
     }
 
     int hour = (int)h.val;
+
+    // H:MM:SS duration: "2:03:45" → "two hours three minutes and forty five seconds"
+    if (!has_period && sc.at(off) == ':') {
+        int second = sc.scan_fixed_digits(off + 1, 2);
+        if (second < 0 || second > 59 || !sc.word_end(off + 3)) return false;
+        const char* units[3][2] = {{"hour", "hours"}, {"minute", "minutes"}, {"second", "seconds"}};
+        int vals[3] = {hour, minute, second};
+        int nonzero = (hour > 0) + (minute > 0) + (second > 0);
+        if (nonzero == 0) return false;
+        int emitted = 0;
+        for (int k = 0; k < 3; k++) {
+            if (vals[k] == 0) continue;
+            if (emitted > 0) sc.emit(emitted == nonzero - 1 ? " and " : " ");
+            emit_number_to_words(sc.out, vals[k]);
+            sc.emit_char(' ');
+            sc.emit(units[k][vals[k] == 1 ? 0 : 1]);
+            emitted++;
+        }
+        sc.advance(off + 3);
+        return true;
+    }
+
     if (has_period) {
         // 12-hour format
         if (hour < 1 || hour > 12) return false;
@@ -567,10 +696,18 @@ inline bool try_time(Scanner& sc) {
         return true;
     }
 
-    // 24-hour: only match unambiguous cases (hour >= 13 or hour == 0)
     if (hour > 23) return false;
-    if (hour >= 1 && hour <= 12) return false; // ambiguous without AM/PM, skip
     if (!sc.word_end(off)) return false;
+
+    // 1-12 without AM/PM: "6:15" → "six fifteen", "6:00" → "six o'clock"
+    if (hour >= 1 && hour <= 12) {
+        emit_number_to_words(sc.out, hour);
+        if (minute == 0) sc.emit(" o'clock");
+        else if (minute < 10) { sc.emit(" oh "); emit_number_to_words(sc.out, minute); }
+        else { sc.emit_char(' '); emit_number_to_words(sc.out, minute); }
+        sc.advance(off);
+        return true;
+    }
 
     if (hour == 0) sc.emit("zero"); else emit_number_to_words(sc.out, hour);
     if (minute == 0) {
@@ -587,6 +724,9 @@ inline bool try_time(Scanner& sc) {
 }
 
 inline bool try_date_dmy_dot(Scanner& sc) { return try_date_dmy_sep(sc, '.'); }
+
+struct UnitEntry;
+inline const UnitEntry* match_unit(const Scanner& sc, size_t offset);
 
 // ── Time (period-separated: H.MM am/pm or H.MM a.m./p.m.) ─────────────────
 
@@ -619,7 +759,24 @@ inline bool try_time_dot(Scanner& sc) {
     } else if (sc.match_str_ci(poff, "p.m")) {
         is_pm = true; period_len = sp + 3;
     } else {
-        return false;  // No AM/PM → not a time
+        // No AM/PM: a time only after a time preposition ("at 6.30", "until 10.15"),
+        // and not when a unit follows ("at 3.25 meters")
+        if (!sc.word_end(off) || match_unit(sc, off)) return false;
+        static const char* PREPS[] = {"at", "by", "until", "till", "before", "after", "around", "from"};
+        if (sc.pos < 2 || sc.s[sc.pos - 1] != ' ') return false;
+        size_t e = sc.pos - 1, b = e;
+        while (b > 0 && std::isalpha((unsigned char)sc.s[b - 1])) b--;
+        bool prep = false;
+        for (const char* p : PREPS)
+            if (e - b == std::strlen(p) && std::strncmp(sc.s + b, p, e - b) == 0) { prep = true; break; }
+        int hour = (int)h.val;
+        if (!prep || hour < 1 || hour > 12) return false;
+        emit_number_to_words(sc.out, hour);
+        if (minute == 0) sc.emit(" o'clock");
+        else if (minute < 10) { sc.emit(" oh "); emit_number_to_words(sc.out, minute); }
+        else { sc.emit_char(' '); emit_number_to_words(sc.out, minute); }
+        sc.advance(off);
+        return true;
     }
 
     int hour = (int)h.val;
@@ -637,6 +794,24 @@ inline bool try_time_dot(Scanner& sc) {
     }
     sc.emit(is_pm ? " P M" : " A M");
     sc.advance(off + period_len);
+    return true;
+}
+
+// "9 PM", "9pm", "11 a.m." → "nine P M"
+inline bool try_hour_period(Scanner& sc) {
+    if (!sc.word_start()) return false;
+    auto h = sc.scan_digits(0);
+    if (h.count < 1 || h.count > 2 || h.val < 1 || h.val > 12) return false;
+    size_t poff = h.count + sc.skip_space(h.count);
+    bool is_pm; size_t plen;
+    if (sc.match_str_ci(poff, "a.m.")) { is_pm = false; plen = 4; }
+    else if (sc.match_str_ci(poff, "p.m.")) { is_pm = true; plen = 4; }
+    else if (sc.match_str_ci(poff, "am") && sc.word_end(poff + 2)) { is_pm = false; plen = 2; }
+    else if (sc.match_str_ci(poff, "pm") && sc.word_end(poff + 2)) { is_pm = true; plen = 2; }
+    else return false;
+    emit_number_to_words(sc.out, (int)h.val);
+    sc.emit(is_pm ? " P M" : " A M");
+    sc.advance(poff + plen);
     return true;
 }
 
@@ -696,6 +871,21 @@ inline bool try_phone_country(Scanner& sc) {
     return true;
 }
 
+inline bool try_phone_7digit(Scanner& sc) {
+    // NNN-NNNN
+    if (!sc.word_start()) return false;
+    if (!sc.is_digit(0) || !sc.is_digit(1) || !sc.is_digit(2) || sc.at(3) != '-') return false;
+    if (!sc.is_digit(4) || !sc.is_digit(5) || !sc.is_digit(6) || !sc.is_digit(7)) return false;
+    if (!sc.word_end(8)) return false;
+    // "100-1000" is a range, not a phone number
+    if (sc.scan_fixed_digits(0, 3) % 10 == 0 && sc.scan_fixed_digits(4, 4) % 10 == 0) return false;
+    sc.emit_digit_words(0, 3);
+    sc.emit(" ");
+    sc.emit_digit_words(4, 4);
+    sc.advance(8);
+    return true;
+}
+
 inline bool try_phone_10digit(Scanner& sc) {
     // NNN-NNN-NNNN or NNN.NNN.NNNN
     if (!sc.word_start()) return false;
@@ -719,24 +909,54 @@ inline bool try_phone_10digit(Scanner& sc) {
 
 // ── Fractions ───────────────────────────────────────────────────────────────
 
+// Parse a proper fraction N/D at off. Returns chars consumed, 0 if none.
+inline size_t parse_fraction(const Scanner& sc, size_t off, int& n, int& d) {
+    if (off > 0 && sc.is_alnum(off - 1)) return 0;
+    auto num = sc.scan_digits(off);
+    if (num.count < 1 || num.count > 3) return 0;
+    if (sc.at(off + num.count) != '/') return 0;
+    auto den = sc.scan_digits(off + num.count + 1);
+    if (den.count < 1 || den.count > 3) return 0;
+    size_t total = num.count + 1 + den.count;
+    if (!sc.word_end(off + total)) return 0;
+    n = (int)num.val; d = (int)den.val;
+    if (n <= 0 || n >= d || !is_common_denom(d)) return 0;
+    return total;
+}
+
+inline void emit_fraction(std::string& out, int n, int d) {
+    emit_number_to_words(out, n);
+    out += ' ';
+    emit_denom_word(out, d, n > 1);
+}
+
 inline bool try_fraction(Scanner& sc) {
     if (!sc.word_start()) return false;
-    auto num = sc.scan_digits(0);
-    if (num.count < 1 || num.count > 3) return false;
-    if (sc.at(num.count) != '/') return false;
-    auto den = sc.scan_digits(num.count + 1);
-    if (den.count < 1 || den.count > 3) return false;
-    size_t total = num.count + 1 + den.count;
-    if (!sc.word_end(total)) return false;
-
-    int n = (int)num.val, d = (int)den.val;
-    if (n <= 0 || d < 2 || d > 100 || n >= d) return false;
-
-    emit_number_to_words(sc.out, n);
-    sc.emit_char(' ');
-    emit_denom_word(sc.out, d, n > 1);
+    int n, d;
+    size_t total = parse_fraction(sc, 0, n, d);
+    if (!total) return false;
+    emit_fraction(sc.out, n, d);
     sc.advance(total);
     return true;
+}
+
+// Numbers with a fixed spoken form.
+inline bool try_number_idiom(Scanner& sc) {
+    if (!sc.word_start()) return false;
+    static const struct { const char* text; const char* spoken; } IDIOMS[] = {
+        {"24/7", "twenty four seven"}, {"9/11", "nine eleven"},
+        {"7/11", "seven eleven"}, {"50/50", "fifty fifty"},
+        {"401(k)", "four oh one k"},
+    };
+    for (const auto& idiom : IDIOMS) {
+        size_t n = std::strlen(idiom.text);
+        if (sc.match_str(0, idiom.text) && sc.word_end(n)) {
+            sc.emit(idiom.spoken);
+            sc.advance(n);
+            return true;
+        }
+    }
+    return false;
 }
 
 // ── Ordinals ────────────────────────────────────────────────────────────────
@@ -813,10 +1033,18 @@ inline bool try_percent(Scanner& sc) {
 // Matches <integer_or_decimal><optional_space><unit_abbrev> and expands both.
 // Must come before try_decimal/try_number to catch "2.5GB", "100kg", etc.
 
-struct UnitEntry { const char* abbr; const char* singular; const char* plural; };
+// attached_only: the abbreviation is also a common word, so it's a unit only
+// when written without a space ("5in" yes, "19 in March" no).
+struct UnitEntry { const char* abbr; const char* singular; const char* plural; bool attached_only = false; };
 
 inline const UnitEntry* match_unit(const Scanner& sc, size_t offset) {
     static const UnitEntry UNITS[] = {
+        // Temperature / angle (° is C2 B0)
+        {"\xC2\xB0""F", "degree Fahrenheit", "degrees Fahrenheit"},
+        {"\xC2\xB0""C", "degree Celsius", "degrees Celsius"},
+        {"\xC2\xB0"" F", "degree Fahrenheit", "degrees Fahrenheit"},
+        {"\xC2\xB0"" C", "degree Celsius", "degrees Celsius"},
+        {"\xC2\xB0", "degree", "degrees"},
         // Length
         {"km/h", "kilometers per hour", "kilometers per hour"},
         {"mph", "miles per hour", "miles per hour"},
@@ -824,16 +1052,21 @@ inline const UnitEntry* match_unit(const Scanner& sc, size_t offset) {
         {"mm", "millimeter", "millimeters"},
         {"cm", "centimeter", "centimeters"},
         {"ft", "foot", "feet"},
-        {"in", "inch", "inches"},
+        {"in", "inch", "inches", true},
         {"mi", "mile", "miles"},
+        {"m", "meter", "meters"},
         // Weight
         {"lbs", "pounds", "pounds"},
         {"kg", "kilogram", "kilograms"},
         {"lb", "pound", "pounds"},
         {"oz", "ounce", "ounces"},
+        {"mg", "milligram", "milligrams"},
+        {"g", "gram", "grams"},
         // Volume
         {"ml", "milliliter", "milliliters"},
+        {"mL", "milliliter", "milliliters"},
         {"gal", "gallon", "gallons"},
+        {"L", "liter", "liters"},
         // Digital
         {"TB", "terabyte", "terabytes"},
         {"GB", "gigabyte", "gigabytes"},
@@ -861,9 +1094,11 @@ inline const UnitEntry* match_unit(const Scanner& sc, size_t offset) {
 
     // Skip optional space
     size_t u = offset;
-    if (sc.has(u) && sc.s[sc.pos + u] == ' ') u++;
+    bool spaced = sc.has(u) && sc.s[sc.pos + u] == ' ';
+    if (spaced) u++;
 
     for (const auto& unit : UNITS) {
+        if (unit.attached_only && spaced) continue;
         size_t ulen = std::strlen(unit.abbr);
         bool match = true;
         for (size_t j = 0; j < ulen && match; j++) {
@@ -986,6 +1221,77 @@ inline bool try_number(Scanner& sc) {
     bool adj_before = sc.pos > 0 && (std::isalpha((unsigned char)sc.s[sc.pos - 1]) || (uint8_t)sc.s[sc.pos - 1] >= 0x80);
     bool adj_after = sc.has(i) && (std::isalpha((unsigned char)sc.s[sc.pos + i]) || (uint8_t)sc.s[sc.pos + i] >= 0x80);
 
+    bool plain4 = (i == 4);  // four digits, no commas
+    bool year = plain4 && is_year_like(val);
+
+    // Decades: "1990s", "1990's", "80s" → "nineteen nineties", "eighties"
+    if (!adj_before && val % 10 == 0 && (plain4 || i == 2)) {
+        size_t s_off = i + (sc.at(i) == '\'' ? 1 : 0);
+        if (sc.at(s_off) == 's' && sc.word_end(s_off + 1) && (i == 4 ? val >= 1000 : val >= 20)) {
+            if (i == 4) emit_year_to_words(sc.out, (int)val);
+            else {
+                // Drop the apostrophe of "'80s" (already copied to output)
+                if (sc.pos > 0 && sc.s[sc.pos - 1] == '\'' && !sc.out.empty() && sc.out.back() == '\'')
+                    sc.out.pop_back();
+                sc.emit(TENS[val / 10]);
+            }
+            pluralize_last_word(sc.out);
+            sc.advance(s_off + 1);
+            return true;
+        }
+    }
+
+    // Abbreviated years: "'97" → "ninety seven", "'05" → "oh five"
+    if (i == 2 && sc.pos > 0 && sc.s[sc.pos - 1] == '\'' && !adj_after &&
+        (sc.pos == 1 || !std::isalnum((unsigned char)sc.s[sc.pos - 2])) &&
+        !sc.out.empty() && sc.out.back() == '\'') {
+        sc.out.pop_back();
+        if (val < 10) { sc.emit("oh "); sc.emit(ONES[val]); }
+        else emit_two_digit(sc.out, (int)val);
+        sc.advance(i);
+        return true;
+    }
+
+    // Currency written after the amount: "20$" → "twenty dollars", "20€" → "twenty euros"
+    if (!adj_before) {
+        const char* cur = nullptr; const char* cur_one = nullptr; size_t clen = 0;
+        if (sc.at(i) == '$') { cur = "dollars"; cur_one = "dollar"; clen = 1; }
+        else if ((uint8_t)sc.at(i) == 0xE2 && (uint8_t)sc.at(i + 1) == 0x82 && (uint8_t)sc.at(i + 2) == 0xAC) {
+            cur = "euros"; cur_one = "euro"; clen = 3;
+        }
+        if (cur && val <= 999999999) {
+            emit_number_to_words(sc.out, (int)val);
+            sc.emit_char(' ');
+            sc.emit(val == 1 ? cur_one : cur);
+            sc.advance(i + clen);
+            return true;
+        }
+    }
+
+    // Number + capital letters: "221B" → "two hundred twenty one B", "2XL" → "two XL"
+    if (!adj_before && adj_after && val <= 999999999) {
+        size_t caps = 0;
+        while (caps < 3 && std::isupper((unsigned char)sc.at(i + caps))) caps++;
+        if (caps > 0 && sc.word_end(i + caps)) {
+            emit_number_to_words(sc.out, (int)val);
+            sc.emit_char(' ');
+            for (size_t k = 0; k < caps; k++) sc.emit_char(sc.at(i + k));
+            sc.advance(i + caps);
+            return true;
+        }
+    }
+
+    // Leading zeros are codes, not quantities: "000" → "zero zero zero", "007"
+    if (!adj_before && !adj_after && i > 1 && sc.at(0) == '0') {
+        bool digits_only = true;
+        for (size_t k = 0; k < i; k++) if (!sc.is_digit(k)) digits_only = false;
+        if (digits_only) {
+            sc.emit_digit_words(0, (int)i);
+            sc.advance(i);
+            return true;
+        }
+    }
+
     if (adj_before || adj_after) {
         // Copy all digits+commas through verbatim (no expansion)
         for (size_t j = 0; j < i; j++) sc.emit_char(sc.at(j));
@@ -995,7 +1301,77 @@ inline bool try_number(Scanner& sc) {
 
     if (val > 999999999) return false;
 
-    emit_number_to_words(sc.out, (int)val);
+    if (val == 911 && i == 3) sc.emit("nine one one");
+    else if (year) emit_year_to_words(sc.out, (int)val);
+    else emit_number_to_words(sc.out, (int)val);
+
+    // Scale word + unit: "150 million km" → "one hundred fifty million kilometers"
+    if (sc.at(i) == ' ') {
+        static const char* SCALES[] = {"thousand", "million", "billion"};
+        for (const char* scale : SCALES) {
+            size_t slen = std::strlen(scale);
+            if (!sc.match_str(i + 1, scale) || !sc.word_end(i + 1 + slen)) continue;
+            size_t after = i + 1 + slen;
+            if (sc.at(after) != ' ') break;
+            const UnitEntry* unit = match_unit(sc, after);
+            if (!unit) break;
+            sc.emit_char(' '); sc.emit(scale);
+            sc.emit_char(' '); sc.emit(unit->plural);
+            sc.advance(after + 1 + std::strlen(unit->abbr));
+            return true;
+        }
+    }
+
+    // Ranges and scores: "10-20" → "ten to twenty", "1990-1995" → years
+    if (i <= 4 && sc.at(i) == '-' && sc.is_digit(i + 1)) {
+        auto r = sc.scan_digits(i + 1);
+        size_t r_end = i + 1 + r.count;
+        bool chained = (sc.at(r_end) == '-' && sc.is_digit(r_end + 1)) ||   // "40-50-60"
+                       (sc.pos >= 2 && sc.s[sc.pos - 1] == '-' && std::isdigit((unsigned char)sc.s[sc.pos - 2]));
+        if (r.count <= 4 && sc.word_end(r_end) && !chained) {
+            // A number "to" itself isn't a range: "20-20 vision" → "twenty twenty"
+            sc.emit(r.val == val ? " " : " to ");
+            if (year && r.count == 4 && is_year_like(r.val)) emit_year_to_words(sc.out, (int)r.val);
+            else emit_number_to_words(sc.out, (int)r.val);
+            sc.advance(i + 1 + r.count);
+            return true;
+        }
+    }
+
+    // Mixed numbers: "2 1/2" → "two and one half"
+    if (sc.at(i) == ' ') {
+        int n, d;
+        size_t flen = parse_fraction(sc, i + 1, n, d);
+        if (flen) {
+            sc.emit(" and ");
+            emit_fraction(sc.out, n, d);
+            sc.advance(i + 1 + flen);
+            return true;
+        }
+    }
+
+    // Number-word compounds: "80-yen" → "eighty yen", "40-year-old" → "forty year-old"
+    if (sc.at(i) == '-' && std::isalpha((unsigned char)sc.at(i + 1))) {
+        sc.emit_char(' ');
+        sc.advance(i + 1);
+        return true;
+    }
+
+    // Any other number/number: "3/7" → "three slash seven",
+    // except splits that add up to 100: "70/30" → "seventy thirty"
+    if (sc.at(i) == '/' && sc.is_digit(i + 1)) {
+        auto r = sc.scan_digits(i + 1);
+        if (r.count <= 2 && val + r.val == 100 && sc.word_end(i + 1 + r.count)) {
+            sc.emit_char(' ');
+            emit_number_to_words(sc.out, (int)r.val);
+            sc.advance(i + 1 + r.count);
+            return true;
+        }
+        sc.emit(" slash ");
+        sc.advance(i + 1);
+        return true;
+    }
+
     sc.advance(i);
     return true;
 }
@@ -1084,6 +1460,7 @@ inline const char* symbol_word(char c) {
         case '&': return "and";
         case '@': return "at";
         case '+': return "plus";
+        case '=': return "equals";
         default: return nullptr;
     }
 }
@@ -1134,10 +1511,161 @@ inline bool try_dotted_initialism(Scanner& sc) {
     return true;
 }
 
+// ── Roman numerals ─────────────────────────────────────────────────────────
+// Expanded only with context, because I/V/X/L/C/D/M are also ordinary words
+// and letters ("I think", "Vitamin C", "DC"):
+//   after a keyword ("Chapter IV", "World War II", "Super Bowl LVII") → cardinal
+//   after a capitalized name, I/V/X only, 2+ letters ("Henry VIII") → "the eighth"
+// Single letters only count after a keyword, and only I, V, X ("Part I").
+
+inline int roman_digit(char c) {
+    switch (c) {
+        case 'I': return 1; case 'V': return 5; case 'X': return 10; case 'L': return 50;
+        case 'C': return 100; case 'D': return 500; case 'M': return 1000; default: return 0;
+    }
+}
+
+// Value of a canonical numeral of length len at pos, or 0 ("IIII", "VX" → 0).
+inline int parse_roman(const Scanner& sc, size_t len) {
+    int total = 0;
+    for (size_t k = 0; k < len; k++) {
+        int v = roman_digit(sc.at(k));
+        int next = k + 1 < len ? roman_digit(sc.at(k + 1)) : 0;
+        total += v < next ? -v : v;
+    }
+    if (total <= 0 || total >= 4000) return 0;
+    // Re-render and compare, which rejects non-canonical spellings
+    static const struct { int v; const char* s; } T[] = {
+        {1000,"M"},{900,"CM"},{500,"D"},{400,"CD"},{100,"C"},{90,"XC"},
+        {50,"L"},{40,"XL"},{10,"X"},{9,"IX"},{5,"V"},{4,"IV"},{1,"I"}};
+    char buf[32]; size_t n = 0; int rem = total;
+    for (const auto& t : T)
+        while (rem >= t.v) { for (const char* p = t.s; *p; p++) buf[n++] = *p; rem -= t.v; }
+    if (n != len) return 0;
+    for (size_t k = 0; k < len; k++) if (buf[k] != sc.at(k)) return 0;
+    return total;
+}
+
+inline bool try_roman(Scanner& sc) {
+    if (sc.pos < 2 || sc.s[sc.pos - 1] != ' ') return false;
+    size_t len = 0;
+    while (roman_digit(sc.at(len))) len++;
+    if (len == 0 || !sc.word_end(len)) return false;
+    // Previous word (letters, optional trailing period for "Vol.")
+    size_t e = sc.pos - 1;
+    if (e > 0 && sc.s[e - 1] == '.') e--;
+    size_t b = e;
+    while (b > 0 && std::isalpha((unsigned char)sc.s[b - 1])) b--;
+    if (b == e) return false;
+    std::string prev(sc.s + b, e - b);
+
+    static const char* KEYWORDS[] = {
+        "Chapter", "Part", "Book", "Volume", "Vol", "Act", "Scene", "Section",
+        "Phase", "Stage", "Level", "Round", "Episode", "Season", "Title", "Article",
+        "Appendix", "War", "Bowl", "Type", "Class", "Grade", "Mark", "Series", "Unit",
+        "Game", "Wars", "Fantasy", "Olympiad", "Canto", "Psalm", "Plate", "Figure",
+    };
+    bool keyword = false;
+    for (const char* k : KEYWORDS) if (prev == k) { keyword = true; break; }
+
+    bool ivx_only = true;
+    for (size_t k = 0; k < len; k++) { char c = sc.at(k); if (c != 'I' && c != 'V' && c != 'X') ivx_only = false; }
+
+    if (keyword) {
+        if (len == 1 && !ivx_only) return false;
+        int v = parse_roman(sc, len);
+        if (!v) return false;
+        emit_number_to_words(sc.out, v);
+    } else {
+        if (len < 2 || !ivx_only || !std::isupper((unsigned char)prev[0]) || prev.size() < 2) return false;
+        for (size_t k = 1; k < prev.size(); k++) if (std::isupper((unsigned char)prev[k])) return false;
+        int v = parse_roman(sc, len);
+        if (!v) return false;
+        sc.emit("the ");
+        emit_ordinal_words(sc.out, v);
+    }
+    sc.advance(len);
+    return true;
+}
+
+// ── Abbreviations and emails (pre-pass) ────────────────────────────────────
+// Runs before the main scan so the expanded words go through the normal rules
+// ("No. 5" → "number 5" → "number five").
+
+inline bool is_word_char(char c) { return std::isalnum((unsigned char)c) || c == '\''; }
+
+inline std::string expand_abbreviations(const std::string& in) {
+    // before_name: expansion when followed by a capitalized word ("Dr. Smith");
+    // otherwise: any other position ("Elm Dr."). prefix: a title that precedes
+    // names, so "Dr. Smith" never ends a sentence; for the rest, a following
+    // capital means the period also ended the sentence ("... etc. Then").
+    static const struct { const char* abbr; const char* before_name; const char* otherwise; bool prefix; } ABBR[] = {
+        {"Mr.", "Mister", "Mister", true}, {"Mrs.", "Missus", "Missus", true}, {"Ms.", "Miz", "Miz", true},
+        {"Dr.", "Doctor", "Drive", true}, {"St.", "Saint", "Street", true}, {"Mt.", "Mount", "Mount", true},
+        {"Prof.", "Professor", "Professor", true}, {"Jr.", "Junior", "Junior", false},
+        {"Sr.", "Senior", "Senior", false}, {"Ave.", "Avenue", "Avenue", false},
+        {"Blvd.", "Boulevard", "Boulevard", false}, {"e.g.", "for example", "for example", false},
+        {"i.e.", "that is", "that is", false}, {"etc.", "et cetera", "et cetera", false},
+        {"vs.", "versus", "versus", false}, {"vs", "versus", "versus", false},
+        {"approx.", "approximately", "approximately", false},
+    };
+    std::string out;
+    out.reserve(in.size() + 16);
+    size_t i = 0, n = in.size();
+    while (i < n) {
+        bool at_word_start = i == 0 || (!is_word_char(in[i - 1]) && in[i - 1] != '.' && in[i - 1] != '@');
+        if (at_word_start) {
+            // "No. 5" → "number 5", "#1" → "number 1"
+            if (in.compare(i, 4, "No. ") == 0 && i + 4 < n && std::isdigit((unsigned char)in[i + 4])) {
+                out += "number "; i += 4; continue;
+            }
+            if (in[i] == '#' && i + 1 < n && std::isdigit((unsigned char)in[i + 1])) {
+                out += "number "; i += 1; continue;
+            }
+            bool matched = false;
+            for (const auto& a : ABBR) {
+                size_t len = std::strlen(a.abbr);
+                if (in.compare(i, len, a.abbr) != 0) continue;
+                size_t j = i + len;
+                if (j < n && (is_word_char(in[j]) || in[j] == '.')) continue;
+                bool next_capital = j + 1 < n && in[j] == ' ' && std::isupper((unsigned char)in[j + 1]);
+                out += next_capital ? a.before_name : a.otherwise;
+                bool ends_sentence = j >= n || (next_capital && !a.prefix);
+                if (a.abbr[len - 1] == '.' && ends_sentence) out += '.';
+                i = j; matched = true; break;
+            }
+            if (matched) continue;
+            // Email: local@domain.tld → "local at domain dot tld"
+            size_t k = i;
+            while (k < n && (std::isalnum((unsigned char)in[k]) || in[k] == '.' || in[k] == '_' || in[k] == '-')) k++;
+            if (k > i && k < n && in[k] == '@') {
+                size_t d = k + 1, dots = 0;
+                while (d < n && (std::isalnum((unsigned char)in[d]) || in[d] == '-' ||
+                                 (in[d] == '.' && d + 1 < n && std::isalnum((unsigned char)in[d + 1])))) {
+                    if (in[d] == '.') dots++;
+                    d++;
+                }
+                if (dots > 0 && d > k + 1) {
+                    for (size_t c = i; c < d; c++) {
+                        if (in[c] == '@') out += " at ";
+                        else if (in[c] == '.') out += " dot ";
+                        else if (in[c] == '_') out += " underscore ";
+                        else out += in[c];
+                    }
+                    i = d; continue;
+                }
+            }
+        }
+        out += in[i++];
+    }
+    return out;
+}
+
 // ── Top-level ───────────────────────────────────────────────────────────────
 
 inline std::string preprocess_text(const std::string& input) {
-    Scanner sc(input);
+    const std::string text = expand_abbreviations(input);
+    Scanner sc(text);
 
     while (!sc.done()) {
         uint8_t c = (uint8_t)sc.at(0);
@@ -1170,14 +1698,22 @@ inline std::string preprocess_text(const std::string& input) {
 
         // ── Digit trigger ───────────────────────────────────────────────
         if (std::isdigit(c)) {
-            if (try_date_dmy(sc)) continue;
+            // "COVID-19" → "COVID nineteen" (hyphen between letters and digits)
+            if (sc.pos >= 2 && sc.s[sc.pos - 1] == '-' && std::isalpha((unsigned char)sc.s[sc.pos - 2]) &&
+                !sc.out.empty() && sc.out.back() == '-')
+                sc.out.back() = ' ';
+            if (try_date_slash(sc)) continue;
             if (try_date_dmy_dot(sc)) continue;
             if (try_date_iso(sc)) continue;
             if (try_date_ymd_slash(sc)) continue;
+            if (try_date_day_month(sc)) continue;
             if (try_time(sc)) continue;
             if (try_time_dot(sc)) continue;
+            if (try_hour_period(sc)) continue;
             if (try_phone_country(sc)) continue;
             if (try_phone_10digit(sc)) continue;
+            if (try_phone_7digit(sc)) continue;
+            if (try_number_idiom(sc)) continue;
             if (try_fraction(sc)) continue;
             if (try_ordinal(sc)) continue;
             if (try_percent(sc)) continue;
@@ -1190,10 +1726,18 @@ inline std::string preprocess_text(const std::string& input) {
         if (std::isupper(c)) {
             if (try_date_textual(sc)) continue;
             if (try_dotted_initialism(sc)) continue;
+            if (try_roman(sc)) continue;
         }
 
         // ── Symbol trigger ──────────────────────────────────────────────
-        if ((c == '&' || c == '@' || c == '+') && try_symbol(sc)) continue;
+        if ((c == '&' || c == '@' || c == '+' || c == '=') && try_symbol(sc)) continue;
+
+        // ── Negative numbers: "-5" at a word start → "minus five" ─────
+        if (c == '-' && sc.is_digit(1) && (sc.pos == 0 || sc.s[sc.pos - 1] == ' ' || sc.s[sc.pos - 1] == '(')) {
+            sc.emit("minus ");
+            sc.advance(1);
+            continue;
+        }
 
         // ── Whitespace: collapse if leading or after stripped chars ─────
         if (c == ' ' || c == '\t') {
@@ -1216,7 +1760,7 @@ inline std::string preprocess_text(const std::string& input) {
                 uint8_t ch = (uint8_t)sc.s[sc.pos];
                 if (ch >= 0x80 || std::isdigit(ch) || ch == '$' || ch == '(') break;
                 if (std::isupper(ch)) break;
-                if (ch == '&' || ch == '@' || ch == '+') break;
+                if (ch == '&' || ch == '@' || ch == '+' || ch == '=' || ch == '-') break;
                 if (ch < 32 || ch == 127) break;
                 if (ch == ' ' || ch == '\t') {
                     // Flush what we have, emit one space, skip whitespace run
@@ -1239,7 +1783,10 @@ inline std::string preprocess_text(const std::string& input) {
     while (!sc.out.empty() && sc.out.back() == ' ')
         sc.out.pop_back();
     if (!sc.out.empty()) {
-        char last = sc.out.back();
+        size_t k = sc.out.size();
+        // Look through closing quotes/brackets: '"Stop."' already ends a sentence
+        while (k > 0 && (sc.out[k - 1] == '"' || sc.out[k - 1] == '\'' || sc.out[k - 1] == ')')) k--;
+        char last = k > 0 ? sc.out[k - 1] : '\0';
         if (last != '.' && last != '!' && last != '?')
             sc.out.push_back('.');
     }

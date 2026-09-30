@@ -1,0 +1,120 @@
+# rokoko normalization test set — hand-written 2026-09-29, independent of normalize.h.
+# Columns: class <TAB> raw text <TAB> accepted spoken forms (separated by " || ") <TAB> note
+# Text comparison is case-insensitive and ignores . , ! ? ; " — but ':' '-' '/' etc. count (the G2P reads them).
+# Convention (decided by lapo): ambiguous numeric dates (both parts <= 12) are NOT expanded as dates.
+class	raw	accepted	note
+DATE	The war ended on November 11, 1918.	The war ended on November eleventh nineteen eighteen.	textual
+DATE	She was born on January 1, 2000.	She was born on January first two thousand.	textual
+DATE	The deadline is March 3rd.	The deadline is March third.	ordinal suffix
+DATE	We met on the 4th of July.	We met on the fourth of July.
+DATE	The file is dated 2024-02-29.	The file is dated February twenty ninth twenty twenty four. || The file is dated February twenty ninth two thousand twenty four.	ISO
+DATE	The log starts at 1999-12-31.	The log starts at December thirty first nineteen ninety nine.	ISO
+DATE	Christmas fell on 12/25/2024 that year.	Christmas fell on December twenty fifth twenty twenty four that year. || Christmas fell on December twenty fifth two thousand twenty four that year.	unambiguous M/D
+DATE	Christmas fell on 25/12/2024 that year.	Christmas fell on December twenty fifth twenty twenty four that year. || Christmas fell on December twenty fifth two thousand twenty four that year. || Christmas fell on the twenty fifth of December twenty twenty four that year.	unambiguous D/M
+DATE	The letter arrived on 2/18/1975.	The letter arrived on February eighteenth nineteen seventy five.	unambiguous M/D (old suite had "two eighteenths")
+DATE	The form says 4/5/1926.	The form says four slash five slash nineteen twenty six. || The form says four five nineteen twenty six.	ambiguous: do not expand
+DATE	Sign it 6/7/2021.	Sign it six slash seven slash twenty twenty one. || Sign it six seven twenty twenty one. || Sign it six slash seven slash two thousand twenty one.	ambiguous: do not expand
+DATE	The castle was built in 1066.	The castle was built in ten sixty six.	year
+DATE	The shop opened in 1908.	The shop opened in nineteen oh eight.	year
+DATE	The album came out in 2005.	The album came out in two thousand five. || The album came out in two thousand and five.	year
+DATE	The museum reopened in 2026.	The museum reopened in twenty twenty six. || The museum reopened in two thousand twenty six.	year
+DATE	The lease runs until May 2030.	The lease runs until May twenty thirty. || The lease runs until May two thousand thirty.	month year
+DATE	Music changed in the 1990s.	Music changed in the nineteen nineties.	decade
+DATE	Everyone dressed like the '80s.	Everyone dressed like the eighties.	short decade
+TIME	The meeting is at 7:30 AM.	The meeting is at seven thirty A M. || The meeting is at seven thirty AM.
+TIME	Dinner is at 6:05 PM.	Dinner is at six oh five P M. || Dinner is at six oh five PM.
+TIME	The store closes at 9 PM.	The store closes at nine P M. || The store closes at nine PM.
+TIME	The train leaves at 3:00 PM.	The train leaves at three P M. || The train leaves at three o'clock P M. || The train leaves at three PM. || The train leaves at three o'clock PM.
+TIME	The flight lands at 14:45.	The flight lands at fourteen forty five. || The flight lands at two forty five P M.	24h
+TIME	Wake me at 6:15.	Wake me at six fifteen.
+TIME	The alarm went off at 12:00 AM.	The alarm went off at twelve A M. || The alarm went off at twelve o'clock A M. || The alarm went off at midnight. || The alarm went off at twelve AM.
+TIME	He finished the race in 2:03:45.	He finished the race in two hours three minutes and forty five seconds. || He finished the race in two hours three minutes forty five seconds. || He finished the race in two oh three forty five.	duration
+MONEY	The ticket costs $3.50.	The ticket costs three dollars and fifty cents. || The ticket costs three dollars fifty cents. || The ticket costs three dollars fifty. || The ticket costs three fifty.
+MONEY	I found $1 on the floor.	I found one dollar on the floor.	singular
+MONEY	It only cost $0.99.	It only cost ninety nine cents. || It only cost zero dollars and ninety nine cents.
+MONEY	The car sold for $12,500.	The car sold for twelve thousand five hundred dollars.
+MONEY	Rent is $1,200 a month.	Rent is one thousand two hundred dollars a month. || Rent is twelve hundred dollars a month.
+MONEY	The startup raised $2.5 million.	The startup raised two point five million dollars. || The startup raised two and a half million dollars.
+MONEY	The dinner was €45.	The dinner was forty five euros.
+MONEY	A coffee is £3.	A coffee is three pounds.
+MONEY	The fine was ¥5000.	The fine was five thousand yen.
+MONEY	He owes me $20.01.	He owes me twenty dollars and one cent. || He owes me twenty dollars one cent.	singular cent
+CARDINAL	She has 3 cats.	She has three cats.
+CARDINAL	The score was 0 at halftime.	The score was zero at halftime. || The score was nothing at halftime.
+CARDINAL	The city has 1,234,567 people.	The city has one million two hundred thirty four thousand five hundred sixty seven people.
+CARDINAL	About 10,000 fans came.	About ten thousand fans came.
+CARDINAL	The temperature dropped to -5 degrees.	The temperature dropped to minus five degrees. || The temperature dropped to negative five degrees.	negative
+CARDINAL	He read 101 books.	He read one hundred one books. || He read one hundred and one books.
+CARDINAL	There were 17 of them.	There were seventeen of them.
+CARDINAL	The stadium seats 80000.	The stadium seats eighty thousand.	no comma
+DECIMAL	Pi is about 3.14.	Pi is about three point one four.
+DECIMAL	The rate is 0.25 now.	The rate is zero point two five now. || The rate is point two five now.
+DECIMAL	It grew 1.5 times.	It grew one point five times.
+DECIMAL	The version is 2.0.	The version is two point zero. || The version is two point oh.
+ORDINAL	She finished 1st.	She finished first.
+ORDINAL	It is his 21st birthday.	It is his twenty first birthday.
+ORDINAL	They live on the 42nd floor.	They live on the forty second floor.
+ORDINAL	This is the 100th time.	This is the hundredth time. || This is the one hundredth time.
+ORDINAL	The 3rd option is best.	The third option is best.
+ROMAN	Read Chapter IV tonight.	Read Chapter four tonight.
+ROMAN	My grandfather fought in World War II.	My grandfather fought in World War two.
+ROMAN	Henry VIII had six wives.	Henry the eighth had six wives.	regnal
+ROMAN	Louis XIV built Versailles.	Louis the fourteenth built Versailles.	regnal
+ROMAN	Super Bowl LVII was close.	Super Bowl fifty seven was close.
+ROMAN	See Part I for details.	See Part one for details.
+ROMAN	I think I can do it.	I think I can do it.	trap: pronoun I
+ROMAN	Vitamin C is good for you.	Vitamin C is good for you.	trap: letter C
+ROMAN	Did you see it?	Did you see it?	trap: no numeral
+FRACTION	Add 1/2 cup of sugar.	Add one half cup of sugar. || Add half a cup of sugar. || Add a half cup of sugar.
+FRACTION	About 3/4 of them agreed.	About three quarters of them agreed. || About three fourths of them agreed.
+FRACTION	It took 2 1/2 hours.	It took two and a half hours. || It took two and one half hours.	mixed number
+FRACTION	Only 1/3 remained.	Only one third remained. || Only a third remained.
+MEASURE	She ran 5 km.	She ran five kilometers. || She ran five kilometres.
+MEASURE	It is 1 km away.	It is one kilometer away. || It is one kilometre away.	singular
+MEASURE	The bag weighs 3.5 kg.	The bag weighs three point five kilograms. || The bag weighs three and a half kilograms.
+MEASURE	The limit is 65 mph.	The limit is sixty five miles per hour.
+MEASURE	It was 72°F outside.	It was seventy two degrees Fahrenheit outside.
+MEASURE	Water boils at 100°C.	Water boils at one hundred degrees Celsius.
+MEASURE	Pour 500 ml of water.	Pour five hundred milliliters of water. || Pour five hundred millilitres of water.
+MEASURE	The file is 2 GB.	The file is two gigabytes.
+MEASURE	The rope is 1 m long.	The rope is one meter long. || The rope is one metre long.	old suite had "one m"
+MEASURE	Buy 10 L of paint.	Buy ten liters of paint. || Buy ten litres of paint.	old suite had "one L"
+MEASURE	He is 6 ft tall.	He is six feet tall. || He is six foot tall.
+MEASURE	Prices rose 50%.	Prices rose fifty percent.
+MEASURE	The battery is at 3%.	The battery is at three percent.
+TELEPHONE	Call 555-123-4567 today.	Call five five five one two three four five six seven today.
+TELEPHONE	Her number is (212) 555-0199.	Her number is two one two five five five zero one nine nine. || Her number is two one two five five five oh one nine nine.
+TELEPHONE	In an emergency call 911.	In an emergency call nine one one.
+TELEPHONE	Dial 1-800-555-0100.	Dial one eight hundred five five five zero one zero zero. || Dial one eight zero zero five five five zero one zero zero. || Dial one eight hundred five five five oh one oh oh.
+ADDRESS	He lives at 221B Baker Street.	He lives at two twenty one B Baker Street. || He lives at two hundred twenty one B Baker Street.
+ADDRESS	Send it to 123 Main St.	Send it to one twenty three Main Street. || Send it to one hundred twenty three Main Street.
+ADDRESS	The office is at 1600 Pennsylvania Ave.	The office is at sixteen hundred Pennsylvania Avenue. || The office is at one thousand six hundred Pennsylvania Avenue.
+ADDRESS	Turn onto 5th Avenue.	Turn onto fifth Avenue.
+ABBREVIATION	Dr. Smith will see you now.	Doctor Smith will see you now.
+ABBREVIATION	Mr. and Mrs. Jones arrived.	Mister and Missus Jones arrived. || Mister and Misses Jones arrived.
+ABBREVIATION	We flew to St. Louis.	We flew to Saint Louis.
+ABBREVIATION	Bring fruit, e.g. apples.	Bring fruit, for example apples.
+ABBREVIATION	Pens, paper, etc. are provided.	Pens, paper, et cetera are provided. || Pens, paper, etc. are provided.
+ABBREVIATION	It was Ali vs. Frazier.	It was Ali versus Frazier.
+ABBREVIATION	She works for the FBI.	She works for the F B I. || She works for the FBI.	initialism
+ABBREVIATION	He moved to the U.S. last year.	He moved to the U S last year.	initialism with dots
+ABBREVIATION	NASA launched a rocket.	NASA launched a rocket.	acronym read as word
+ABBREVIATION	Jr. is his son.	Junior is his son.
+LETTERS	Spell it A B C.	Spell it A B C.
+LETTERS	She got an A on the test.	She got an A on the test.
+RANGE	Read pages 10-20.	Read pages ten to twenty. || Read pages ten through twenty.
+RANGE	He ruled from 1990-1995.	He ruled from nineteen ninety to nineteen ninety five.
+RANGE	Open 9-5 on weekdays.	Open nine to five on weekdays.
+SCORE	They won 3-2 last night.	They won three to two last night. || They won three two last night.
+SYMBOL	Ben & Jerry make ice cream.	Ben and Jerry make ice cream.
+SYMBOL	He was ranked #1 in the world.	He was ranked number one in the world.
+SYMBOL	Clearly 5 + 3 = 8.	Clearly five plus three equals eight.
+SYMBOL	Email me at info@example.com.	Email me at info at example dot com.
+MIXED	In 1969, Apollo 11 landed on the Moon.	In nineteen sixty nine, Apollo eleven landed on the Moon.
+MIXED	The store is open 24/7.	The store is open twenty four seven.	trap: not a date or fraction
+MIXED	Nobody forgets 9/11.	Nobody forgets nine eleven.	trap: not a fraction
+MIXED	She caught COVID-19 in March.	She caught COVID nineteen in March.
+MIXED	He upgraded to Windows 10.	He upgraded to Windows ten.
+MIXED	I bought an iPhone 15.	I bought an iPhone fifteen.
+MIXED	The top 3 finishers get medals.	The top three finishers get medals.
+MIXED	It happened 2 days ago.	It happened two days ago.
