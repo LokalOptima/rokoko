@@ -4,6 +4,7 @@
 //   Weights  — pointers into GPU weight allocation (loaded from weights.bin)
 
 #pragma once
+#include "artifact_format.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -97,13 +98,7 @@ static constexpr size_t   HEADER_ALIGN = 4096;
 // Tensor descriptor (parsed from header)
 // ---------------------------------------------------------------------------
 
-struct TensorDesc {
-    std::string name;
-    size_t offset;       // offset from data start
-    size_t size_bytes;
-    std::string dtype;
-    std::vector<int> shape;
-};
+
 
 // ---------------------------------------------------------------------------
 // Model dimensions
@@ -143,6 +138,7 @@ static constexpr int SAMPLE_RATE     = 24000;
 // ---------------------------------------------------------------------------
 
 struct Weights {
+    int format_version = 0;
     void* gpu_data = nullptr;        // single contiguous GPU allocation
     size_t gpu_data_size = 0;
 
@@ -398,11 +394,26 @@ struct Weights {
 /// Compute exact decode-arena bytes needed for given T (tokens) and L (frames).
 size_t compute_decode_bytes(int T, int L);
 
+struct InferenceStats {
+    uint64_t encode_hits=0, encode_misses=0, decode_hits=0, decode_misses=0, invalidations=0;
+    size_t encode_graphs=0, decode_graphs=0, arena_bytes=0;
+    int true_frames=0, decode_frames=0, upsample_frames=0, stft_samples=0;
+};
+struct InferenceTrace {
+    // Test-only duration override. Zero leaves the ordinary path untouched.
+    int force_frames=0;
+    std::vector<float> durations, f0, noise;
+    std::vector<int> rounded;
+};
+InferenceStats inference_stats();
+void clear_inference_graphs();
+void release_inference_state(Weights& weights);
+
 /// Run Kokoro inference: phoneme token IDs + style vector → audio samples.
 std::vector<float> rokoko_infer(const Weights& w,
     const int* token_ids, int T, const float* style_vec,
     cudaStream_t stream, GpuArena& arena, GpuArena& decode_arena,
-    float* d_workspace, size_t workspace_bytes);
+    float* d_workspace, size_t workspace_bytes, InferenceTrace* trace = nullptr);
 
 /// Write audio samples to a WAV file (16-bit PCM). path="-" writes to stdout.
 bool write_wav(const std::string& path, const float* audio,

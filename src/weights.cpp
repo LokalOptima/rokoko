@@ -32,24 +32,6 @@ static size_t align_up(size_t x, size_t alignment) {
 // Parse header
 // ---------------------------------------------------------------------------
 
-static std::vector<TensorDesc> parse_header(const char* header_text, size_t header_len) {
-    std::vector<TensorDesc> tensors;
-    std::string text(header_text, header_len);
-    std::istringstream iss(text);
-    std::string line;
-
-    while (std::getline(iss, line)) {
-        if (line.empty()) continue;
-        std::istringstream ls(line);
-        TensorDesc td;
-        ls >> td.name >> td.offset >> td.size_bytes >> td.dtype;
-        int d;
-        while (ls >> d) td.shape.push_back(d);
-        tensors.push_back(std::move(td));
-    }
-    return tensors;
-}
-
 // ---------------------------------------------------------------------------
 // Weights: pointer assignment
 // ---------------------------------------------------------------------------
@@ -499,67 +481,22 @@ void Weights::assign_v2_fp16_pointers() {
 
 Weights Weights::prefetch(const std::string& path) {
     Weights w;
-
-    int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "Cannot open weights: %s\n", path.c_str());
-        std::exit(1);
-    }
+    int fd=open(path.c_str(),O_RDONLY);
+    if (fd<0) throw std::runtime_error("cannot open weights: "+path);
     struct stat st;
-    fstat(fd, &st);
-    size_t file_size = st.st_size;
-    void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+    if (fstat(fd,&st) || st.st_size<16) { close(fd); throw std::runtime_error("truncated weights: "+path); }
+    size_t size=st.st_size;
+    void* mapped=mmap(nullptr,size,PROT_READ,MAP_PRIVATE|MAP_POPULATE,fd,0);
     close(fd);
-    if (mapped == MAP_FAILED) {
-        fprintf(stderr, "mmap failed: %s\n", path.c_str());
-        std::exit(1);
-    }
-    madvise(mapped, file_size, MADV_SEQUENTIAL);
-    const uint8_t* base = (const uint8_t*)mapped;
-
-    // Parse file header
-    uint32_t magic;
-    memcpy(&magic, base, 4);
-    if (magic != KOKO_MAGIC) {
-        fprintf(stderr, "Bad magic in %s: expected KOKO\n", path.c_str());
-        munmap(mapped, file_size);
-        std::exit(1);
-    }
-
-    uint32_t version;
-    memcpy(&version, base + 4, 4);
-    if (version != 1 && version != 2) {
-        fprintf(stderr, "Unsupported weight file version %u (expected 1 or 2)\n", version);
-        munmap(mapped, file_size);
-        std::exit(1);
-    }
-
-    uint64_t header_len;
-    memcpy(&header_len, base + 8, 8);
-    w.tensors = parse_header((const char*)(base + 16), header_len);
-
-    for (size_t i = 0; i < w.tensors.size(); i++)
-        w.name_to_idx[w.tensors[i].name] = i;
-
-    size_t header_end = 16 + header_len;
-    size_t data_start = align_up(header_end, HEADER_ALIGN);
-
-    size_t total_data = 0;
-    for (auto& td : w.tensors) {
-        size_t end = td.offset + td.size_bytes;
-        if (end > total_data) total_data = end;
-    }
-    if (!w.tensors.empty()) {
-        auto& last = w.tensors.back();
-        total_data = std::max(total_data, align_up(last.offset + last.size_bytes, 256));
-    }
-
-    w.gpu_data_size = total_data;
-    w.prefetch_base = (const uint8_t*)mapped + data_start;
-    w.mmap_ptr = mapped;
-    w.mmap_size = file_size;
-    w.data_offset = data_start;
-
+    if (mapped==MAP_FAILED) throw std::runtime_error("cannot map weights: "+path);
+    try {
+        auto index=read_artifact_index(mapped,size);
+        w.format_version=index.version;w.tensors=std::move(index.tensors);
+        for (size_t i=0;i<w.tensors.size();++i) w.name_to_idx[w.tensors[i].name]=i;
+        w.gpu_data_size=index.bytes;w.data_offset=index.start;
+        w.prefetch_base=static_cast<const uint8_t*>(mapped)+index.start;
+        w.mmap_ptr=mapped;w.mmap_size=size;
+    } catch (...) { munmap(mapped,size); throw; }
     return w;
 }
 
@@ -605,6 +542,7 @@ Weights Weights::load(const std::string& path, cudaStream_t stream) {
 // ---------------------------------------------------------------------------
 
 void Weights::free() {
+    if (mmap_ptr) { munmap(mmap_ptr,mmap_size);mmap_ptr=nullptr;mmap_size=0;prefetch_base=nullptr; }
     if (gpu_data) {
         cudaFree(gpu_data);
         gpu_data = nullptr;

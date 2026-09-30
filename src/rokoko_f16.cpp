@@ -10,6 +10,7 @@
 #include <random>
 #include <string>
 #include <unordered_map>
+#include <stdexcept>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -676,10 +677,38 @@ static std::unordered_map<int, cudaGraphExec_t> s_encode_graph_cache;
 // use the same device pointers on replay.
 struct DecodeGraph {
     cudaGraphExec_t exec;
+    size_t f0_offset, noise_offset;
     size_t audio_offset;  // byte offset of d_audio from decode_arena.base
 };
 static std::unordered_map<int64_t, DecodeGraph> s_decode_graph_cache;
 static float* s_d_rand_ini = nullptr;  // persistent rand_ini on GPU (seed=42)
+
+extern "C" void clear_cutlass_conv_cache();
+extern "C" void clear_cutlass_gemm_cache();
+extern "C" void clear_cutlass_gemm_f16_cache();
+extern "C" void clear_cutlass_conv_f16_cache();
+static InferenceStats s_stats;
+static constexpr size_t MAX_GRAPHS = 64;
+InferenceStats inference_stats() {
+    auto out=s_stats; out.encode_graphs=s_encode_graph_cache.size();
+    out.decode_graphs=s_decode_graph_cache.size(); return out;
+}
+void clear_inference_graphs() {
+    for (auto& kv:s_encode_graph_cache) cudaGraphExecDestroy(kv.second);
+    for (auto& kv:s_decode_graph_cache) cudaGraphExecDestroy(kv.second.exec);
+    s_encode_graph_cache.clear(); s_decode_graph_cache.clear(); ++s_stats.invalidations;
+}
+void release_inference_state(Weights& w) {
+    clear_cutlass_conv_cache();
+    clear_cutlass_gemm_cache();
+    clear_cutlass_gemm_f16_cache();
+    clear_cutlass_conv_f16_cache();
+
+    clear_inference_graphs();
+    cudaFree(s_d_rand_ini); s_d_rand_ini=nullptr;
+    cudaFree(s_fp16_buf); s_fp16_buf=nullptr; s_fp16_buf_size=0;
+    s_workspace=nullptr; s_workspace_bytes=0; s_stats={};
+}
 
 // ---------------------------------------------------------------------------
 // Rokoko inference: phoneme IDs + style vector -> audio
@@ -692,7 +721,9 @@ std::vector<float> rokoko_infer(const Weights& w,
                                 GpuArena& arena,
                                 GpuArena& decode_arena,
                                 float* d_workspace,
-                                size_t workspace_bytes) {
+                                size_t workspace_bytes, InferenceTrace* trace) {
+    if (T<3 || T>512) throw std::invalid_argument("token count outside 3..512");
+    for (int i=0;i<T;++i) if (token_ids[i]<0 || token_ids[i]>=178) throw std::invalid_argument("invalid token ID");
     // Set workspace for Cutlass GEMM (used by all sgemm_* wrappers)
     s_workspace = d_workspace;
     s_workspace_bytes = workspace_bytes;
@@ -733,7 +764,12 @@ std::vector<float> rokoko_infer(const Weights& w,
     // ---- Encode phase: CUDA graph capture/replay ----
     auto git = s_encode_graph_cache.find(T);
     if (git == s_encode_graph_cache.end()) {
-        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        ++s_stats.encode_misses;
+        if (s_encode_graph_cache.size() >= MAX_GRAPHS) {
+            for (auto& kv:s_encode_graph_cache) cudaGraphExecDestroy(kv.second);
+            s_encode_graph_cache.clear(); ++s_stats.invalidations;
+        }
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
 
         // ALBERT encoder
         cudaMemcpyAsync(albert_buf.token_ids, d_token_ids, T * sizeof(int),
@@ -777,42 +813,54 @@ std::vector<float> rokoko_infer(const Weights& w,
         round_clamp_durations_f32(d_durations, d_int_durations, d_L, T, stream);
 
         cudaGraph_t graph;
-        cudaStreamEndCapture(stream, &graph);
+        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
         cudaGraphExec_t exec;
-        cudaGraphInstantiateWithFlags(&exec, graph, 0);
-        cudaGraphDestroy(graph);
+        CUDA_CHECK(cudaGraphInstantiateWithFlags(&exec, graph, 0));
+        CUDA_CHECK(cudaGraphDestroy(graph));
         s_encode_graph_cache[T] = exec;
-        cudaGraphLaunch(exec, stream);
+        CUDA_CHECK(cudaGraphLaunch(exec, stream));
     } else {
-        cudaGraphLaunch(git->second, stream);
+        ++s_stats.encode_hits;
+        CUDA_CHECK(cudaGraphLaunch(git->second, stream));
     }
 
     // Sync for L only (4 bytes) -- needed for decode arena sizing
     int L;
     CUDA_CHECK(cudaMemcpyAsync(&L, d_L, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (trace) {
+        trace->durations.resize(T); trace->rounded.resize(T);
+        CUDA_CHECK(cudaMemcpy(trace->durations.data(),d_durations,T*sizeof(float),cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(trace->rounded.data(),d_int_durations,T*sizeof(int),cudaMemcpyDeviceToHost));
+        if (trace->force_frames) {
+            if (trace->force_frames<T || trace->force_frames>10000) throw std::invalid_argument("invalid diagnostic frame count");
+            trace->rounded.assign(T,1); trace->rounded[T/2]+=trace->force_frames-T; L=trace->force_frames;
+            CUDA_CHECK(cudaMemcpyAsync(d_int_durations,trace->rounded.data(),T*sizeof(int),cudaMemcpyHostToDevice,stream));
+        }
+    }
+    if (L<1 || L>25600) throw std::runtime_error("invalid predicted frame count");
+    const int true_L=L;
     int L2 = 2 * L;
-    int T_audio_actual = L2 * 300;  // actual audio length for download
-
-    // Bucket L for decode graph cache hit rate: different L values
-    // within the same bucket share a single cached graph.
-    static constexpr int DECODE_L_BUCKET = 32;
-    L = ((L + DECODE_L_BUCKET - 1) / DECODE_L_BUCKET) * DECODE_L_BUCKET;
-    L2 = 2 * L;
-    int T_audio = L2 * 300;  // padded -- used by decode operations
+    int T_audio_actual = true_L * 600;
+    int T_audio = L2 * 300;
+    s_stats.true_frames=true_L; s_stats.decode_frames=L;
+    s_stats.upsample_frames=L2; s_stats.stft_samples=T_audio;
 
     // ===== DECODE PHASE: exact-sized arena =====
     size_t decode_bytes = compute_decode_bytes(T, L);
     if (decode_arena.capacity < decode_bytes) {
         // Arena grows -- invalidate all cached decode graphs
         for (auto& [k, dg] : s_decode_graph_cache)
-            cudaGraphExecDestroy(dg.exec);
+            CUDA_CHECK(cudaGraphExecDestroy(dg.exec));
         s_decode_graph_cache.clear();
+        ++s_stats.invalidations;
         decode_arena.destroy();
         decode_arena.init(decode_bytes);
     } else {
         decode_arena.reset();
     }
+
+    s_stats.arena_bytes=decode_arena.capacity;
 
     // Lazy-init persistent rand_ini device buffer (SineGen, seed=42)
     if (!s_d_rand_ini) {
@@ -829,23 +877,36 @@ std::vector<float> rokoko_infer(const Weights& w,
     int64_t decode_key = ((int64_t)T << 32) | (int64_t)(unsigned int)L;
     auto dgit = s_decode_graph_cache.find(decode_key);
     if (dgit != s_decode_graph_cache.end()) {
+        ++s_stats.decode_hits;
         float* d_audio = (float*)(decode_arena.base + dgit->second.audio_offset);
-        cudaGraphLaunch(dgit->second.exec, stream);
+        CUDA_CHECK(cudaGraphLaunch(dgit->second.exec, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         std::vector<float> audio(T_audio_actual);
         cudaMemcpy(audio.data(), d_audio, T_audio_actual * sizeof(float),
                    cudaMemcpyDeviceToHost);
+
+        if (trace) {
+            trace->f0.resize(L2);trace->noise.resize(L2);
+            CUDA_CHECK(cudaMemcpy(trace->f0.data(),decode_arena.base+dgit->second.f0_offset,L2*sizeof(float),cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(trace->noise.data(),decode_arena.base+dgit->second.noise_offset,L2*sizeof(float),cudaMemcpyDeviceToHost));
+        }
         return audio;
     }
 
+    ++s_stats.decode_misses;
+    if (s_decode_graph_cache.size() >= MAX_GRAPHS) {
+        for (auto& kv:s_decode_graph_cache) cudaGraphExecDestroy(kv.second.exec);
+        s_decode_graph_cache.clear(); ++s_stats.invalidations;
+    }
     // First time for (T, L): capture decode graph
-    cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed);
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
 
     // Decode workspace (first alloc, matches compute_decode_bytes order)
     int har_frames_ws = (L2 * 300) / 5 + 1;
     size_t dec_ws_floats = (size_t)128 * 11 * har_frames_ws;
     float* d_dec_workspace = decode_arena.alloc<float>(dec_ws_floats);
     size_t dec_ws_bytes = dec_ws_floats * sizeof(float);
+    float* d_stft_scratch=decode_arena.alloc<float>(2*(T_audio+20));
 
     // Build alignment matrix on GPU
     float* d_alignment = decode_arena.alloc<float>(T * L);
@@ -1012,7 +1073,7 @@ std::vector<float> rokoko_infer(const Weights& w,
         float* d_har_spec = d_gen_har_ct;
         float* d_har_phase = d_gen_har_ct + 11 * har_frames;
         stft_f32(d_har_source, d_har_spec, d_har_phase,
-                 T_audio, n_fft_gen, hop_gen, stream);
+                 T_audio, n_fft_gen, hop_gen, stream, d_stft_scratch);
         decode_arena.restore(sinegen_save);
     }
 
@@ -1147,18 +1208,18 @@ std::vector<float> rokoko_infer(const Weights& w,
     // iSTFT -> audio (operates on [n_freqs, T_loop] channels-first)
     float* d_audio = decode_arena.alloc<float>(T_audio);
     istft_f32(d_gen_tmp, d_gen_tmp + n_freqs * T_loop, d_audio,
-              T_loop, 20, 5, T_audio, stream);
+              T_loop, 20, 5, T_audio, stream, d_stft_scratch);
     // End decode graph capture
     cudaGraph_t decode_graph;
-    cudaStreamEndCapture(stream, &decode_graph);
+    CUDA_CHECK(cudaStreamEndCapture(stream, &decode_graph));
     cudaGraphExec_t decode_exec;
-    cudaGraphInstantiateWithFlags(&decode_exec, decode_graph, 0);
-    cudaGraphDestroy(decode_graph);
+    CUDA_CHECK(cudaGraphInstantiateWithFlags(&decode_exec, decode_graph, 0));
+    CUDA_CHECK(cudaGraphDestroy(decode_graph));
 
     size_t audio_offset = (size_t)((char*)d_audio - decode_arena.base);
-    s_decode_graph_cache[decode_key] = {decode_exec, audio_offset};
+    s_decode_graph_cache[decode_key] = {decode_exec, size_t((char*)d_f0_pred-decode_arena.base), size_t((char*)d_n_pred-decode_arena.base), audio_offset};
 
-    cudaGraphLaunch(decode_exec, stream);
+    CUDA_CHECK(cudaGraphLaunch(decode_exec, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Download audio (actual length, not padded)
@@ -1166,6 +1227,11 @@ std::vector<float> rokoko_infer(const Weights& w,
     cudaMemcpy(audio.data(), d_audio, T_audio_actual * sizeof(float),
                cudaMemcpyDeviceToHost);
 
+    if (trace) {
+        trace->f0.resize(L2); trace->noise.resize(L2);
+        CUDA_CHECK(cudaMemcpy(trace->f0.data(),d_f0_pred,L2*sizeof(float),cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(trace->noise.data(),d_n_pred,L2*sizeof(float),cudaMemcpyDeviceToHost));
+    }
     return audio;
 }
 
@@ -1175,6 +1241,7 @@ std::vector<float> rokoko_infer(const Weights& w,
 // ---------------------------------------------------------------------------
 
 void precompute_weight_norms(Weights& w, cudaStream_t stream) {
+    if (w.format_version!=2) throw std::runtime_error("wrong weights version for this binary (expected 2)");
     w.assign_v2_fp16_pointers();
     // Staging buffer sized for largest activation cast: generator resblock conv
     // at max ~90k frames * 128 channels * sizeof(half) ≈ 23 MB. Allocate 64 MB.

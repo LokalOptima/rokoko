@@ -3,6 +3,7 @@
 // Contains: AlbertBuffers, TextEncoderBuffers, write_wav, compute_decode_bytes.
 
 #pragma once
+#include "audio.h"
 
 #include <cmath>
 #include <cstdint>
@@ -56,104 +57,6 @@ struct TextEncoderBuffers {
 };
 
 // ---------------------------------------------------------------------------
-// WAV I/O
-// ---------------------------------------------------------------------------
-
-inline void write_wav_to_(std::ostream& f, const float* audio, int n_samples,
-                          int sample_rate) {
-    int16_t bits_per_sample = 16;
-    int16_t num_channels = 1;
-    int32_t byte_rate = sample_rate * num_channels * bits_per_sample / 8;
-    int16_t block_align = num_channels * bits_per_sample / 8;
-    int32_t data_size = n_samples * block_align;
-    int32_t chunk_size = 36 + data_size;
-
-    f.write("RIFF", 4);
-    f.write(reinterpret_cast<char*>(&chunk_size), 4);
-    f.write("WAVE", 4);
-
-    f.write("fmt ", 4);
-    int32_t fmt_size = 16;
-    int16_t audio_format = 1;
-    f.write(reinterpret_cast<char*>(&fmt_size), 4);
-    f.write(reinterpret_cast<char*>(&audio_format), 2);
-    f.write(reinterpret_cast<char*>(&num_channels), 2);
-    f.write(reinterpret_cast<char*>(&sample_rate), 4);
-    f.write(reinterpret_cast<char*>(&byte_rate), 4);
-    f.write(reinterpret_cast<char*>(&block_align), 2);
-    f.write(reinterpret_cast<char*>(&bits_per_sample), 2);
-
-    f.write("data", 4);
-    f.write(reinterpret_cast<char*>(&data_size), 4);
-
-    for (int i = 0; i < n_samples; i++) {
-        float s = std::max(-1.0f, std::min(1.0f, audio[i]));
-        int16_t sample = (int16_t)(s * 32767.0f);
-        f.write(reinterpret_cast<char*>(&sample), 2);
-    }
-}
-
-inline bool write_wav(const std::string& path, const float* audio, int n_samples,
-                      int sample_rate) {
-    if (path == "-") {
-        write_wav_to_(std::cout, audio, n_samples, sample_rate);
-        std::cout.flush();
-        return true;
-    }
-    std::ofstream f(path, std::ios::binary);
-    if (!f) return false;
-    write_wav_to_(f, audio, n_samples, sample_rate);
-    return f.good();
-}
-
-// streambuf adapter for FILE* so we can reuse write_wav_to_() with popen pipes
-class stdio_streambuf : public std::streambuf {
-    FILE* f_;
-protected:
-    std::streamsize xsputn(const char* s, std::streamsize n) override {
-        return fwrite(s, 1, n, f_);
-    }
-    int overflow(int c) override {
-        return (c != EOF && fputc(c, f_) != EOF) ? c : EOF;
-    }
-public:
-    stdio_streambuf(FILE* f) : f_(f) {}
-};
-
-inline bool play_wav(const float* audio, int n_samples, int sample_rate) {
-    char paplay_cmd[128], pwplay_cmd[128];
-    snprintf(paplay_cmd, sizeof(paplay_cmd),
-             "paplay --raw --format=s16le --rate=%d --channels=1", sample_rate);
-    snprintf(pwplay_cmd, sizeof(pwplay_cmd),
-             "pw-play --format=s16 --rate=%d --channels=1 -", sample_rate);
-
-    const char* players[] = {
-        "aplay -q -",
-        paplay_cmd,
-        pwplay_cmd,
-        "ffplay -nodisp -autoexit -loglevel quiet -",
-        nullptr
-    };
-    for (int i = 0; players[i]; i++) {
-        std::string cmd = players[i];
-        std::string bin = cmd.substr(0, cmd.find(' '));
-        if (system(("command -v " + bin + " >/dev/null 2>&1").c_str()) != 0) continue;
-
-        FILE* pipe = popen(cmd.c_str(), "w");
-        if (!pipe) continue;
-
-        stdio_streambuf buf(pipe);
-        std::ostream os(&buf);
-        write_wav_to_(os, audio, n_samples, sample_rate);
-        os.flush();
-
-        if (pclose(pipe) == 0) return true;
-    }
-    fprintf(stderr, "Error: no audio player found. Install alsa-utils, pulseaudio, pipewire, or ffmpeg.\n");
-    return false;
-}
-
-// ---------------------------------------------------------------------------
 // Compute exact decode-arena bytes for given T (tokens) and L (duration frames)
 // ---------------------------------------------------------------------------
 
@@ -171,6 +74,7 @@ inline size_t compute_decode_bytes(int T, int L) {
     // Workspace for gemm_conv1d/gemm_conv_transpose1d
     size_t max_ws_floats = (size_t)128 * 11 * har_frames;
     off = a(off, max_ws_floats * sizeof(float));
+    off = a(off, size_t(2)*(T_audio+20)*sizeof(float)); // persistent STFT scratch
 
     // Alignment matrix + expanded encoder + shared LSTM output
     off = a(off, (size_t)T * L * sizeof(float));

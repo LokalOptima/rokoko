@@ -375,6 +375,8 @@ struct G2PModelCuda {
     bool load(const char* path, cudaStream_t stream);
     std::string infer(const std::string& text, cudaStream_t stream) const;
     void free();
+    int max_positions() const { return max_pos_; }
+    size_t graph_count() const { return graph_cache_.size(); }
 
     bool loaded() const { return d_ > 0; }
     size_t param_bytes() const { return total_bytes_; }
@@ -432,10 +434,12 @@ private:
 // ── Implementation ──────────────────────────────────────────────────────────
 
 inline bool G2PModelCuda::load(const char* path, cudaStream_t stream) {
+    free();
     FILE* f = fopen(path, "rb");
     if (!f) return false;
     bool ok = load_from_file_(f, path, stream);
     fclose(f);
+    if (!ok) free();
     return ok;
 }
 
@@ -457,6 +461,9 @@ inline bool G2PModelCuda::load_from_file_(FILE* f, const char* label, cudaStream
     use_rope_ = (flags & 1) != 0;
     bool use_qk_norm = (flags & 2) != 0;
     bool use_conv = (flags & 4) != 0;
+    if (d_<1 || d_>1024 || heads_<1 || heads_>32 || d_%heads_ || (d_/heads_)%2 ||
+        n_layers_<1 || n_layers_>32 || ff_<1 || ff_>4096 || up_<1 || up_>8 ||
+        n_chars_<2 || n_chars_>4096 || n_phones_<2 || n_phones_>4096) return false;
     head_dim_ = d_ / heads_;
 
     bool use_rmsnorm = (flags & 8) != 0;
@@ -471,19 +478,21 @@ inline bool G2PModelCuda::load_from_file_(FILE* f, const char* label, cudaStream
 
     // Char vocab
     uint32_t n_cv;
-    if (fread(&n_cv, 4, 1, f) != 1) { return false; }
+    if (fread(&n_cv, 4, 1, f) != 1 || n_cv>uint32_t(n_chars_)) { return false; }
     for (uint32_t i = 0; i < n_cv; i++) {
         uint32_t pair[2];
         if (fread(pair, 4, 2, f) != 2) { return false; }
+        if (pair[1]>=uint32_t(n_chars_)) return false;
         char2id_[pair[0]] = pair[1];
     }
 
     // Phone vocab
     uint32_t n_pv;
-    if (fread(&n_pv, 4, 1, f) != 1) { return false; }
+    if (fread(&n_pv, 4, 1, f) != 1 || n_pv>uint32_t(n_phones_)) { return false; }
     for (uint32_t i = 0; i < n_pv; i++) {
         uint32_t pair[2];
         if (fread(pair, 4, 2, f) != 2) { return false; }
+        if (pair[1]>=uint32_t(n_phones_)) return false;
         id2phone_[pair[1]] = pair[0];
     }
 
@@ -504,6 +513,11 @@ inline bool G2PModelCuda::load_from_file_(FILE* f, const char* label, cudaStream
     total_floats += d_ * up_ * d_ + d_ * up_;           // up_w, up_b
     total_floats += n_phones_ * d_ + n_phones_;          // head_w, head_b
 
+    long payload=ftell(f);
+    if (payload<0 || fseek(f,0,SEEK_END)) return false;
+    long end=ftell(f);
+    if (end<payload || size_t(end-payload)!=(total_floats-size_t(max_pos_)*d2*2)*sizeof(float)) return false;
+    if (fseek(f,payload,SEEK_SET)) return false;
     total_bytes_ = total_floats * sizeof(float);
 
     // Allocate GPU memory (single contiguous block)
@@ -672,7 +686,7 @@ inline void G2PModelCuda::free() {
     graph_cache_.clear();
     if (weights_gpu_) { cudaFree(weights_gpu_); weights_gpu_ = nullptr; }
     if (workspace_) { cudaFree(workspace_); workspace_ = nullptr; workspace_bytes_ = 0; }
-    d_ = 0;
+    d_ = 0; char2id_.clear(); id2phone_.clear();
 }
 
 inline std::string G2PModelCuda::infer(const std::string& text,
@@ -836,6 +850,7 @@ inline std::string G2PModelCuda::infer(const std::string& text,
     // second call captures the graph, third+ replays.
     auto git = graph_cache_.find(T);
     if (git == graph_cache_.end()) {
+        if (graph_cache_.size()>=64) {for (auto& kv:graph_cache_) if(kv.second) cudaGraphExecDestroy(kv.second);graph_cache_.clear();}
         // First call: run directly. Cutlass initialize() populates operator
         // caches. Output is valid — returned to caller.
         run_kernels();

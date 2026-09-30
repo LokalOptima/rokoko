@@ -350,3 +350,9 @@ size_t cutlass_conv1d_workspace_bytes(int C_in, int C_out, int T_in, int K,
     }
     return ws;
 }
+
+extern "C" void clear_cutlass_conv_cache() {
+    s_tf32_large_cache.clear();
+    s_tf32_small_cache.clear();
+    s_simt_cache.clear();
+}

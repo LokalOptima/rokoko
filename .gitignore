@@ -10,3 +10,14 @@ bench.sh
 scratch/
 tests/frontend/normalize_cli
 tests/frontend/g2p_check
+
+/tests/helpers
+/tests/results/
+/tests/__pycache__/
+/tests/runtime
+/tests/runtime.fp16
+/tests/runtime.o
+/tests/models/
+/.venv-tests/
+
+/tests/audio

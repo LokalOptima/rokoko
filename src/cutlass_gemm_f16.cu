@@ -367,3 +367,16 @@ int cutlass_gemm_nn_f16(int M, int N, int K,
         {C, LayoutCM(ldc)}, {C, LayoutCM(ldc)}, {alpha, beta});
     return dispatch_gemm<GemmNN_FP16_SIMT>(s_f16_nn_simt, key, args, workspace, workspace_bytes, stream);
 }
+
+extern "C" void clear_cutlass_gemm_f16_cache() {
+    s_f16_tn_large.clear();
+    s_f16_tn_small.clear();
+    s_f16_tn_align1.clear();
+    s_f16_tn_simt.clear();
+    s_f16_nn_large.clear();
+    s_f16_nn_small.clear();
+    s_f16_nn_align1.clear();
+    s_f16_nn_simt.clear();
+    s_f16_batched_tn.clear();
+    s_f16_batched_nn.clear();
+}

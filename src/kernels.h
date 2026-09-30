@@ -211,7 +211,7 @@ void sin_f32(const float* x, float* y, int N, cudaStream_t stream);
 // ---------------------------------------------------------------------------
 void stft_f32(const float* x, float* mag, float* phase,
               int T_signal, int n_fft, int hop_length,
-              cudaStream_t stream);
+              cudaStream_t stream, float* scratch = nullptr);
 
 // ---------------------------------------------------------------------------
 // iSTFT inverse: reconstruct time-domain signal from magnitude and phase
@@ -221,7 +221,7 @@ void stft_f32(const float* x, float* mag, float* phase,
 // ---------------------------------------------------------------------------
 void istft_f32(const float* mag, const float* phase, float* y,
                int n_frames, int n_fft, int hop_length, int T_signal,
-               cudaStream_t stream);
+               cudaStream_t stream, float* scratch = nullptr);
 
 // ---------------------------------------------------------------------------
 // LSTM gate activation: apply sigmoid/tanh to pre-computed gates

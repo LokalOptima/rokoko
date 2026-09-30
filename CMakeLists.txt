@@ -1,13 +1,17 @@
 cmake_minimum_required(VERSION 3.24)
+
+# Set the default before project() enables CUDA and populates a compiler default.
+# Respect explicit toolchain/cache settings and CUDAARCHS for cross compilation.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
+    set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures")
+endif()
 project(rokoko LANGUAGES C CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES native)
-endif()
+
 
 find_package(CUDAToolkit REQUIRED)
 

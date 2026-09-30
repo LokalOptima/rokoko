@@ -858,15 +858,15 @@ __global__ void stft_kernel(const float* x_padded, float* mag, float* phase,
 
 void stft_f32(const float* x, float* mag, float* phase,
               int T_signal, int n_fft, int hop_length,
-              cudaStream_t stream) {
+              cudaStream_t stream, float* scratch) {
     int pad = n_fft / 2;
     int T_padded = T_signal + 2 * pad;
     int n_frames = (T_padded - n_fft) / hop_length + 1;
     int n_freqs = n_fft / 2 + 1;
 
     // Create reflect-padded signal on GPU
-    float* x_padded;
-    cudaMalloc(&x_padded, T_padded * sizeof(float));
+    float* x_padded=scratch;
+    if (!scratch) cudaMalloc(&x_padded, T_padded * sizeof(float));
 
     // Pad with reflection: [pad-1, pad-2, ..., 0, 0, 1, ..., T-1, T-2, T-3, ...]
     reflection_pad_1d_f32(x, x_padded, 1, T_signal, pad, pad, stream);
@@ -875,7 +875,7 @@ void stft_f32(const float* x, float* mag, float* phase,
     stft_kernel<<<blocks, 32, 0, stream>>>(x_padded, mag, phase, T_padded,
                                              n_fft, hop_length, n_frames, n_freqs);
 
-    cudaFree(x_padded);
+    if (!scratch) cudaFree(x_padded);
 }
 
 // ---------------------------------------------------------------------------
@@ -941,13 +941,12 @@ __global__ void istft_normalize_kernel(const float* __restrict__ y_padded,
 
 void istft_f32(const float* mag, const float* phase, float* y,
                int n_frames, int n_fft, int hop_length, int T_signal,
-               cudaStream_t stream) {
+               cudaStream_t stream, float* scratch) {
     int pad = n_fft / 2;
     int T_padded = n_fft + hop_length * (n_frames - 1);
 
-    float *y_padded, *window_sum;
-    cudaMalloc(&y_padded, T_padded * sizeof(float));
-    cudaMalloc(&window_sum, T_padded * sizeof(float));
+    float *y_padded=scratch, *window_sum=scratch?scratch+T_padded:nullptr;
+    if (!scratch) { cudaMalloc(&y_padded,T_padded*sizeof(float));cudaMalloc(&window_sum,T_padded*sizeof(float)); }
     cudaMemsetAsync(y_padded, 0, T_padded * sizeof(float), stream);
     cudaMemsetAsync(window_sum, 0, T_padded * sizeof(float), stream);
 
@@ -965,8 +964,7 @@ void istft_f32(const float* mag, const float* phase, float* y,
             y_padded, window_sum, y, T_signal, pad);
     }
 
-    cudaFreeAsync(y_padded, stream);
-    cudaFreeAsync(window_sum, stream);
+    if (!scratch) {cudaFreeAsync(y_padded,stream);cudaFreeAsync(window_sum,stream);}
 }
 
 // ---------------------------------------------------------------------------

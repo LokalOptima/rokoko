@@ -45,14 +45,11 @@ On first run, model files are auto-downloaded from GitHub releases to `~/.cache/
 # Pipe to audio player
 ./rokoko.fp16 "Hello world." --stdout | aplay
 
-# Different voice
-./rokoko.fp16 "Hello world." --say --voice af_bella
-
 # Web UI
 ./rokoko.fp16 --serve 8080
 ```
 
-Available voices: `af_heart` (default), `af_bella`, `af_sky`, `af_nicole`.
+The supported voice is **`af_heart`**, the highest-graded English voice in [Kokoro’s official ratings](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md#american-english).
 
 ## Acknowledgments
 
@@ -63,7 +60,7 @@ Available voices: `af_heart` (default), `af_bella`, `af_sky`, `af_nicole`.
 ## Options
 
 ```
---voice <name>      Voice (default: af_heart)
+--voice <name>      Voice (only: af_heart)
 -o <file>           Output WAV (default: output.wav)
 --say               Play audio through speakers
 --stdout            Write WAV to stdout
@@ -71,6 +68,6 @@ Available voices: `af_heart` (default), `af_bella`, `af_sky`, `af_nicole`.
 --host <addr>       Server bind address (default: 0.0.0.0)
 --weights <file>    TTS weight file
 --g2p <file>        G2P model file
---voices <dir>      Voice directory
+--voices <dir>      Directory containing af_heart.bin
 -v                  Verbose output (timings, IPA, GPU info)
 ```

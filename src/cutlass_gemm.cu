@@ -538,3 +538,20 @@ int cutlass_gemm_batched_nn(int M, int N, int K,
     }
     return 0;
 }
+
+extern "C" void clear_cutlass_gemm_cache() {
+    s_tn_large.clear();
+    s_tn_small.clear();
+    s_tn_align1.clear();
+    s_tn_simt.clear();
+    s_nt_large.clear();
+    s_nt_small.clear();
+    s_nt_align1.clear();
+    s_nt_simt.clear();
+    s_nn_large.clear();
+    s_nn_small.clear();
+    s_nn_align1.clear();
+    s_nn_simt.clear();
+    s_batched_tn_tf32.clear();
+    s_batched_nn_tf32.clear();
+}

@@ -1,0 +1,77 @@
+{
+  "purpose": "Fixed diagnostic set, not a powered equivalence study; reviewed cases may overlap G2P training",
+  "cases": [
+    {
+      "id": "reviewed_0",
+      "text": "Last week we worked until 10 p.m.",
+      "spoken": "Last week we worked until ten P M.",
+      "source": "frontend/real_world.reviewed.tsv row 2"
+    },
+    {
+      "id": "reviewed_2",
+      "text": "I got married when I was 19 years of age.",
+      "spoken": "I got married when I was nineteen years of age.",
+      "source": "frontend/real_world.reviewed.tsv row 4"
+    },
+    {
+      "id": "reviewed_3",
+      "text": "The Japanese economy recorded more than 60 months of continuous expansion.",
+      "spoken": "The Japanese economy recorded more than sixty months of continuous expansion.",
+      "source": "frontend/real_world.reviewed.tsv row 5"
+    },
+    {
+      "id": "reviewed_4",
+      "text": "Our school is 80 years old.",
+      "spoken": "Our school is eighty years old.",
+      "source": "frontend/real_world.reviewed.tsv row 6"
+    },
+    {
+      "id": "reviewed_9",
+      "text": "Please tell Mary she needs to get home before 2:30.",
+      "spoken": "Please tell Mary she needs to get home before two thirty.",
+      "source": "frontend/real_world.reviewed.tsv row 11"
+    },
+    {
+      "id": "reviewed_10",
+      "text": "We invited 30 people to our party. However, only 13 came.",
+      "spoken": "We invited thirty people to our party. However, only thirteen came.",
+      "source": "frontend/real_world.reviewed.tsv row 12"
+    },
+    {
+      "id": "manual_0",
+      "text": "The blue cup is beside the green plate.",
+      "spoken": "The blue cup is beside the green plate.",
+      "source": "independently written for this suite; not model output"
+    },
+    {
+      "id": "manual_1",
+      "text": "Please do not turn off the lights.",
+      "spoken": "Please do not turn off the lights.",
+      "source": "independently written for this suite; not model output"
+    },
+    {
+      "id": "manual_2",
+      "text": "She did not say that he was late.",
+      "spoken": "She did not say that he was late.",
+      "source": "independently written for this suite; not model output"
+    },
+    {
+      "id": "manual_3",
+      "text": "Five birds flew north and two birds flew south.",
+      "spoken": "Five birds flew north and two birds flew south.",
+      "source": "independently written for this suite; not model output"
+    },
+    {
+      "id": "manual_4",
+      "text": "We saw a small boat near the bridge.",
+      "spoken": "We saw a small boat near the bridge.",
+      "source": "independently written for this suite; not model output"
+    },
+    {
+      "id": "manual_5",
+      "text": "The final words are purple lantern.",
+      "spoken": "The final words are purple lantern.",
+      "source": "independently written for this suite; not model output"
+    }
+  ]
+}

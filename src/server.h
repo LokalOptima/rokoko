@@ -16,6 +16,7 @@
 
 #include "cpp-httplib/httplib.h"
 #include "weights.h"
+#include "request_json.h"
 
 using namespace rokoko;
 
@@ -29,7 +30,10 @@ static inline std::string json_escape(const std::string& s) {
             case '\n': out += "\\n";  break;
             case '\r': out += "\\r";  break;
             case '\t': out += "\\t";  break;
-            default:   out += c;
+            default:
+                if (static_cast<unsigned char>(c)<32) {
+                    char escaped[7];snprintf(escaped,sizeof(escaped),"\\u%04x",static_cast<unsigned char>(c));out+=escaped;
+                } else out+=c;
         }
     }
     return out;
@@ -51,39 +55,6 @@ static inline void log_request(const httplib::Request& req, const httplib::Respo
         fprintf(stderr, "         %s\n", t_log_detail.c_str());
         t_log_detail.clear();
     }
-}
-
-// Minimal JSON string value extractor (no dependency on a JSON library).
-// Finds "key":"value" and returns value. Returns fallback if not found.
-static inline std::string json_get_string(const std::string& body,
-                                           const std::string& key,
-                                           const std::string& fallback = "") {
-    std::string needle = "\"" + key + "\"";
-    auto pos = body.find(needle);
-    if (pos == std::string::npos) return fallback;
-    pos = body.find(':', pos + needle.size());
-    if (pos == std::string::npos) return fallback;
-    pos = body.find('"', pos + 1);
-    if (pos == std::string::npos) return fallback;
-    pos++; // skip opening quote
-    std::string result;
-    while (pos < body.size() && body[pos] != '"') {
-        if (body[pos] == '\\' && pos + 1 < body.size()) {
-            pos++;
-            switch (body[pos]) {
-                case '"':  result += '"'; break;
-                case '\\': result += '\\'; break;
-                case 'n':  result += '\n'; break;
-                case 'r':  result += '\r'; break;
-                case 't':  result += '\t'; break;
-                default:   result += body[pos]; break;
-            }
-        } else {
-            result += body[pos];
-        }
-        pos++;
-    }
-    return result;
 }
 
 template<typename PipelineT>
@@ -120,8 +91,6 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
              font-family: inherit; resize: vertical; outline: none; }
   textarea:focus { border-color: #555; }
   .controls { display: flex; gap: 10px; margin-top: 12px; align-items: center; }
-  select { background: #1a1a1a; color: #e0e0e0; border: 1px solid #333;
-           border-radius: 6px; padding: 8px 12px; font-size: 14px; outline: none; }
   button { background: #2563eb; color: #fff; border: none; border-radius: 6px;
            padding: 8px 20px; font-size: 14px; font-weight: 500; cursor: pointer; }
   button:hover { background: #1d4ed8; }
@@ -137,12 +106,6 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
   <h1>Rokoko TTS</h1>
   <textarea id="text" placeholder="Type something..." autofocus>The quick brown fox jumps over the lazy dog.</textarea>
   <div class="controls">
-    <select id="voice">
-      <option value="af_heart">af_heart</option>
-      <option value="af_bella">af_bella</option>
-      <option value="af_sky">af_sky</option>
-      <option value="af_nicole">af_nicole</option>
-    </select>
     <button id="btn" onclick="speak()">Speak</button>
     <span class="status" id="status"></span>
   </div>
@@ -167,7 +130,7 @@ async function speak() {
     const r = await fetch('/synthesize/stream', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({text, voice: $('voice').value})
+      body: JSON.stringify({text})
     });
     if (!r.ok) {
       $('status').textContent = (await r.json()).error || 'error';
@@ -239,102 +202,61 @@ $('text').addEventListener('keydown', e => {
 </html>)html", "text/html");
     });
 
-    svr.Post("/synthesize", [&](const httplib::Request& req, httplib::Response& res) {
-        // Parse JSON body
-        std::string text = json_get_string(req.body, "text");
-        std::string voice = json_get_string(req.body, "voice", "af_heart");
-
-        if (text.empty()) {
-            res.status = 400;
-            res.set_content("{\"error\":\"missing 'text' field\"}", "application/json");
-            return;
-        }
-
-        auto t0 = std::chrono::high_resolution_clock::now();
-        std::vector<float> audio;
-        std::string err;
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            err = pipeline.synthesize(text, voice, audio);
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-
-        if (!err.empty()) {
-            res.status = 500;
-            std::string body = "{\"error\":\"" + json_escape(err) + "\"}";
-            res.set_content(body, "application/json");
-            return;
-        }
-
-        double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        double audio_dur = (double)audio.size() / SAMPLE_RATE;
-        double rtfx = audio_dur / (elapsed_ms / 1000.0);
-
-        // Timing headers
-        res.set_header("X-Preprocess-Ms", std::to_string(pipeline.last_preprocess_ms));
-        res.set_header("X-G2P-Ms", std::to_string(pipeline.last_g2p_ms));
-        res.set_header("X-TTS-Ms", std::to_string(pipeline.last_tts_ms));
-        res.set_header("X-Audio-Duration", std::to_string(audio_dur));
-
-        // Write WAV to string via ostringstream
-        std::ostringstream wav_stream(std::ios::binary);
-        write_wav_to_(wav_stream, audio.data(), (int)audio.size(), SAMPLE_RATE);
-        res.set_content(wav_stream.str(), "audio/wav");
-
-        // Log detail
-        std::string preview = text.substr(0, 80);
-        if (text.size() > 80) preview += "...";
-        char detail[256];
-        snprintf(detail, sizeof(detail), "audio=%.1fs  inference=%.0fms  RTFx=%.0fx  \"%s\"",
-                 audio_dur, elapsed_ms, rtfx, preview.c_str());
-        t_log_detail = detail;
+    auto error=[](httplib::Response& res,int status,const std::string& msg) {
+        res.status=status;res.set_content("{\"error\":\""+json_escape(msg)+"\"}","application/json");
+    };
+    auto prepare=[&](const httplib::Request& req,httplib::Response& res,typename PipelineT::Prepared& speech) {
+        try {
+            auto fields=parse_request(req.body);
+            auto it=fields.find("text");
+            if (it==fields.end()) {error(res,400,"missing text field");return false;}
+            auto voice=fields.count("voice")?fields.at("voice"):"af_heart";
+            auto err=pipeline.prepare(it->second,voice,speech,fields.count("input") && fields.at("input")=="phonemes");
+            if (!err.empty()) {error(res,400,err);return false;}
+            return true;
+        } catch (const std::exception& e) {error(res,400,e.what());return false;}
+    };
+    svr.Get("/stats",[&](const httplib::Request&,httplib::Response& res) {
+        std::lock_guard<std::mutex> lock(mtx);auto s=inference_stats();size_t available=0,total=0;cudaMemGetInfo(&available,&total);
+        std::ostringstream out;
+        out<<"{\"encode_graphs\":"<<s.encode_graphs<<",\"decode_graphs\":"<<s.decode_graphs
+           <<",\"g2p_graphs\":"<<pipeline.g2p.graph_count()<<",\"arena_bytes\":"<<s.arena_bytes
+           <<",\"gpu_used_bytes\":"<<total-available<<",\"invalidations\":"<<s.invalidations<<"}";
+        res.set_content(out.str(),"application/json");
     });
-
-    // Streaming endpoint: sends raw float32 PCM via chunked transfer encoding.
-    // Each TTS chunk is flushed as it's synthesized, enabling low-latency playback.
-    svr.Post("/synthesize/stream", [&](const httplib::Request& req, httplib::Response& res) {
-        std::string text = json_get_string(req.body, "text");
-        std::string voice = json_get_string(req.body, "voice", "af_heart");
-
-        if (text.empty()) {
-            res.status = 400;
-            res.set_content("{\"error\":\"missing 'text' field\"}", "application/json");
-            return;
-        }
-
-        res.set_header("X-Sample-Rate", std::to_string(SAMPLE_RATE));
-
-        res.set_chunked_content_provider(
-            "audio/pcm",
-            [&pipeline, &mtx, text, voice](size_t /*offset*/, httplib::DataSink& sink) {
-                std::lock_guard<std::mutex> lock(mtx);
-                auto t0 = std::chrono::high_resolution_clock::now();
-                size_t total_samples = 0;
-
-                pipeline.synthesize_streaming(text, voice,
-                    [&sink, &total_samples](const float* data, size_t n) -> bool {
-                        total_samples += n;
-                        return sink.write(reinterpret_cast<const char*>(data),
-                                          n * sizeof(float));
-                    });
-
-                auto t1 = std::chrono::high_resolution_clock::now();
-                double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                double audio_dur = (double)total_samples / SAMPLE_RATE;
-                double rtfx = (elapsed_ms > 0) ? audio_dur / (elapsed_ms / 1000.0) : 0;
-
-                std::string preview = text.substr(0, 80);
-                if (text.size() > 80) preview += "...";
-                char detail[256];
-                snprintf(detail, sizeof(detail),
-                         "[stream] audio=%.1fs  inference=%.0fms  RTFx=%.0fx  \"%s\"",
-                         audio_dur, elapsed_ms, rtfx, preview.c_str());
-                t_log_detail = detail;
-
-                sink.done();
-                return true;
-            }
-        );
+    svr.Post("/synthesize",[&](const httplib::Request& req,httplib::Response& res) {
+        std::lock_guard<std::mutex> lock(mtx);
+        typename PipelineT::Prepared speech;
+        if (!prepare(req,res,speech)) return;
+        auto before=inference_stats();std::vector<float> audio;
+        auto err=pipeline.render(speech,[&](const float* p,size_t n) {audio.insert(audio.end(),p,p+n);return true;});
+        if (!err.empty()) {error(res,500,err);return;}
+        auto after=inference_stats();
+        res.set_header("X-Preprocess-Ms",std::to_string(pipeline.last_preprocess_ms));
+        res.set_header("X-G2P-Ms",std::to_string(pipeline.last_g2p_ms));
+        res.set_header("X-TTS-Ms",std::to_string(pipeline.last_tts_ms));
+        res.set_header("X-Encode-Hits",std::to_string(after.encode_hits-before.encode_hits));
+        res.set_header("X-Encode-Misses",std::to_string(after.encode_misses-before.encode_misses));
+        res.set_header("X-Decode-Hits",std::to_string(after.decode_hits-before.decode_hits));
+        res.set_header("X-Decode-Misses",std::to_string(after.decode_misses-before.decode_misses));
+        res.set_header("X-Graph-Invalidations",std::to_string(after.invalidations-before.invalidations));
+        res.set_header("X-Chunks",std::to_string(speech.chunks.size()));
+        std::ostringstream wav(std::ios::binary);write_wav_to_(wav,audio.data(),int(audio.size()),SAMPLE_RATE);
+        res.set_content(wav.str(),"audio/wav");
+    });
+    svr.Post("/synthesize/stream",[&](const httplib::Request& req,httplib::Response& res) {
+        auto speech=std::make_shared<typename PipelineT::Prepared>();
+        { std::lock_guard<std::mutex> lock(mtx); if (!prepare(req,res,*speech)) return; }
+        res.set_header("X-Sample-Rate",std::to_string(SAMPLE_RATE));
+        res.set_chunked_content_provider("audio/pcm",[&pipeline,&mtx,speech](size_t,httplib::DataSink& sink) {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto err=pipeline.render(*speech,[&](const float* p,size_t n) {
+                return sink.is_writable() && sink.write(reinterpret_cast<const char*>(p),n*sizeof(float));
+            });
+            // A failure after headers terminates the transfer without a successful terminator.
+            if (!err.empty()) {fprintf(stderr,"stream: %s\n",err.c_str());return false;}
+            sink.done();return true;
+        });
     });
 
     const char* display_host = (host == "0.0.0.0") ? "localhost" : host.c_str();

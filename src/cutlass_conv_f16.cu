@@ -271,3 +271,8 @@ int cutlass_conv1d_fprop_f16(const __half* x, const __half* w, const float* bias
         C_in, C_out, T_in, T_out, K, alpha, beta,
         layout_x, layout_w, layout_y, layout_bias, stream);
 }
+
+extern "C" void clear_cutlass_conv_f16_cache() {
+    s_fp16_large_cache.clear();
+    s_fp16_small_cache.clear();
+}

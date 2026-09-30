@@ -65,7 +65,10 @@ def main():
     # 2. G2P alone on plain sentences, vs misaki
     plain_normed = run(norm_bin, plain)
     pred = run(g2p_bin, plain_normed, a.g2p)
-    ok = sum(lenient(p) == lenient(ref(s)) for p, s in zip(pred, plain))
+    refs = [ref(s) for s in plain]
+    ok = sum(lenient(p) == lenient(r) for p, r in zip(pred, refs))
+    strict = sum(p.strip() == r.strip() for p, r in zip(pred, refs))
+    print(f"G2P exact, stress retained:     {strict}/{len(plain)} (diagnostic, no new threshold)")
     print(f"G2P, plain sentences:           {ok}/{len(plain)} ({100 * ok / len(plain):.1f}%)")
     if ok / len(plain) < 0.985:
         failed.append("g2p plain")
