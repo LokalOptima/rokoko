@@ -17,6 +17,8 @@
 #include "cpp-httplib/httplib.h"
 #include "weights.h"
 
+using namespace rokoko;
+
 static inline std::string json_escape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 8);
@@ -93,6 +95,11 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
 
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content("{\"status\":\"ok\"}", "application/json");
+    });
+
+    svr.Post("/shutdown", [&svr](const httplib::Request&, httplib::Response& res) {
+        res.set_content("{\"status\":\"shutting down\"}", "application/json");
+        svr.stop();
     });
 
     svr.Get("/", [](const httplib::Request&, httplib::Response& res) {

@@ -369,9 +369,10 @@ __global__ void g2p_bias_ctc_argmax_kernel(const float* __restrict__ logits,
 
 // ── Model struct ────────────────────────────────────────────────────────────
 
+namespace rokoko {
+
 struct G2PModelCuda {
     bool load(const char* path, cudaStream_t stream);
-    bool load(const void* data, size_t size, cudaStream_t stream);
     std::string infer(const std::string& text, cudaStream_t stream) const;
     void free();
 
@@ -429,14 +430,6 @@ private:
 };
 
 // ── Implementation ──────────────────────────────────────────────────────────
-
-inline bool G2PModelCuda::load(const void* data, size_t size, cudaStream_t stream) {
-    FILE* f = fmemopen(const_cast<void*>(data), size, "rb");
-    if (!f) return false;
-    bool ok = load_from_file_(f, "<bundle:g2p>", stream);
-    fclose(f);
-    return ok;
-}
 
 inline bool G2PModelCuda::load(const char* path, cudaStream_t stream) {
     FILE* f = fopen(path, "rb");
@@ -668,9 +661,9 @@ inline bool G2PModelCuda::load_from_file_(FILE* f, const char* label, cudaStream
 
     cudaStreamSynchronize(stream);
 
-    fprintf(stderr, "g2p_cuda: loaded %s (d=%d, %d layers, %d heads, %d ff, %dx up, %.1f MB, ws=%.1f MB)\n",
-            label, d_, n_layers_, heads_, ff_, up_,
-            total_bytes_ / (1024.0f * 1024.0f), workspace_bytes_ / (1024.0f * 1024.0f));
+    vlog("g2p_cuda: loaded %s (d=%d, %d layers, %d heads, %d ff, %dx up, %.1f MB, ws=%.1f MB)\n",
+         label, d_, n_layers_, heads_, ff_, up_,
+         total_bytes_ / (1024.0f * 1024.0f), workspace_bytes_ / (1024.0f * 1024.0f));
     return true;
 }
 
@@ -889,3 +882,5 @@ inline std::string G2PModelCuda::infer(const std::string& text,
 
     return result;
 }
+
+} // namespace rokoko

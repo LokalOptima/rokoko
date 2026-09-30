@@ -16,6 +16,13 @@
 #include <cuda_fp16.h>
 
 // ---------------------------------------------------------------------------
+// Verbosity control (defined in main.cu, default false = quiet)
+// ---------------------------------------------------------------------------
+
+extern bool g_verbose;
+#define vlog(...) do { if (g_verbose) fprintf(stderr, __VA_ARGS__); } while (0)
+
+// ---------------------------------------------------------------------------
 // Utility macros
 // ---------------------------------------------------------------------------
 
@@ -28,6 +35,8 @@
             std::exit(1);                                                      \
         }                                                                      \
     } while (0)
+
+namespace rokoko {
 
 // ---------------------------------------------------------------------------
 // GPU scratch arena: single allocation, bump pointer, reset per inference
@@ -270,8 +279,9 @@ struct Weights {
         // FP16 companions (v2)
         __half *conv1_wv_nhwc_f16 = nullptr;  // NHWC FP16 for K=3 conv
         __half *conv2_wv_nhwc_f16 = nullptr;
-        __half *conv1x1_wv_f16 = nullptr;     // K=1, straight FP16
-        int conv1_c_in_pad = 0;               // padded C_in (0 = unpadded)
+        __half *conv1x1_wv_nhwc_f16 = nullptr; // K=1 NHWC FP16 (identity layout)
+        int conv1_c_in_pad = 0;               // padded C_in for conv1 (0 = unpadded)
+        int conv1x1_c_in_pad = 0;             // padded C_in for conv1x1 (0 = unpadded)
     };
 
     // DurationEncoder: 3x (BiLSTM + AdaLayerNorm)
@@ -365,7 +375,6 @@ struct Weights {
     // -----------------------------------------------------------------------
 
     static Weights prefetch(const std::string& path);
-    static Weights prefetch(const void* data, size_t size);
     void upload(cudaStream_t stream = nullptr);
     static Weights load(const std::string& path, cudaStream_t stream = nullptr);
     void free();
@@ -405,3 +414,5 @@ void write_wav_to_(std::ostream& f, const float* audio,
 
 /// Precompute weight norms (called once after weight upload).
 void precompute_weight_norms(Weights& w, cudaStream_t stream);
+
+} // namespace rokoko

@@ -18,6 +18,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+using namespace rokoko;
+
 // ---------------------------------------------------------------------------
 // Helper: align up
 // ---------------------------------------------------------------------------
@@ -424,8 +426,10 @@ void Weights::assign_v2_fp16_pointers() {
         blk.conv1_wv_nhwc_f16 = nhwc16(c1);
         blk.conv1_c_in_pad = pad_cin(c1);
         blk.conv2_wv_nhwc_f16 = nhwc16(c2);
-        if (blk.has_shortcut)
-            blk.conv1x1_wv_f16 = f16(prefix + ".conv1x1.weight_v");
+        if (blk.has_shortcut) {
+            blk.conv1x1_wv_nhwc_f16 = nhwc16(prefix + ".conv1x1.weight_v");
+            blk.conv1x1_c_in_pad = pad_cin(prefix + ".conv1x1.weight_v");
+        }
         assign_adain1d_v2(blk.norm1, prefix + ".norm1");
         assign_adain1d_v2(blk.norm2, prefix + ".norm2");
     };
@@ -560,55 +564,6 @@ Weights Weights::prefetch(const std::string& path) {
 }
 
 // ---------------------------------------------------------------------------
-// Weights::prefetch (from memory) — parse KOKO data already in memory.
-// Caller owns the buffer (e.g. bundle mmap); we just store a pointer.
-// ---------------------------------------------------------------------------
-
-Weights Weights::prefetch(const void* data, size_t size) {
-    Weights w;
-    const uint8_t* base = (const uint8_t*)data;
-
-    uint32_t magic;
-    memcpy(&magic, base, 4);
-    if (magic != KOKO_MAGIC) {
-        fprintf(stderr, "Bad magic: expected KOKO\n");
-        std::exit(1);
-    }
-
-    uint32_t version;
-    memcpy(&version, base + 4, 4);
-    if (version != 1 && version != 2) {
-        fprintf(stderr, "Unsupported weight file version %u (expected 1 or 2)\n", version);
-        std::exit(1);
-    }
-
-    uint64_t header_len;
-    memcpy(&header_len, base + 8, 8);
-    w.tensors = parse_header((const char*)(base + 16), header_len);
-
-    for (size_t i = 0; i < w.tensors.size(); i++)
-        w.name_to_idx[w.tensors[i].name] = i;
-
-    size_t header_end = 16 + header_len;
-    size_t data_start = align_up(header_end, HEADER_ALIGN);
-
-    size_t total_data = 0;
-    for (auto& td : w.tensors) {
-        size_t end = td.offset + td.size_bytes;
-        if (end > total_data) total_data = end;
-    }
-    if (!w.tensors.empty()) {
-        auto& last = w.tensors.back();
-        total_data = std::max(total_data, align_up(last.offset + last.size_bytes, 256));
-    }
-
-    w.gpu_data_size = total_data;
-    w.prefetch_base = base + data_start;
-    // mmap_ptr stays nullptr — we don't own the mapping
-    return w;
-}
-
-// ---------------------------------------------------------------------------
 // Weights::upload — cudaMalloc + cudaMemcpy from prefetched data, assign ptrs.
 // ---------------------------------------------------------------------------
 
@@ -682,8 +637,8 @@ const std::vector<int>* Weights::get_shape(const std::string& name) const {
 // ---------------------------------------------------------------------------
 
 void Weights::print_info() const {
-    fprintf(stderr, "weights: %zu tensors, %.1f MB GPU\n",
-            tensors.size(), gpu_data_size / (1024.0 * 1024.0));
+    vlog("weights: %zu tensors, %.1f MB GPU\n",
+         tensors.size(), gpu_data_size / (1024.0 * 1024.0));
 
     int missing = 0;
     auto check = [&](const char* label, const float* ptr) {
@@ -744,6 +699,6 @@ void Weights::print_info() const {
     if (missing) {
         fprintf(stderr, "  %d weight(s) missing!\n", missing);
     } else {
-        fprintf(stderr, "  all key weights found\n");
+        vlog("  all key weights found\n");
     }
 }
