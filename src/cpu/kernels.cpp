@@ -1,6 +1,7 @@
 // CPU signal and recurrent operators. Layout is [time, channels], shared with CUDA.
 #include "kernels.h"
 #include "cpu/math.h"
+#include "cpu/parallel.h"
 #include <cblas.h>
 #include <immintrin.h>
 #include <algorithm>
@@ -11,6 +12,7 @@
 // glibc's public x86 vector-function ABI (libmvec, linked through libm).
 // Explicit calls retain finite-value checks and avoid global fast-math flags.
 extern "C" __m256 _ZGVdN8v_sinf(__m256);
+extern "C" __m256 _ZGVdN8v_tanhf(__m256);
 namespace rokoko {
 static constexpr float pi = 3.14159265358979323846f;
 static float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
@@ -81,12 +83,14 @@ void instance_norm_style_affine_f32(const float *x, const float *nw, const float
     // Double precision statistics avoid long-utterance cancellation. No fast-math:
     // nonfinite output remains detectable by the public pipeline.
     std::vector<double> sums(C, 0), squares(C, 0);
-    for (int t = 0; t < T; ++t)
-        for (int c = 0; c < C; ++c) {
-            double v = x[t * C + c];
-            sums[c] += v;
-            squares[c] += v * v;
-        }
+    cpu::parallel(size_t(C), 16, [&](size_t begin, size_t end) {
+        for (int t = 0; t < T; ++t)
+            for (size_t c = begin; c < end; ++c) {
+                double v = x[t * C + c];
+                sums[c] += v;
+                squares[c] += v * v;
+            }
+    });
     std::vector<float> scale(C), bias(C);
     for (int c = 0; c < C; ++c) {
         float mean = float(sums[c] / T),
@@ -95,38 +99,51 @@ void instance_norm_style_affine_f32(const float *x, const float *nw, const float
         scale[c] = (1 + g[c]) * nw[c] * inv;
         bias[c] = (1 + g[c]) * (nb[c] - nw[c] * mean * inv) + b[c];
     }
-    for (int t = 0; t < T; ++t) {
-        int c = 0;
-        for (; c + 8 <= C; c += 8) {
-            __m256 v =
-                _mm256_fmadd_ps(_mm256_loadu_ps(scale.data() + c), _mm256_loadu_ps(x + t * C + c),
-                                _mm256_loadu_ps(bias.data() + c));
-            if (snake) {
-                __m256 a = _mm256_loadu_ps(snake + c);
-                __m256 z = _ZGVdN8v_sinf(_mm256_mul_ps(a, v));
-                v = _mm256_add_ps(v, _mm256_div_ps(_mm256_mul_ps(z, z), a));
+    cpu::parallel(size_t(T), size_t(std::max(1, 16384 / C)), [&](size_t begin, size_t end) {
+        for (size_t t = begin; t < end; ++t) {
+            int c = 0;
+            for (; c + 8 <= C; c += 8) {
+                __m256 v =
+                    _mm256_fmadd_ps(_mm256_loadu_ps(scale.data() + c), _mm256_loadu_ps(x + t * C + c),
+                                    _mm256_loadu_ps(bias.data() + c));
+                if (snake) {
+                    __m256 a = _mm256_loadu_ps(snake + c);
+                    __m256 z = _ZGVdN8v_sinf(_mm256_mul_ps(a, v));
+                    v = _mm256_add_ps(v, _mm256_div_ps(_mm256_mul_ps(z, z), a));
+                }
+                _mm256_storeu_ps(y + t * C + c, v);
             }
-            _mm256_storeu_ps(y + t * C + c, v);
-        }
-        for (; c < C; ++c) {
-            float v = scale[c] * x[t * C + c] + bias[c];
-            if (snake) {
-                float z = std::sin(snake[c] * v);
-                v += z * z / snake[c];
+            for (; c < C; ++c) {
+                float v = scale[c] * x[t * C + c] + bias[c];
+                if (snake) {
+                    float z = std::sin(snake[c] * v);
+                    v += z * z / snake[c];
+                }
+                y[t * C + c] = v;
             }
-            y[t * C + c] = v;
         }
-    }
+    });
 }
 void gelu_f32(const float *x, float *y, int N, Stream) {
-    for (int i = 0; i < N; ++i) {
+    int i = 0;
+    for (; i + 8 <= N; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        __m256 cubic = _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(.044715f), v), v);
+        __m256 z = _mm256_mul_ps(_mm256_set1_ps(.7978845608028654f),
+                                 _mm256_fmadd_ps(cubic, v, v));
+        __m256 a = _mm256_add_ps(_mm256_set1_ps(1.f), _ZGVdN8v_tanhf(z));
+        _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(.5f), v), a));
+    }
+    for (; i < N; ++i) {
         float v = x[i];
         y[i] = 0.5f * v * (1 + std::tanh(0.7978845608028654f * (v + 0.044715f * v * v * v)));
     }
 }
 void leaky_relu_f32(const float *x, float *y, int N, float alpha, Stream) {
-    for (int i = 0; i < N; ++i)
-        y[i] = x[i] > 0 ? x[i] : alpha * x[i];
+    cpu::parallel(size_t(N), 32768, [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i)
+            y[i] = x[i] > 0 ? x[i] : alpha * x[i];
+    });
 }
 void softmax_f32(const float *x, float *y, int N, int D, Stream) {
     for (int n = 0; n < N; ++n) {
@@ -143,9 +160,11 @@ void softmax_f32(const float *x, float *y, int N, int D, Stream) {
     }
 }
 void bias_add_f32(const float *x, const float *b, float *y, int N, int D, Stream) {
-    for (int n = 0; n < N; ++n)
-        for (int i = 0; i < D; ++i)
-            y[n * D + i] = x[n * D + i] + b[i];
+    cpu::parallel(size_t(N), size_t(std::max(1, 32768 / D)), [&](size_t begin, size_t end) {
+        for (size_t n = begin; n < end; ++n)
+            for (int i = 0; i < D; ++i)
+                y[n * D + i] = x[n * D + i] + b[i];
+    });
 }
 void channel_bias_add_f32(float *y, const float *b, int C, int T, Stream s) {
     bias_add_f32(y, b, y, T, C, s);
@@ -370,28 +389,30 @@ void sinegen_phase_f32(const float *f0, const float *random, float *phase, int L
 }
 void sinegen_source_f32(const float *phase, const float *f0, const float *w, const float *b,
                         float *y, int L, int T, unsigned seed, Stream) {
-    for (int t = 0; t < T; ++t) {
-        float src = (t + .5f) * L / float(T) - .5f;
-        src = std::clamp(src, 0.f, float(L - 1));
-        int lo = int(src), hi = std::min(lo + 1, L - 1);
-        float frac = src - lo, uv = f0[t / 300] > 10 ? 1.f : 0.f,
-              amp = uv * .003f + (1 - uv) * .1f / 3.f, sum = b[0];
-        for (int h = 0; h < 9; ++h) {
-            float p = (1 - frac) * phase[lo * 9 + h] + frac * phase[hi * 9 + h];
-            unsigned hash = unsigned(t) * 2654435761u + unsigned(h) * 340573321u + seed;
-            hash ^= hash >> 16;
-            hash *= 0x85ebca6bu;
-            hash ^= hash >> 13;
-            hash *= 0xc2b2ae35u;
-            hash ^= hash >> 16;
-            float u1 = ((hash & 0xffffffu) + 1u) / 16777217.f;
-            hash = hash * 1664525u + 1013904223u;
-            float u2 = (hash & 0xffffffu) / 16777216.f;
-            float noise = std::sqrt(-2 * std::log(u1)) * std::cos(2 * pi * u2) * amp;
-            sum += (std::sin(p) * .1f * uv + noise) * w[h];
+    cpu::parallel(size_t(T), 1024, [&](size_t begin, size_t end) {
+        for (size_t t = begin; t < end; ++t) {
+            float src = (t + .5f) * L / float(T) - .5f;
+            src = std::clamp(src, 0.f, float(L - 1));
+            int lo = int(src), hi = std::min(lo + 1, L - 1);
+            float frac = src - lo, uv = f0[t / 300] > 10 ? 1.f : 0.f,
+                  amp = uv * .003f + (1 - uv) * .1f / 3.f, sum = b[0];
+            for (int h = 0; h < 9; ++h) {
+                float p = (1 - frac) * phase[lo * 9 + h] + frac * phase[hi * 9 + h];
+                unsigned hash = unsigned(t) * 2654435761u + unsigned(h) * 340573321u + seed;
+                hash ^= hash >> 16;
+                hash *= 0x85ebca6bu;
+                hash ^= hash >> 13;
+                hash *= 0xc2b2ae35u;
+                hash ^= hash >> 16;
+                float u1 = ((hash & 0xffffffu) + 1u) / 16777217.f;
+                hash = hash * 1664525u + 1013904223u;
+                float u2 = (hash & 0xffffffu) / 16777216.f;
+                float noise = std::sqrt(-2 * std::log(u1)) * std::cos(2 * pi * u2) * amp;
+                sum += (std::sin(p) * .1f * uv + noise) * w[h];
+            }
+            y[t] = std::tanh(sum);
         }
-        y[t] = std::tanh(sum);
-    }
+    });
 }
 void round_clamp_durations_f32(const float *x, int *durations, int *total, int T, Stream) {
     int sum = 0;

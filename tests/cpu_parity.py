@@ -73,9 +73,9 @@ def main():
     cpu_info=embedded_identity(args.cpu);gpu_info=embedded_identity(args.gpu)
     assert cpu_info['backend']=='cpu' and gpu_info['backend']=='cuda'
     assert cpu_info['files']==gpu_info['files'], 'different model assets'
-    # The CPU executable must run without loading either CUDA or a dynamic BLAS.
+    # CPU computation libraries are static; neither CUDA nor external inference libraries load.
     dependencies=subprocess.check_output(['ldd',str(args.cpu)],text=True)
-    assert not any(s in dependencies.lower() for s in ('cuda','cublas','openblas'))
+    assert not any(s in dependencies.lower() for s in ('cuda','cublas','openblas','dnnl'))
     cases=json.loads((ROOT/'tests/fixtures/quality.json').read_text())['cases']
     cases += [dict(id=f'benchmark_{i}',text=text) for i,text in enumerate(TEXTS)]
     report=dict(cpu=provenance(args.cpu,bundled=True),gpu=provenance(args.gpu,bundled=True),

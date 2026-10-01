@@ -48,13 +48,15 @@ cmake --build build/cmake -j2
 
 ### CPU build
 
-The CPU backend requires **AVX2, FMA and F16C** on Linux with glibc/libmvec
+The CPU backend requires **AVX2, FMA and F16C** on Linux with glibc/libmvec 2.35+
 (tested on an Intel i7-12700).
 It needs CMake 3.24+ and GNU Make, and does not need CUDA, an NVIDIA driver,
-CUTLASS or a GPU. OpenBLAS 0.3.30 is downloaded into the build directory with a
-pinned SHA-256 and linked statically. It supplies AVX2/FMA matrix kernels;
-F16C accelerates half-weight conversion. Convolutions use bounded im2col tiles.
-The sine-based activation uses glibc's AVX2 vector math, without fast-math flags.
+CUTLASS or a GPU. OpenBLAS 0.3.30 and oneDNN 3.10.2 are downloaded into the build
+directory with pinned SHA-256 hashes and linked statically. They supply matrix
+kernels and direct convolutions using one shared pool of CPU workers. Weights
+remain FP16 in the executable; CPU computation uses cached FP32 weights.
+Input rounding is fused into FP32 staging, avoiding a separate FP16 buffer pass.
+Sine and GELU activations use glibc's AVX2 vector math, without fast-math flags.
 
 ```bash
 make cpu
@@ -71,16 +73,17 @@ cmake --build build/cpu -j4
 
 The CPU build has the same CLI, HTTP and library interfaces. Backend selection
 happens at build time; the default `rokoko` Make target remains CUDA.
-OpenBLAS uses up to eight threads by default. Set `ROKOKO_CPU_THREADS=1..64` to
+CPU operations use up to eight threads by default. Set `ROKOKO_CPU_THREADS=1..64` to
 choose a different count; more threads are not always faster.
 
 For a fresh offline CPU build, provide approved model assets and the pinned
-OpenBLAS source archive:
+OpenBLAS and oneDNN source archives:
 
 ```bash
 cmake -S . -B build/cpu -DROKOKO_BACKEND=CPU -DCMAKE_BUILD_TYPE=Release \
   -DROKOKO_OFFLINE=ON -DROKOKO_ASSET_SOURCE=/path/to/models \
-  -DROKOKO_OPENBLAS_URL=/path/to/OpenBLAS-0.3.30.tar.gz
+  -DROKOKO_OPENBLAS_URL=/path/to/OpenBLAS-0.3.30.tar.gz \
+  -DROKOKO_ONEDNN_URL=/path/to/oneDNN-3.10.2.tar.gz
 cmake --build build/cpu -j4
 ```
 
@@ -129,7 +132,8 @@ After building, copy just `rokoko` (about 202 MB with the tested Make toolchain)
 You can delete the build directory. Moving the executable still requires a
 compatible CPU and Linux system libraries. The CUDA executable additionally
 requires a compatible NVIDIA GPU, its driver and the CUDA runtime. The CPU
-executable has no CUDA or dynamic OpenBLAS dependency and can also be moved alone.
+executable (about 228 MB with the tested CMake toolchain) has no CUDA, dynamic
+OpenBLAS or dynamic oneDNN dependency and can also be moved alone.
 Model updates require rebuilding the executable.
 
 `--build-info` prints the selected backend and embedded asset identities without
@@ -161,6 +165,7 @@ The supported voice is **`af_heart`**, the highest-graded English voice in [Koko
 
 - **[Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)** by hexgrad — the original TTS model that this project reimplements in C++/CUDA (Apache 2.0 License)
 - **[OpenBLAS](https://github.com/OpenMathLib/OpenBLAS)** — statically linked SIMD CPU matrix operations ([BSD 3-Clause license](third_party/OpenBLAS-LICENSE)). Include this notice when distributing CPU binaries.
+- **[oneDNN](https://github.com/uxlfoundation/oneDNN)** — statically linked CPU convolutions ([Apache 2.0 license](third_party/oneDNN-LICENSE), [third-party notices](third_party/oneDNN-THIRD-PARTY-PROGRAMS)). Include these notices when distributing CPU binaries.
 - **[CUTLASS](https://github.com/NVIDIA/cutlass)** by NVIDIA — CUDA GEMM templates (BSD-3-Clause License, Copyright 2017-2026 NVIDIA Corporation & Affiliates)
 - **[cpp-httplib](https://github.com/yhirose/cpp-httplib)** by yhirose — HTTP server for web UI (MIT License)
 

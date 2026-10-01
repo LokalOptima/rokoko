@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import mmap
 import os
 from pathlib import Path
 import shutil
@@ -14,6 +15,7 @@ from support import ROOT, server, request, wav_info, embedded_identity, save_rep
 def verify_embedded_bytes(binary, info):
     # Independently hash the linked ELF bytes, rather than trusting --build-info.
     symbols={}
+    payloads=[]
     for line in subprocess.check_output(['nm','-S','--defined-only',str(binary)],text=True).splitlines():
         fields=line.split()
         if len(fields)==4 and fields[3].startswith('rokoko_') and fields[3].endswith('_start'):
@@ -33,14 +35,22 @@ def verify_embedded_bytes(binary, info):
             assert size==meta['size'] and address%4096==0,(name,'size/alignment')
             matches=[p for p in segments if p[0]==1 and p[3]<=address and address+size<=p[3]+p[5]]
             assert len(matches)==1 and not matches[0][1]&2,(name,'writable or unmapped asset')
-            segment=matches[0];f.seek(segment[2]+address-segment[3]);h=hashlib.sha256()
+            segment=matches[0];position=segment[2]+address-segment[3]
+            payloads.append((name,position,size))
+            f.seek(position);h=hashlib.sha256()
             remaining=size
             while remaining:
                 block=f.read(min(1024*1024,remaining));assert block
                 h.update(block);remaining-=len(block)
             assert h.hexdigest()==meta['sha256'],(name,'embedded bytes differ from approved asset')
     assert set(symbols)=={'rokoko_'+kind+'_start' for kind in ('weights','g2p','voice','info')}
-    assert binary.stat().st_size < sum(m['size'] for m in info['files'].values())+10*1024*1024,'unexpected duplicate asset payload'
+    # Check actual payload duplication: static inference libraries can legitimately
+    # grow the executable, so a fixed allowance for non-asset bytes is misleading.
+    with binary.open('rb') as f, mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ) as data:
+        for name,position,size in payloads:
+            with memoryview(data)[position:position+size] as payload:
+                assert data.find(payload)==position,(name,'earlier duplicate asset payload')
+                assert data.find(payload,position+1)==-1,(name,'duplicate asset payload')
 
 
 def trace_command(trace):

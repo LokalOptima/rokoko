@@ -11,6 +11,7 @@ def main():
     ap.add_argument('--build',type=Path)
     ap.add_argument('--backend',choices=('CUDA','CPU'),default='CUDA')
     ap.add_argument('--openblas-archive',type=Path)
+    ap.add_argument('--onednn-archive',type=Path)
     ap.add_argument('--no-build',action='store_true',help='test already-built directories')
     args=ap.parse_args()
     if args.backend=='CUDA': idle_gpu()
@@ -19,6 +20,7 @@ def main():
     options=['-DCMAKE_BUILD_TYPE=Release','-DROKOKO_BACKEND='+args.backend,
              '-DROKOKO_ASSET_SOURCE='+str(args.models.resolve()),'-DROKOKO_OFFLINE=ON']
     if args.openblas_archive: options.append('-DROKOKO_OPENBLAS_URL='+str(args.openblas_archive.resolve()))
+    if args.onednn_archive: options.append('-DROKOKO_ONEDNN_URL='+str(args.onednn_archive.resolve()))
     out=ROOT/'tests/results'/('cmake'+suffix);out.mkdir(parents=True,exist_ok=True)
     with (out/'build.log').open('wb') as log:
         if not args.no_build:

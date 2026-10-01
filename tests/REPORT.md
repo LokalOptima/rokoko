@@ -1,5 +1,78 @@
 # Implementation report — 2026-09-30
 
+## Direct CPU convolutions and shared workers — verified 2026-10-01
+
+The CPU forward pass now uses statically linked oneDNN 3.10.2 direct AVX2
+convolutions alongside OpenBLAS 0.3.30. Both libraries share the existing BLAS
+workers; there is still only one request in flight. Normalization, source
+signal generation, conversions and large pointwise loops use those same workers.
+GELU uses vector tanh. Dense and convolution input staging preserves the former
+FP16 rounding while eliminating the separate half-buffer pass. Arithmetic and
+cached weights remain FP32; bundled model assets and CUDA arithmetic are unchanged.
+No INT8 quantization is included.
+
+Each convolution weight retains one packed weight buffer and its most recent
+primitive shape. A different shape replaces the primitive; oneDNN's independent
+primitive-history cache is disabled. Staging grows to the largest input seen.
+Context destruction releases this state. The shared-worker adapter uses an
+isolated internal entry point in pinned OpenBLAS 0.3.30, which must be revalidated
+when that dependency is upgraded.
+
+Validation passed:
+
+- Operator tests with one and eight workers; ASan/UBSan with three workers.
+  New checks cover worker partitioning, nested jobs and exception recovery,
+  exact fused half rounding, vector GELU, padded convolutions, output guards,
+  residual aliasing, 160 changing lengths, bounded primitive count and cleanup.
+  External library builds themselves were not sanitizer-instrumented.
+- All 15 CPU/CUDA synthesis cases and 100 G2P comparisons pass the existing
+  limits without changes. Text, tokens, styles, rounded durations and output
+  lengths agree exactly. Maximum duration difference is 0.01348 frames;
+  F0 RMSE is at most 0.08460 Hz; noise RMSE is at most 0.001298. Maximum relative
+  magnitude-spectrogram error is 0.08367; RMS ratios are 1.0165–1.0232.
+- Against the saved previous SIMD CPU output, maximum relative spectral error
+  is 0.06897 and RMS ratios are 0.99968–1.00140. These numerical comparisons
+  do not establish perceptual equivalence; paired WAVs are retained for listening.
+- Library lifecycle checks, exact repeated outputs, A→B→A, arena growth,
+  context recreation, malformed assets, CLI/HTTP and streaming recovery pass.
+- The copied executable passes the isolated CLI/HTTP/streaming check with no
+  external assets, blocked connections, unavailable HOME/cache and empty PATH.
+  A separate CMake library consumer also builds and synthesizes speech.
+- Embedded ELF bytes match the approved assets, and direct payload scanning
+  detects duplicates. This replaces a 10 MiB non-asset-size heuristic that
+  incorrectly rejected the larger static library. An appended duplicate voice
+  is rejected. The executable is 227,802,848 bytes (217.25 MiB), up 26.94 MiB;
+  only ordinary C/C++ system libraries are loaded dynamically.
+- The CUDA build and the fast offline tests pass.
+
+Performance on the i7-12700 uses eight workers, one request in flight and no
+affinity pinning. Five accepted warm requests per binary/text are alternated
+against preserved commit `b1bc302`; requests above 0.5 competing CPU core are
+rejected and retained in the JSON. Startup and each first request are excluded.
+
+| Speech length | Previous CPU | Optimized CPU | RTFx | Less time |
+|---|---:|---:|---:|---:|
+| 1.575 s | 286.9 ms | 157.1 ms | 10.03× | 45.2% |
+| 5.725 s | 961.9 ms | 514.6 ms | 11.12× | 46.5% |
+| 18.825 s | 3226.2 ms | 1878.4 ms | 10.02× | 41.8% |
+
+The medium sentence's five accepted optimized requests range from 502.9 to
+531.8 ms. Short and long medians are only just above 10×; individual requests
+can be slower. This is a warm-request result, not a guarantee for every sentence.
+The first medium request at its new length took 801.2 ms (7.15×), versus
+1069.9 ms previously. New shapes incur convolution primitive preparation;
+startup and weight packing are additional work. Startup samples were collected
+before the quiet guard and are not used as clean performance comparisons.
+The first long request was rejected for contention and is not a reported timing.
+
+Measured binaries, every accepted/rejected request and WAV are retained in
+`tests/results/cpu-rtfx-final/report.json`. The final optimized binary SHA-256 is
+`270e520762ba2086d733524b3291ea49b505f0994a5596b1a304a6e281a4f5b6`.
+
+Evidence: `tests/results/cpu-rtfx-parity/`, `cpu-rtfx-inference/`,
+`cpu-rtfx-audio.json`, `cpu-rtfx-validation/`, and `cmake-cpu.json`. The parity directory contains
+an `index.html` listening page. Timings are recorded separately from correctness.
+
 ## AVX2 activation optimization — verified 2026-10-01
 
 The CPU style-affine/Snake loop now processes eight channels at once using AVX2
@@ -45,8 +118,8 @@ The original binary identity matches the saved pre-optimization audio report.
 Added a CPU-only build alongside CUDA, sharing the forward pass, model parsing,
 normalization, chunking, af_heart style selection and all three bundled assets.
 CPU matrix operations use statically linked OpenBLAS 0.3.30 AVX2/FMA kernels;
-F16C converts the same FP16 weights to FP32 arithmetic. Convolution im2col scratch
-is tiled to 128 frames. No runtime Python, external model files, model downloads,
+F16C converts the same FP16 weights to FP32 arithmetic. At this stage, convolution im2col scratch
+was tiled to 128 frames (superseded by direct convolutions above). No runtime Python, external model files, model downloads,
 CUDA libraries or dynamic OpenBLAS library are needed by `rokoko.cpu`.
 The supported CPU target is Linux x86-64 with AVX2, FMA and F16C.
 

@@ -88,7 +88,7 @@ make test-cpu-parity REFERENCE_PYTHON=.venv-tests/bin/python
 python3 tests/bench.py --binary ./rokoko --binary ./rokoko.cpu --mixed 0 --repeats 5
 ```
 
-`test-cpu-inference` needs a compiler, CMake, the pinned static OpenBLAS build,
+`test-cpu-inference` needs a compiler, CMake, the pinned static OpenBLAS and oneDNN builds,
 model assets, NumPy and `strace`. It does not require CUDA. It covers all half
 encodings and conversion tails, independent scalar/double matrix oracles,
 noncontiguous/batched layouts, convolution padding/stride/dilation/residuals,
@@ -102,6 +102,10 @@ The style normalization/Snake checks compare SIMD results with a scalar sine
 oracle and independent two-pass statistics. They cover vector widths and tails,
 unaligned and in-place output, large sine arguments, guard regions, and isolated
 NaN/infinity lanes. No fast-math assumptions may hide nonfinite output.
+Additional checks cover GELU against a double-precision oracle, fused rounding
+against the original two-pass contract, and shared-worker partitioning, nested
+jobs and exception recovery. Convolution tests include padded input channels,
+unaligned output, residual aliasing and 160 changing lengths on one weight tensor.
 
 `test-cpu-parity` additionally needs the CUDA build and NumPy. It checks G2P pronunciation on 100 evenly sampled corpus sentences, then runs the 12
 existing quality fixtures and three benchmark texts through both backends,
@@ -117,8 +121,19 @@ reported separately because small pitch changes accumulate phase differences.
 CPU/GPU reports and paired WAVs are in `tests/results/cpu-parity/`. Open its
 `index.html` for listening. CPU runtime contract evidence is in
 `tests/results/cpu-inference/`. Use `--cpu-runtime`/`--runtime` to select a custom
-CMake build directory. CPU weight conversion caches hold only model tensors and
-are cleared on context destruction; convolution scratch is bounded to 128 frames.
+CMake build directory. CPU caches retain immutable model weights and one current
+convolution primitive per weight tensor. A new sentence length replaces that
+primitive; oneDNN's separate primitive-history cache is disabled. Staging buffers
+are reused up to the largest input seen by the context. All these caches and
+buffers are released on context destruction.
+
+For offline CPU packaging checks, pass both dependency archives:
+
+```sh
+python3 tests/cmake_smoke.py --backend CPU --build build/cpu --no-build \
+  --openblas-archive build/deps/OpenBLAS-0.3.30.tar.gz \
+  --onednn-archive build/deps/oneDNN-3.10.2.tar.gz
+```
 
 For a CPU optimization, preserve the original executable before rebuilding and
 alternate requests between it and the new binary:

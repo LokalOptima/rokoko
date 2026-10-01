@@ -2,6 +2,9 @@
 #include "backend_ops.h"
 #include "kernels.h"
 #include "cpu/math.h"
+#include "cpu/convolution.h"
+#include "cpu/parallel.h"
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -21,6 +24,38 @@ static void close(float a, double b, double tol = 2e-5) {
     require(std::isfinite(a) && std::abs(a - b) <= tol * (1 + std::abs(b)), "numeric mismatch");
 }
 static float sample(int i) { return float((i * 37 % 101) - 50) / 53; }
+static void worker_jobs() {
+    std::vector<std::atomic<int>> visits(1003);
+    for (auto &v : visits)
+        v.store(0);
+    cpu::parallel(visits.size(), 1, [&](size_t begin, size_t end) {
+        bool nested = cpu::in_parallel();
+        for (size_t i = begin; i < end; ++i)
+            cpu::parallel(7, 1, [&](size_t a, size_t b) {
+                require(cpu::in_parallel() == nested, "nested worker state changed");
+                for (size_t j = a; j < b; ++j)
+                    visits[i].fetch_add(1);
+            });
+    });
+    for (const auto &v : visits)
+        require(v.load() == 7, "parallel partition lost or repeated work");
+    bool caught = false;
+    try {
+        cpu::parallel(1003, 1, [](size_t begin, size_t end) {
+            if (begin <= 500 && end > 500)
+                throw std::runtime_error("worker failure");
+        });
+    } catch (const std::runtime_error &) {
+        caught = true;
+    }
+    require(caught && !cpu::in_parallel(), "worker exception was not restored to caller");
+    cpu::parallel(visits.size(), 1, [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i)
+            visits[i].fetch_add(1);
+    });
+    for (const auto &v : visits)
+        require(v.load() == 8, "worker pool failed to recover");
+}
 static void conversions() {
     std::vector<Half> half(65536), roundtrip(65536);
     std::vector<float> actual(65536);
@@ -50,6 +85,32 @@ static void conversions() {
         cpu::to_float(h.data() + 1, y.data() + 1, n);
         for (int i = 1; i <= n; ++i)
             require(y[i] == 1.f, "F16C tail tie");
+    }
+    // Fused rounding must preserve the two-pass contract, including unaligned
+    // tails, signed zero, nonfinite values, and work spanning multiple threads.
+    for (int n : {1, 7, 8, 9, 17, 65543}) {
+        std::vector<float> x(n + 2, -999), y(n + 2, -999), expected(n);
+        std::vector<Half> h(n);
+        for (int i = 0; i < n; ++i)
+            x[i + 1] = sample(i) * 100;
+        x[1] = -0.f;
+        if (n > 7) {
+            x[2] = 1.00048828125f;
+            x[3] = 1.00146484375f;
+            x[4] = std::numeric_limits<float>::infinity();
+            x[5] = std::numeric_limits<float>::quiet_NaN();
+        }
+        cpu::to_half(x.data() + 1, h.data(), n);
+        cpu::to_float(h.data(), expected.data(), n);
+        cpu::round_to_half(x.data() + 1, y.data() + 1, n);
+        cpu::round_to_half(x.data() + 1, x.data() + 1, n);
+        for (int i = 0; i < n; ++i)
+            for (float actual : {x[i + 1], y[i + 1]})
+                require(std::isnan(expected[i]) ? std::isnan(actual)
+                        : std::memcmp(&actual, &expected[i], sizeof(float)) == 0,
+                        "fused half rounding changed a value");
+        require(x.front() == -999 && x.back() == -999 && y.front() == -999 && y.back() == -999,
+                "fused rounding wrote outside output");
     }
 }
 static void gemms() {
@@ -97,6 +158,24 @@ static void gemms() {
                                 double(ah[ta ? i * lda + k : k * lda + i]) * float(bh[j * ldb + k]);
                         close(c[j * ldc + i], sum);
                     }
+                c = old;
+                std::vector<float> bias(M);
+                for (int i = 0; i < M; ++i)
+                    bias[i] = sample(i + 19);
+                cpu::gemm(ta, M, N, K, ah.data(), lda, b.data(), ldb, c.data(), ldc,
+                           .8f, beta, bias.data());
+                for (int j = 0; j < N; ++j) {
+                    for (int i = 0; i < M; ++i) {
+                        double sum = 0;
+                        for (int k = 0; k < K; ++k)
+                            sum += double(ah[ta ? i * lda + k : k * lda + i]) *
+                                   float(bh[j * ldb + k]);
+                        close(c[j * ldc + i], .8f * sum +
+                              (beta ? beta * old[j * ldc + i] : 0) + bias[i]);
+                    }
+                    for (int i = M; i < ldc; ++i)
+                        require(c[j * ldc + i] == -999, "fused GEMM wrote stride padding");
+                }
                 cpu::clear_weights();
             }
         }
@@ -124,6 +203,92 @@ static void gemms() {
                 }
                 close(out[t * ld + h * dim + d], sum);
             }
+}
+static void convolution_cache_and_padding() {
+    constexpr int ci = 8, source_ci = 5, co = 13, K = 3;
+    std::vector<Half> w(co * ci * K);
+    std::vector<float> bias(co);
+    for (size_t i = 0; i < w.size(); ++i)
+        w[i] = Half(sample(i + 17));
+    for (int i = 0; i < co; ++i)
+        bias[i] = sample(i + 9);
+    cpu::clear_weights();
+    auto check = [&](int T, int stride, int dilation, int mode, bool has_bias) {
+        int pad = dilation * (K - 1) / 2;
+        int to = (T + 2 * pad - dilation * (K - 1) - 1) / stride + 1;
+        std::vector<float> x(T * source_ci), y(to * co + 2, -999), residual(to * co);
+        for (size_t i = 0; i < x.size(); ++i)
+            x[i] = sample(i) * .37f;
+        auto original = x;
+        for (size_t i = 0; i < residual.size(); ++i) {
+            residual[i] = sample(i + 11);
+            y[i + 1] = mode ? residual[i] : std::numeric_limits<float>::quiet_NaN();
+        }
+        cpu::convolution(x.data(), w.data(), has_bias ? bias.data() : nullptr, y.data() + 1,
+                           mode == 0 ? nullptr : mode == 1 ? residual.data() : y.data() + 1,
+                           ci, co, T, K, stride, pad, dilation, source_ci);
+        for (int t = 0; t < to; ++t)
+            for (int o = 0; o < co; ++o) {
+                double expected = (has_bias ? bias[o] : 0) + (mode ? residual[t * co + o] : 0);
+                for (int k = 0; k < K; ++k) {
+                    int p = t * stride - pad + k * dilation;
+                    if (p >= 0 && p < T)
+                        for (int c = 0; c < source_ci; ++c)
+                            expected += double(Half(x[p * source_ci + c])) *
+                                        float(w[(o * K + k) * ci + c]);
+                }
+                close(y[1 + t * co + o], expected);
+            }
+        require(x == original && y.front() == -999 && y.back() == -999,
+                "convolution changed input or output guards");
+        auto stats = cpu::convolution_cache_stats();
+        require(stats.weights == 1 && stats.primitives == 1,
+                "convolution cache retained sentence history");
+    };
+    for (int T : {1, 127, 128, 129, 257})
+        for (int stride : {1, 2})
+            for (int dilation : {1, 3})
+                for (int mode = 0; mode < 3; ++mode)
+                    check(T, stride, dilation, mode, mode != 1);
+    size_t capacity = cpu::convolution_cache_stats().input_capacity;
+    for (int T = 1; T <= 160; ++T)
+        check(T, 1, 1, 0, false);
+    require(cpu::convolution_cache_stats().input_capacity == capacity,
+            "smaller sentence lengths grew convolution scratch");
+    cpu::clear_weights();
+    auto empty = cpu::convolution_cache_stats();
+    require(!empty.weights && !empty.primitives && !empty.input_capacity,
+            "convolution state survived context cleanup");
+    for (auto &value : w)
+        value = Half(float(value) * .5f);
+    check(129, 1, 1, 2, true);
+    cpu::clear_weights();
+}
+static void gelu_activation() {
+    for (int n : {1, 7, 8, 9, 17, 65537}) {
+        std::vector<float> x(n + 2, -999), y(n + 2, -999);
+        for (int i = 0; i < n; ++i)
+            x[i + 1] = sample(i) * 8;
+        auto original = x;
+        gelu_f32(x.data() + 1, y.data() + 1, n, nullptr);
+        gelu_f32(x.data() + 1, x.data() + 1, n, nullptr);
+        for (int i = 0; i < n; ++i) {
+            double v = original[i + 1];
+            double expected = .5 * v * (1 + std::tanh(.7978845608028654 * (v + .044715 * v * v * v)));
+            close(x[i + 1], expected, 3e-6);
+            close(y[i + 1], expected, 3e-6);
+        }
+        require(x.front() == -999 && x.back() == -999 && y.front() == -999 && y.back() == -999,
+                "GELU wrote outside output");
+    }
+    for (int lane : {0, 7, 8, 16}) {
+        std::vector<float> x(17, 1), y(17);
+        x[lane] = std::numeric_limits<float>::quiet_NaN();
+        gelu_f32(x.data(), y.data(), 17, nullptr);
+        for (int i = 0; i < 17; ++i)
+            require(i == lane ? std::isnan(y[i]) : std::isfinite(y[i]),
+                    "GELU nonfinite lane contamination");
+    }
 }
 static void convolutions() {
     constexpr int ci = 3, co = 5, T = 11;
@@ -309,9 +474,12 @@ static void reductions_and_signal() {
 int main() {
     try {
         cpu::configure();
+        worker_jobs();
         conversions();
         gemms();
         convolutions();
+        convolution_cache_and_padding();
+        gelu_activation();
         style_normalization();
         reductions_and_signal();
         std::cout << "PASS CPU SIMD conversions, BLAS layouts, convolution padding/residuals, "

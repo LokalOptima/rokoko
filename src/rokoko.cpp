@@ -19,6 +19,7 @@
 #include "kernels.h"
 #ifdef ROKOKO_CPU
 #include "cpu/math.h"
+#include "cpu/convolution.h"
 #endif
 
 namespace rokoko {
@@ -46,9 +47,13 @@ static void sgemm_tn(int m, int n, int k,
         gemv_tn_f16(A, lda, B, C, m, k, alpha, beta, stream);
         return;
     }
+#ifdef ROKOKO_CPU
+    cpu::gemm(true, m, n, k, A, lda, B, ldb, C, ldc, alpha, beta);
+#else
     cast_f32_to_f16(B, s_fp16_buf, n * k, stream);
     backend_gemm_tn_f16(m, n, k, A, lda, s_fp16_buf, ldb,
                          C, ldc, alpha, beta, s_workspace, s_workspace_bytes, stream);
+#endif
 }
 
 // C = alpha * A * B^T + beta * C  (activation-only, stays FP32)
@@ -69,9 +74,13 @@ static void sgemm_nn(int m, int n, int k,
                       float* C, int ldc,
                       rokoko::Stream stream,
                       float alpha = 1.0f, float beta = 0.0f) {
+#ifdef ROKOKO_CPU
+    cpu::gemm(false, m, n, k, A, lda, B, ldb, C, ldc, alpha, beta);
+#else
     cast_f32_to_f16(B, s_fp16_buf, n * k, stream);
     backend_gemm_nn_f16(m, n, k, A, lda, s_fp16_buf, ldb,
                          C, ldc, alpha, beta, s_workspace, s_workspace_bytes, stream);
+#endif
 }
 
 // C = A^T * B + bias  (A is FP16 weight)
@@ -81,9 +90,13 @@ static void sgemm_bias(int m, int n, int k,
                         float* C, int ldc,
                         const float* bias,
                         rokoko::Stream stream) {
+#ifdef ROKOKO_CPU
+    cpu::gemm(true, m, n, k, A, lda, B, ldb, C, ldc, 1.f, 0.f, bias);
+#else
     cast_f32_to_f16(B, s_fp16_buf, n * k, stream);
     backend_gemm_tn_bias_f16(m, n, k, A, lda, s_fp16_buf, ldb,
                               C, ldc, bias, s_workspace, s_workspace_bytes, stream);
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +117,10 @@ static void gemm_conv1d(const float* x, const rokoko::Half* w, const float* bias
 
     // Cutlass FP16 implicit GEMM conv (w is NHWC FP16, works for all K)
     int actual_cin = C_in_pad ? C_in_pad : C_in;
+#ifdef ROKOKO_CPU
+    cpu::convolution(x, w, residual ? nullptr : bias, y, residual, actual_cin,
+                     C_out, T_in, K, stride, padding, dilation, C_in);
+#else
     if (C_in_pad) {
         cast_f32_to_f16_pad(x, s_fp16_buf, T_in, C_in, C_in_pad, stream);
     } else {
@@ -114,6 +131,7 @@ static void gemm_conv1d(const float* x, const rokoko::Half* w, const float* bias
                               workspace, workspace_bytes,
                               actual_cin, C_out, T_in, K,
                               stride, padding, dilation, stream);
+#endif
     if (residual && bias)
         channel_bias_add_f32(y, bias, C_out, T_out, stream);
 }
