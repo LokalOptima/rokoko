@@ -219,7 +219,11 @@ $('text').addEventListener('keydown', e => {
         } catch (const std::exception& e) {error(res,400,e.what());return false;}
     };
     svr.Get("/stats",[&](const httplib::Request&,httplib::Response& res) {
-        std::lock_guard<std::mutex> lock(mtx);auto s=inference_stats();size_t available=0,total=0;cudaMemGetInfo(&available,&total);
+        std::lock_guard<std::mutex> lock(mtx);auto s=inference_stats();size_t available=0,total=0;
+#ifndef ROKOKO_CPU
+        cudaMemGetInfo(&available,&total);
+#endif
+
         std::ostringstream out;
         out<<"{\"encode_graphs\":"<<s.encode_graphs<<",\"decode_graphs\":"<<s.decode_graphs
            <<",\"g2p_graphs\":"<<pipeline.g2p.graph_count()<<",\"arena_bytes\":"<<s.arena_bytes

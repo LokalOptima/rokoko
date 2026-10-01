@@ -1,5 +1,66 @@
 # Implementation report — 2026-09-30
 
+## SIMD CPU backend — verified 2026-10-01
+
+Added a CPU-only build alongside CUDA, sharing the forward pass, model parsing,
+normalization, chunking, af_heart style selection and all three bundled assets.
+CPU matrix operations use statically linked OpenBLAS 0.3.30 AVX2/FMA kernels;
+F16C converts the same FP16 weights to FP32 arithmetic. Convolution im2col scratch
+is tiled to 128 frames. No runtime Python, external model files, model downloads,
+CUDA libraries or dynamic OpenBLAS library are needed by `rokoko.cpu`.
+The supported CPU target is Linux x86-64 with AVX2, FMA and F16C.
+
+Validation completed:
+
+- Independent operator tests cover every half bit pattern, SIMD tails and ties,
+  scalar/double GEMM oracles, leading dimensions, interleaved attention heads,
+  convolution stride/dilation/padding and aliased residuals, normalization,
+  duration rounding and spectral reconstruction. AddressSanitizer and
+  UndefinedBehaviorSanitizer passed on this operator suite.
+- The final eight-thread CPU build passed library, invalid-asset, CLI, HTTP and
+  streaming checks, including frame boundaries, arena growth, changed text/style,
+  cancellation/recovery and context recreation. Repeated CPU outputs in the
+  lifecycle set were bit-identical. Invalid thread settings fail explicitly.
+- The 12 existing quality sentences and three benchmark texts produced identical
+  normalized text, phonemes, token IDs, style rows, rounded durations and audio
+  lengths on CPU and CUDA. Maximum pre-rounding duration difference was 0.01605
+  frames; largest per-case F0 RMSE was 0.123 Hz; noise RMSE was below 0.00187.
+  Relative magnitude-spectrogram error was at most 0.0826; RMS ratios were
+  1.0167–1.0235. All predefined engineering regression guards passed, as did
+  their silence/gain negative controls. This is not a perceptual equivalence claim.
+- A further 100 evenly sampled frontend corpus sentences produced identical
+  CPU/CUDA G2P output. The reusable parity target includes this check.
+- Copied CPU and CUDA executables passed CLI, HTTP and streaming checks with
+  all outbound connections blocked, inaccessible HOME/cache, empty PATH and no
+  external model reads or temporary model extraction. Linked ELF asset bytes
+  independently match the approved manifest. The CPU binary is approximately
+  200 MB and loads only ordinary C/C++ system libraries.
+- Both CMake backends and separate library-only consumers built and synthesized
+  valid audio. CPU configuration and compilation require no CUDA compiler.
+- The existing fast offline suite and complete GPU/artifact/reference/mutation
+  suite passed. A real padding mutation still reaches the intended failing assertion.
+
+Timings on the i7-12700 (CPU, eight OpenBLAS threads) and RTX 5070 Ti (CUDA),
+median wall time for five warm HTTP repeats of the same fixed texts:
+
+| Speech length | CPU | CUDA |
+|---|---:|---:|
+| 1.575 s | 410.7 ms | 7.32 ms |
+| 5.725 s | 1477.2 ms | 17.87 ms |
+| 18.825 s | 4844.5 ms | 52.77 ms |
+
+The long-text CPU run is about 3.9x faster than playback. Warm GPU requests
+benefit from CUDA graph replay; CPU runs the forward pass on every request.
+First-request and startup measurements are retained separately. A bounded
+thread sweep (1, 2, 4, 8) supported the eight-thread default on this machine;
+`ROKOKO_CPU_THREADS` permits 1–64. Results are descriptive, not speed guarantees.
+
+Evidence: `tests/results/cpu-parity/` (JSON, intermediate arrays, paired WAVs and
+`index.html` listening page), `cpu-g2p/report.json`, `cpu-inference/report.json`,
+`cmake-cpu.json`, `cpu-gpu-bench-8threads.json` and `cpu-thread-tuning/`.
+Test commands and the explicit numerical tolerances are in `tests/README.md`.
+
+
 ## Public build assets verified (2026-10-01)
 
 The approved G2P V11 bytes are now published as

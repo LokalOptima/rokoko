@@ -41,11 +41,11 @@ src/cutlass_gemm_f16.o: src/cutlass_gemm_f16.cu
 src/cutlass_conv_f16.o: src/cutlass_conv_f16.cu
 	$(NVCC) $(NVFLAGS) -I$(CUTLASS) -c $< -o $@
 
-src/main.o: src/main.cu src/embedded.h src/byte_reader.h src/rokoko.h src/phonemes.h src/request_json.h src/artifact_format.h src/model_schema.h src/g2p.h src/normalize.h src/weights.h src/rokoko_common.h src/audio.h \
+src/main.o: src/main.cu src/embedded.h src/device.h src/byte_reader.h src/rokoko.h src/phonemes.h src/request_json.h src/artifact_format.h src/model_schema.h src/g2p.h src/normalize.h src/weights.h src/rokoko_common.h src/audio.h \
             src/kernels.h src/server.h src/cpp-httplib/httplib.h
 	$(NVCC) $(NVFLAGS) -c $< -o $@
 
-rokoko: Makefile $(ASSET_DIR)/embedded.o src/embedded.cpp src/embedded.h src/main.o src/rokoko.cpp src/weights.cpp src/weights.h src/rokoko_common.h src/audio.h src/artifact_format.h src/model_schema.h $(SHARED_OBJS)
+rokoko: Makefile $(ASSET_DIR)/embedded.o src/embedded.cpp src/embedded.h src/main.o src/rokoko.cpp src/weights.cpp src/weights.h src/device.h src/rokoko_common.h src/audio.h src/artifact_format.h src/model_schema.h $(SHARED_OBJS)
 	$(CXX) $(CXXFLAGS) -mavx2 -mfma \
 		src/main.o src/rokoko.cpp src/weights.cpp src/embedded.cpp \
 		$(ASSET_DIR)/embedded.o $(SHARED_OBJS) $(LDFLAGS) -o $@
@@ -70,7 +70,7 @@ bench: rokoko
 
 clean:
 	rm -f "$(ASSET_DIR)/embedded.o"
-	rm -f rokoko src/kernels.o src/main.o \
+	rm -f rokoko rokoko.cpu src/kernels.o src/main.o \
 		src/cutlass_gemm.o src/cutlass_gemm_f16.o src/cutlass_conv_f16.o \
 		tests/helpers tests/audio tests/runtime.o tests/runtime \
 		$(FRONTEND)/normalize_cli $(FRONTEND)/g2p_check
@@ -85,7 +85,7 @@ test-cpu: tests/helpers $(FRONTEND)/normalize_cli build/byte_reader
 	./build/byte_reader
 	python3 tests/test_bundle.py
 
-tests/runtime.o: tests/runtime.cu src/embedded.h src/byte_reader.h src/rokoko.h src/phonemes.h src/weights.h src/g2p.h src/rokoko_common.h src/audio.h src/artifact_format.h src/model_schema.h
+tests/runtime.o: tests/runtime.cu src/embedded.h src/device.h src/byte_reader.h src/rokoko.h src/phonemes.h src/weights.h src/g2p.h src/rokoko_common.h src/audio.h src/artifact_format.h src/model_schema.h
 	$(NVCC) $(NVFLAGS) -c $< -o $@
 tests/runtime: Makefile $(ASSET_DIR)/embedded.o src/embedded.cpp tests/runtime.o src/rokoko.cpp src/weights.cpp src/weights.h $(SHARED_OBJS)
 	$(CXX) $(CXXFLAGS) -mavx2 -mfma tests/runtime.o src/rokoko.cpp src/weights.cpp src/embedded.cpp $(ASSET_DIR)/embedded.o $(SHARED_OBJS) $(LDFLAGS) -o $@
@@ -117,3 +117,27 @@ build/byte_reader: tests/byte_reader.cpp src/byte_reader.h
 .PHONY: test-bundle
 test-bundle: rokoko
 	python3 tests/bundle_smoke.py
+
+# CPU inference is isolated from CUDA object files and uses a static SIMD BLAS.
+CPU_BUILD ?= build/cpu
+.PHONY: cpu
+cpu: rokoko.cpu
+rokoko.cpu: FORCE
+	cmake -S . -B "$(CPU_BUILD)" -DCMAKE_BUILD_TYPE=Release -DROKOKO_BACKEND=CPU -DROKOKO_BUILD_DIAGNOSTICS=ON -DROKOKO_ASSET_DIR="$(abspath $(ASSET_DIR))" -DROKOKO_ASSET_SOURCE="$(ASSET_SOURCE)" -DROKOKO_OFFLINE=$(OFFLINE)
+	cmake --build "$(CPU_BUILD)" -j4
+	cp "$(CPU_BUILD)/rokoko" $@
+
+src/main.o tests/runtime.o: src/backend_ops.h src/device.h
+src/kernels.o: src/device.h
+rokoko tests/runtime: src/backend_ops.h src/device.h
+
+.PHONY: test-cpu-inference test-cpu-parity
+# CPU-only inference checks (requires the reference environment's numpy).
+test-cpu-inference: rokoko.cpu
+	ctest --test-dir "$(CPU_BUILD)" --output-on-failure
+	$(REFERENCE_PYTHON) tests/cpu_inference.py --binary ./rokoko.cpu --runtime "$(CPU_BUILD)/rokoko_runtime" --models "$(MODELS)"
+	python3 tests/bundle_smoke.py --binary ./rokoko.cpu
+
+# Requires CUDA solely for the independent comparison executable.
+test-cpu-parity: rokoko.cpu rokoko tests/runtime $(FRONTEND)/g2p_check
+	$(REFERENCE_PYTHON) tests/cpu_parity.py --cpu ./rokoko.cpu --cpu-runtime "$(CPU_BUILD)/rokoko_runtime" --cpu-g2p "$(CPU_BUILD)/rokoko_g2p_check" --g2p-asset "$(G2P)"

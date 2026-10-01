@@ -1,10 +1,10 @@
 #pragma once
 #include "byte_reader.h"
 #include <fstream>
-// g2p_model_cuda.h — CUDA inference for G2P V3 Conformer CTC model.
+// Shared CPU/CUDA inference for the G2P3-format transformer CTC model.
 //
-// Same binary format as g2p_model.h, but runs on GPU using Cutlass GEMM for
-// linear projections and custom kernels for RMSNorm, RoPE, softmax, SiLU.
+// CUDA uses CUTLASS; CPU uses SIMD OpenBLAS. Both share parsing, vocabulary,
+// forward-pass order and CTC decoding.
 //
 // Architecture: char_emb → N × (RMSNorm→MHA→RMSNorm→SwiGLU) → upsample → head → CTC decode
 //
@@ -16,7 +16,7 @@
 //   - Softmax batched across all heads (1 launch vs 4)
 //
 // Usage:
-//   G2PModelCuda model;
+//   G2PModel model;
 //   model.load("data/g2p_model.bin", stream);
 //   std::string phonemes = model.infer("hello world", stream);
 
@@ -27,30 +27,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include <cuda_runtime.h>
+#include "backend_ops.h"
 
-// Cutlass GEMM (defined in cutlass_gemm.cu)
-extern "C" int cutlass_gemm_tn(int M, int N, int K,
-    const float* A, int lda, const float* B, int ldb,
-    float* C, int ldc, float alpha, float beta,
-    float* workspace, size_t workspace_bytes, cudaStream_t stream);
-extern "C" int cutlass_gemm_nn(int M, int N, int K,
-    const float* A, int lda, const float* B, int ldb,
-    float* C, int ldc, float alpha, float beta,
-    float* workspace, size_t workspace_bytes, cudaStream_t stream);
-extern "C" int cutlass_gemm_batched_tn(int M, int N, int K,
-    const float* A, int lda, long long strideA,
-    const float* B, int ldb, long long strideB,
-    float* C, int ldc, long long strideC,
-    int batch_count, float alpha, float beta,
-    float* workspace, size_t workspace_bytes, cudaStream_t stream);
-extern "C" int cutlass_gemm_batched_nn(int M, int N, int K,
-    const float* A, int lda, long long strideA,
-    const float* B, int ldb, long long strideB,
-    float* C, int ldc, long long strideC,
-    int batch_count, float alpha, float beta,
-    float* workspace, size_t workspace_bytes, cudaStream_t stream);
-
+#ifndef ROKOKO_CPU
 // ── CUDA kernels ────────────────────────────────────────────────────────────
 
 // RMSNorm: out[t,i] = weight[i] * x[t,i] / sqrt(mean(x[t,:]^2) + eps)
@@ -369,17 +348,27 @@ __global__ void g2p_bias_ctc_argmax_kernel(const float* __restrict__ logits,
 }
 
 
+#else
+#include "cpu/g2p_ops.h"
+#endif
+
 // ── Model struct ────────────────────────────────────────────────────────────
 
 namespace rokoko {
 
-struct G2PModelCuda {
-    bool load(const char* path, cudaStream_t stream); // Development/export evaluator adapter.
-    bool load(const void* data, size_t size, cudaStream_t stream);
-    std::string infer(const std::string& text, cudaStream_t stream) const;
+struct G2PModel {
+    bool load(const char* path, rokoko::Stream stream); // Development/export evaluator adapter.
+    bool load(const void* data, size_t size, rokoko::Stream stream);
+    std::string infer(const std::string& text, rokoko::Stream stream) const;
     void free();
     int max_positions() const { return max_pos_; }
-    size_t graph_count() const { return graph_cache_.size(); }
+    size_t graph_count() const {
+#ifndef ROKOKO_CPU
+        return graph_cache_.size();
+#else
+        return 0;
+#endif
+    }
 
     bool loaded() const { return d_ > 0; }
     size_t param_bytes() const { return total_bytes_; }
@@ -420,23 +409,25 @@ private:
 
     int max_pos_ = 2048;
 
-    // Cached workspace (avoids cudaMalloc per call)
+    // Cached workspace (avoids rokoko::device::allocate per call)
     mutable float* workspace_ = nullptr;
     mutable size_t workspace_bytes_ = 0;
 
     // CUDA graph cache: keyed by input length T for zero-overhead replay.
     // Eliminates ~150 kernel dispatch overheads per inference call.
+#ifndef ROKOKO_CPU
     mutable std::unordered_map<int, cudaGraphExec_t> graph_cache_;
+#endif
 
     // Attention scale (value, not pointer — Cutlass uses value-based alpha/beta)
     float attn_scale_ = 0.0f;
 
-    bool load_from_memory_(ByteReader& reader, cudaStream_t stream);
+    bool load_from_memory_(ByteReader& reader, rokoko::Stream stream);
 };
 
 // ── Implementation ──────────────────────────────────────────────────────────
 
-inline bool G2PModelCuda::load(const char* path, cudaStream_t stream) {
+inline bool G2PModel::load(const char* path, rokoko::Stream stream) {
     free();
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) return false;
@@ -448,7 +439,7 @@ inline bool G2PModelCuda::load(const char* path, cudaStream_t stream) {
     return load(data.data(),data.size(),stream);
 }
 
-inline bool G2PModelCuda::load(const void* data, size_t size, cudaStream_t stream) {
+inline bool G2PModel::load(const void* data, size_t size, rokoko::Stream stream) {
     free();
     ByteReader reader(data,size);
     try {
@@ -458,11 +449,11 @@ inline bool G2PModelCuda::load(const void* data, size_t size, cudaStream_t strea
     return false;
 }
 
-inline bool G2PModelCuda::load_from_memory_(ByteReader& reader, cudaStream_t stream) {
+inline bool G2PModel::load_from_memory_(ByteReader& reader, rokoko::Stream stream) {
     // Magic
     char magic[4];
     if (!reader.read(magic, sizeof(magic)) || std::memcmp(magic, "G2P3", 4) != 0) {
-        fprintf(stderr, "g2p_cuda: expected G2P3 format\n");
+        fprintf(stderr, "g2p: expected G2P3 format\n");
         return false;
     }
 
@@ -482,11 +473,11 @@ inline bool G2PModelCuda::load_from_memory_(ByteReader& reader, cudaStream_t str
 
     bool use_rmsnorm = (flags & 8) != 0;
     if (use_qk_norm || use_conv) {
-        fprintf(stderr, "g2p_cuda: QK-Norm and ConvModule not supported\n");
+        fprintf(stderr, "g2p: QK-Norm and ConvModule not supported\n");
         return false;
     }
     if (!use_rmsnorm) {
-        fprintf(stderr, "g2p_cuda: only RMSNorm supported (got LayerNorm model)\n");
+        fprintf(stderr, "g2p: only RMSNorm supported (got LayerNorm model)\n");
         return false;
     }
 
@@ -531,10 +522,10 @@ inline bool G2PModelCuda::load_from_memory_(ByteReader& reader, cudaStream_t str
     total_bytes_ = total_floats * sizeof(float);
 
     // Allocate GPU memory (single contiguous block)
-    auto err = cudaMalloc(&weights_gpu_, total_bytes_);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "g2p_cuda: cudaMalloc failed for weights (%.1f MB): %s\n",
-                total_bytes_ / (1024.0f * 1024.0f), cudaGetErrorString(err));
+    auto err = rokoko::device::allocate(&weights_gpu_, total_bytes_);
+    if (err != rokoko::device::success) {
+        fprintf(stderr, "g2p: rokoko::device::allocate failed for weights (%.1f MB): %s\n",
+                total_bytes_ / (1024.0f * 1024.0f), rokoko::device::error_string(err));
         return false;
     }
 
@@ -598,7 +589,7 @@ inline bool G2PModelCuda::load_from_memory_(ByteReader& reader, cudaStream_t str
     float* gpu = weights_gpu_;
     auto upload = [&](const float* src, int n) -> float* {
         float* dst = gpu;
-        cudaMemcpyAsync(dst, src, n * sizeof(float), cudaMemcpyHostToDevice, stream);
+        rokoko::device::copy_async(dst, src, n * sizeof(float), rokoko::device::host_to_device, stream);
         gpu += n;
         return dst;
     };
@@ -674,33 +665,35 @@ inline bool G2PModelCuda::load_from_memory_(ByteReader& reader, cudaStream_t str
         workspace_bytes_ = a(workspace_bytes_, Tm_up * d_ * sizeof(float));
         workspace_bytes_ = a(workspace_bytes_, Tm_up * n_phones_ * sizeof(float));
         workspace_bytes_ = a(workspace_bytes_, Tm_up * sizeof(int));
-        auto ws_err = cudaMalloc(&workspace_, workspace_bytes_);
-        if (ws_err != cudaSuccess) {
-            fprintf(stderr, "g2p_cuda: workspace alloc failed (%zu bytes): %s\n",
-                    workspace_bytes_, cudaGetErrorString(ws_err));
+        auto ws_err = rokoko::device::allocate(&workspace_, workspace_bytes_);
+        if (ws_err != rokoko::device::success) {
+            fprintf(stderr, "g2p: workspace alloc failed (%zu bytes): %s\n",
+                    workspace_bytes_, rokoko::device::error_string(ws_err));
             workspace_ = nullptr; workspace_bytes_ = 0;
             return false;
         }
     }
 
-    cudaStreamSynchronize(stream);
+    rokoko::device::synchronize(stream);
 
-    vlog("g2p_cuda: loaded %s (d=%d, %d layers, %d heads, %d ff, %dx up, %.1f MB, ws=%.1f MB)\n",
+    vlog("g2p: loaded %s (d=%d, %d layers, %d heads, %d ff, %dx up, %.1f MB, ws=%.1f MB)\n",
          "memory", d_, n_layers_, heads_, ff_, up_,
          total_bytes_ / (1024.0f * 1024.0f), workspace_bytes_ / (1024.0f * 1024.0f));
     return true;
 }
 
-inline void G2PModelCuda::free() {
+inline void G2PModel::free() {
+#ifndef ROKOKO_CPU
     for (auto& [t, exec] : graph_cache_) if (exec) cudaGraphExecDestroy(exec);
     graph_cache_.clear();
-    if (weights_gpu_) { cudaFree(weights_gpu_); weights_gpu_ = nullptr; }
-    if (workspace_) { cudaFree(workspace_); workspace_ = nullptr; workspace_bytes_ = 0; }
+#endif
+    if (weights_gpu_) { rokoko::device::release(weights_gpu_); weights_gpu_ = nullptr; }
+    if (workspace_) { rokoko::device::release(workspace_); workspace_ = nullptr; workspace_bytes_ = 0; }
     d_ = 0; char2id_.clear(); id2phone_.clear();
 }
 
-inline std::string G2PModelCuda::infer(const std::string& text,
-                                         cudaStream_t stream) const {
+inline std::string G2PModel::infer(const std::string& text,
+                                         rokoko::Stream stream) const {
     if (d_ == 0) return "";
 
     // Encode input to char IDs
@@ -741,7 +734,7 @@ inline std::string G2PModelCuda::infer(const std::string& text,
 
     if (ws_bytes > workspace_bytes_) {
         // Should never happen — workspace is pre-allocated at max_pos_ size
-        fprintf(stderr, "g2p_cuda: BUG: ws_bytes %zu > workspace_bytes_ %zu (T=%d)\n",
+        fprintf(stderr, "g2p: BUG: ws_bytes %zu > workspace_bytes_ %zu (T=%d)\n",
                 ws_bytes, workspace_bytes_, T);
         return "";
     }
@@ -765,36 +758,54 @@ inline std::string G2PModelCuda::infer(const std::string& text,
     int* argmax          = walloci(T_up);
 
     // Upload input IDs (before graph — stream ordering guarantees completion)
-    cudaMemcpyAsync(ids_gpu, ids.data(), T * sizeof(int), cudaMemcpyHostToDevice, stream);
+    rokoko::device::copy_async(ids_gpu, ids.data(), T * sizeof(int), rokoko::device::host_to_device, stream);
 
     // Lambda: run all inference kernels on the stream
     auto run_kernels = [&]() {
 
+        #ifdef ROKOKO_CPU
+        g2p_embed_kernel(ids_gpu, char_emb_, X, T, d);
+#else
         g2p_embed_kernel<<<T, 128, 0, stream>>>(ids_gpu, char_emb_, X, T, d);
+#endif
 
         int block = 128;
         for (int li = 0; li < n_layers_; li++) {
             const auto& L = layers_[li];
 
             // 1. RMSNorm (attn)
-            g2p_rms_norm_kernel<<<T, block, block * sizeof(float), stream>>>(
+            #ifdef ROKOKO_CPU
+        g2p_rms_norm_kernel(
                 X, L.n1_w, normed, T, d, 1e-6f);
+#else
+        g2p_rms_norm_kernel<<<T, block, block * sizeof(float), stream>>>(
+                X, L.n1_w, normed, T, d, 1e-6f);
+#endif
 
             // 2. QKV projection
-            cutlass_gemm_tn(3 * d, T, d, L.qkv_w, d, normed, d, QKV, 3 * d,
+            backend_gemm_tn(3 * d, T, d, L.qkv_w, d, normed, d, QKV, 3 * d,
                              1.0f, 0.0f, nullptr, 0, stream);
 
 
             // 3. Fused QKV bias + RoPE Q&K
             if (use_rope_) {
-                g2p_qkv_bias_rope_kernel<<<T, 256, 0, stream>>>(
+                #ifdef ROKOKO_CPU
+        g2p_qkv_bias_rope_kernel(
                     QKV, L.qkv_b, rope_cos_, rope_sin_, T, 3 * d, d, h, dk);
+#else
+        g2p_qkv_bias_rope_kernel<<<T, 256, 0, stream>>>(
+                    QKV, L.qkv_b, rope_cos_, rope_sin_, T, 3 * d, d, h, dk);
+#endif
             } else {
-                g2p_bias_kernel<<<T, 256, 0, stream>>>(QKV, L.qkv_b, 3 * d, T);
+                #ifdef ROKOKO_CPU
+        g2p_bias_kernel(QKV, L.qkv_b, 3 * d, T);
+#else
+        g2p_bias_kernel<<<T, 256, 0, stream>>>(QKV, L.qkv_b, 3 * d, T);
+#endif
             }
 
             // 4. Batched attention scores
-            cutlass_gemm_batched_tn(T, T, dk,
+            backend_gemm_batched_tn(T, T, dk,
                 QKV + d, 3 * d, (long long)dk,
                 QKV,     3 * d, (long long)dk,
                 attn_scores, T, (long long)T * T,
@@ -802,11 +813,16 @@ inline std::string G2PModelCuda::infer(const std::string& text,
 
 
             // 5. Softmax
-            g2p_softmax_kernel<<<h * T, block, block * sizeof(float), stream>>>(
+            #ifdef ROKOKO_CPU
+        g2p_softmax_kernel(
                 attn_scores, T, h * T);
+#else
+        g2p_softmax_kernel<<<h * T, block, block * sizeof(float), stream>>>(
+                attn_scores, T, h * T);
+#endif
 
             // 6. Batched value weighted sum
-            cutlass_gemm_batched_nn(dk, T, T,
+            backend_gemm_batched_nn(dk, T, T,
                 QKV + 2 * d, 3 * d, (long long)dk,
                 attn_scores, T,     (long long)T * T,
                 attn_out, d, (long long)dk,
@@ -814,48 +830,75 @@ inline std::string G2PModelCuda::infer(const std::string& text,
 
 
             // 7. Output projection with fused residual (beta=1)
-            cutlass_gemm_tn(d, T, d, L.out_w, d, attn_out, d, X, d,
+            backend_gemm_tn(d, T, d, L.out_w, d, attn_out, d, X, d,
                              1.0f, 1.0f, nullptr, 0, stream);
 
 
             // 8a. Fused out_bias + RMSNorm
-            g2p_bias_rms_norm_kernel<<<T, block, block * sizeof(float), stream>>>(
+            #ifdef ROKOKO_CPU
+        g2p_bias_rms_norm_kernel(
                 X, L.out_b, L.n2_w, normed, T, d, 1e-6f);
+#else
+        g2p_bias_rms_norm_kernel<<<T, block, block * sizeof(float), stream>>>(
+                X, L.out_b, L.n2_w, normed, T, d, 1e-6f);
+#endif
 
             // 8b. Gate+Up GEMM: ffn_out[2*ff, T] = gate_up_w[2*ff, d] × normed[d, T]
-            cutlass_gemm_nn(2 * ff, T, d, L.gate_up_w, 2 * ff, normed, d, ffn_out, 2 * ff,
+            backend_gemm_nn(2 * ff, T, d, L.gate_up_w, 2 * ff, normed, d, ffn_out, 2 * ff,
                              1.0f, 0.0f, nullptr, 0, stream);
 
             // 8c. Fused bias + SwiGLU
-            g2p_swiglu_bias_kernel<<<(T * ff + 255) / 256, 256, 0, stream>>>(
+            #ifdef ROKOKO_CPU
+        g2p_swiglu_bias_kernel(
                 ffn_out, L.gate_up_b, ff, T);
+#else
+        g2p_swiglu_bias_kernel<<<(T * ff + 255) / 256, 256, 0, stream>>>(
+                ffn_out, L.gate_up_b, ff, T);
+#endif
 
             // 8d. Down GEMM with fused residual: X += down_w[d, ff] × ffn_out[ff, T]
-            cutlass_gemm_nn(d, T, ff, L.down_w, d, ffn_out, 2 * ff, X, d,
+            backend_gemm_nn(d, T, ff, L.down_w, d, ffn_out, 2 * ff, X, d,
                              1.0f, 1.0f, nullptr, 0, stream);
 
             // 8e. Down bias
-            g2p_bias_kernel<<<T, 256, 0, stream>>>(X, L.down_b, d, T);
+            #ifdef ROKOKO_CPU
+        g2p_bias_kernel(X, L.down_b, d, T);
+#else
+        g2p_bias_kernel<<<T, 256, 0, stream>>>(X, L.down_b, d, T);
+#endif
         }
 
         // Upsample projection (no bias — fused into reshape)
-        cutlass_gemm_tn(d * up_, T, d, up_w_, d, X, d, X_up_proj, d * up_,
+        backend_gemm_tn(d * up_, T, d, up_w_, d, X, d, X_up_proj, d * up_,
                          1.0f, 0.0f, nullptr, 0, stream);
 
         // Fused upsample bias + reshape
+        #ifdef ROKOKO_CPU
+        g2p_upsample_bias_reshape_kernel(
+            X_up_proj, up_b_, X_up, T, d, up_);
+#else
         g2p_upsample_bias_reshape_kernel<<<T_up, 128, 0, stream>>>(
             X_up_proj, up_b_, X_up, T, d, up_);
+#endif
 
         // Output head (no bias — fused into CTC argmax)
-        cutlass_gemm_tn(n_phones_, T_up, d, head_w_, d, X_up, d, logits, n_phones_,
+        backend_gemm_tn(n_phones_, T_up, d, head_w_, d, X_up, d, logits, n_phones_,
                          1.0f, 0.0f, nullptr, 0, stream);
 
         // Fused head bias + CTC argmax
+        #ifdef ROKOKO_CPU
+        g2p_bias_ctc_argmax_kernel(
+            logits, head_b_, argmax, T_up, n_phones_);
+#else
         g2p_bias_ctc_argmax_kernel<<<(T_up + 255) / 256, 256, 0, stream>>>(
             logits, head_b_, argmax, T_up, n_phones_);
+#endif
 
     };
 
+#ifdef ROKOKO_CPU
+    run_kernels();
+#else
     // CUDA graph: first call runs directly (populates Cutlass operator caches),
     // second call captures the graph, third+ replays.
     auto git = graph_cache_.find(T);
@@ -882,10 +925,11 @@ inline std::string G2PModelCuda::infer(const std::string& text,
         cudaGraphLaunch(git->second, stream);
     }
 
+#endif
     // Copy argmax back to CPU
     std::vector<int> argmax_cpu(T_up);
-    cudaMemcpyAsync(argmax_cpu.data(), argmax, T_up * sizeof(int), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
+    rokoko::device::copy_async(argmax_cpu.data(), argmax, T_up * sizeof(int), rokoko::device::device_to_host, stream);
+    rokoko::device::synchronize(stream);
 
     // CTC decode on CPU
     std::string result;

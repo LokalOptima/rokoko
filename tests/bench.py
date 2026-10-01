@@ -3,7 +3,7 @@ import argparse
 import statistics
 import json
 from pathlib import Path
-from support import ROOT, idle_gpu, model_args, paths, provenance, request, save_report, server, sha256, wav_info
+from support import ROOT, embedded_identity, idle_gpu, model_args, paths, provenance, request, save_report, server, sha256, wav_info
 
 TEXTS = ['Hello world.',
 'The quick brown fox jumps over the lazy dog and then runs back home again through the meadow.',
@@ -22,10 +22,11 @@ def main():
     ap.add_argument('--output',type=Path,default=ROOT/'tests/results/bench.json')
     model_args(ap); args=ap.parse_args()
     if args.repeats < 1 or args.mixed < 0: ap.error('repeats must be positive; mixed must be nonnegative')
-    idle_gpu()
+    binaries=args.binary or [ROOT/'rokoko']
+    if any(embedded_identity(p).get('backend')!='cpu' for p in binaries): idle_gpu()
     report=dict(kind='descriptive benchmark; no perceptual equivalence claim', workloads=[])
     mixed=(ROOT/'tests/frontend/plain_test.txt').read_text().splitlines()[:args.mixed]
-    for binary in args.binary or [ROOT/'rokoko']:
+    for binary in binaries:
         artifact_dir=args.output.parent/(args.output.stem+'-'+binary.name)
         artifact_dir.mkdir(parents=True,exist_ok=True)
         run=dict(provenance=provenance(binary,bundled=True), artifacts={k:sha256(v) for k,v in paths(args).items() if v.is_file()}, requests=[])
@@ -55,7 +56,7 @@ def main():
         for state in ('hit','miss'):
             rows=[r for r in run['requests'] if int(r['telemetry'].get('x-decode-'+('hits' if state=='hit' else 'misses'),'0'))>0]
             run['summary']['observed_decode_'+state]=summary(rows)
-        run['cache_observed']=any('x-encode-hits' in r['telemetry'] for r in run['requests'])
+        run['cache_observed']=run['provenance']['embedded_assets'].get('backend')!='cpu' and any('x-encode-hits' in r['telemetry'] for r in run['requests'])
         report['workloads'].append(run); save_report(args.output,report)
         print(binary.name,run['summary'],flush=True)
     print(f'Saved {args.output}')

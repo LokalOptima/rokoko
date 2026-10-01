@@ -73,7 +73,11 @@ int main(int argc,char** argv) {
             record(pipe,b,out/"key_b",64);
             record(pipe,styled,out/"key_style",64);
             record(pipe,a,out/"key_aba",64);
+#ifndef ROKOKO_CPU
             require(inference_stats().decode_hits==hits+3,"changed-input decode replay not exercised");
+#else
+            require(inference_stats().encode_graphs==0 && inference_stats().decode_graphs==0,"CPU must not create CUDA graphs");
+#endif
             for(int frames:{31,32,33,63,64,65,127,128,129}) record(pipe,a,out/("frames"+std::to_string(frames)),frames);
             auto large=chunk_ipa(std::string(300,'a')).at(0);record(pipe,large,out/"grow");
             record(pipe,a,out/"after_growth");

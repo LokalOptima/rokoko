@@ -1,4 +1,4 @@
-// cutlass_gemm.cu — Cutlass GEMM kernels for all linear algebra
+// backend_gemm.cu — Cutlass GEMM kernels for all linear algebra
 //
 // Three layout combinations (TN, NT, NN) × two TF32 tile sizes + SIMT fallback.
 // Batched variants for attention (TN, NN).
@@ -291,14 +291,14 @@ static bool tf32_align1(int K) {
 }
 
 // ---------------------------------------------------------------------------
-// cutlass_gemm_tn: C = alpha * A^T * B + beta * C
+// backend_gemm_tn: C = alpha * A^T * B + beta * C
 //   A stored [K, M] col-major → RowMajor [M, K]
 //   B stored [K, N] col-major → ColumnMajor [K, N]
 //   C stored [M, N] col-major → ColumnMajor [M, N]
 // ---------------------------------------------------------------------------
 
 extern "C"
-int cutlass_gemm_tn(int M, int N, int K,
+int backend_gemm_tn(int M, int N, int K,
                      const float* A, int lda,
                      const float* B, int ldb,
                      float* C, int ldc,
@@ -339,11 +339,11 @@ int cutlass_gemm_tn(int M, int N, int K,
 }
 
 // ---------------------------------------------------------------------------
-// cutlass_gemm_nt: C = alpha * A * B^T + beta * C
+// backend_gemm_nt: C = alpha * A * B^T + beta * C
 // ---------------------------------------------------------------------------
 
 extern "C"
-int cutlass_gemm_nt(int M, int N, int K,
+int backend_gemm_nt(int M, int N, int K,
                      const float* A, int lda, const float* B, int ldb,
                      float* C, int ldc, float alpha, float beta,
                      float* workspace, size_t workspace_bytes, cudaStream_t stream) {
@@ -378,11 +378,11 @@ int cutlass_gemm_nt(int M, int N, int K,
 }
 
 // ---------------------------------------------------------------------------
-// cutlass_gemm_nn: C = alpha * A * B + beta * C
+// backend_gemm_nn: C = alpha * A * B + beta * C
 // ---------------------------------------------------------------------------
 
 extern "C"
-int cutlass_gemm_nn(int M, int N, int K,
+int backend_gemm_nn(int M, int N, int K,
                      const float* A, int lda, const float* B, int ldb,
                      float* C, int ldc, float alpha, float beta,
                      float* workspace, size_t workspace_bytes, cudaStream_t stream) {
@@ -417,13 +417,13 @@ int cutlass_gemm_nn(int M, int N, int K,
 }
 
 // ---------------------------------------------------------------------------
-// cutlass_gemm_tn_bias: D = A^T * B + bias  (bias broadcast across columns)
+// backend_gemm_tn_bias: D = A^T * B + bias  (bias broadcast across columns)
 //   bias: [M] vector, fused into epilogue via stride-0 C source.
-//   Same as cutlass_gemm_tn but with separate C (bias) and D (output).
+//   Same as backend_gemm_tn but with separate C (bias) and D (output).
 // ---------------------------------------------------------------------------
 
 extern "C"
-int cutlass_gemm_tn_bias(int M, int N, int K,
+int backend_gemm_tn_bias(int M, int N, int K,
                           const float* A, int lda,
                           const float* B, int ldb,
                           float* D, int ldd,
@@ -466,11 +466,11 @@ int cutlass_gemm_tn_bias(int M, int N, int K,
 }
 
 // ---------------------------------------------------------------------------
-// cutlass_gemm_batched_tn: C_i = alpha * A_i^T * B_i + beta * C_i
+// backend_gemm_batched_tn: C_i = alpha * A_i^T * B_i + beta * C_i
 // ---------------------------------------------------------------------------
 
 extern "C"
-int cutlass_gemm_batched_tn(int M, int N, int K,
+int backend_gemm_batched_tn(int M, int N, int K,
                               const float* A, int lda, long long strideA,
                               const float* B, int ldb, long long strideB,
                               float* C, int ldc, long long strideC,
@@ -493,7 +493,7 @@ int cutlass_gemm_batched_tn(int M, int N, int K,
 
     // Fallback: loop of single GEMMs (uses TF32 align1 or SIMT per-element)
     for (int b = 0; b < batch_count; b++) {
-        int rc = cutlass_gemm_tn(M, N, K,
+        int rc = backend_gemm_tn(M, N, K,
             A + b * strideA, lda, B + b * strideB, ldb,
             C + b * strideC, ldc, alpha, beta,
             workspace, workspace_bytes, stream);
@@ -503,11 +503,11 @@ int cutlass_gemm_batched_tn(int M, int N, int K,
 }
 
 // ---------------------------------------------------------------------------
-// cutlass_gemm_batched_nn: C_i = alpha * A_i * B_i + beta * C_i
+// backend_gemm_batched_nn: C_i = alpha * A_i * B_i + beta * C_i
 // ---------------------------------------------------------------------------
 
 extern "C"
-int cutlass_gemm_batched_nn(int M, int N, int K,
+int backend_gemm_batched_nn(int M, int N, int K,
                               const float* A, int lda, long long strideA,
                               const float* B, int ldb, long long strideB,
                               float* C, int ldc, long long strideC,
@@ -530,7 +530,7 @@ int cutlass_gemm_batched_nn(int M, int N, int K,
 
     // Fallback: loop of single GEMMs (uses TF32 align1 or SIMT per-element)
     for (int b = 0; b < batch_count; b++) {
-        int rc = cutlass_gemm_nn(M, N, K,
+        int rc = backend_gemm_nn(M, N, K,
             A + b * strideA, lda, B + b * strideB, ldb,
             C + b * strideC, ldc, alpha, beta,
             workspace, workspace_bytes, stream);
@@ -539,7 +539,7 @@ int cutlass_gemm_batched_nn(int M, int N, int K,
     return 0;
 }
 
-extern "C" void clear_cutlass_gemm_cache() {
+extern "C" void clear_backend_gemm_cache() {
     s_tn_large.clear();
     s_tn_small.clear();
     s_tn_align1.clear();

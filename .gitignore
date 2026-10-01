@@ -1,4 +1,5 @@
 /rokoko
+/rokoko.cpu
 *.o
 *.wav
 __pycache__/

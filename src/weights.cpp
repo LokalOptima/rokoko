@@ -292,9 +292,9 @@ void Weights::assign_v2_fp16_pointers() {
 
     // Build suffix map: base tensor name → {f16, nhwc_f16, nhwc_f16_pad, c_in_pad, bias_combined}
     struct V2Info {
-        __half* f16 = nullptr;
-        __half* nhwc_f16 = nullptr;
-        __half* nhwc_f16_pad = nullptr;
+        rokoko::Half* f16 = nullptr;
+        rokoko::Half* nhwc_f16 = nullptr;
+        rokoko::Half* nhwc_f16_pad = nullptr;
         int c_in_pad = 0;
         float* bias_combined_fwd = nullptr;
         float* bias_combined_rev = nullptr;
@@ -311,12 +311,12 @@ void Weights::assign_v2_fp16_pointers() {
         };
 
         if (ends_with(".f16")) {
-            v2[n.substr(0, n.size() - 4)].f16 = (__half*)ptr;
+            v2[n.substr(0, n.size() - 4)].f16 = (rokoko::Half*)ptr;
         } else if (ends_with(".nhwc_f16")) {
-            v2[n.substr(0, n.size() - 9)].nhwc_f16 = (__half*)ptr;
+            v2[n.substr(0, n.size() - 9)].nhwc_f16 = (rokoko::Half*)ptr;
         } else if (auto pos = n.find(".nhwc_f16_pad"); pos != std::string::npos) {
             auto& info = v2[n.substr(0, pos)];
-            info.nhwc_f16_pad = (__half*)ptr;
+            info.nhwc_f16_pad = (rokoko::Half*)ptr;
             info.c_in_pad = std::stoi(n.substr(pos + 13));
         } else if (ends_with(".bias_combined_fwd")) {
             v2[n.substr(0, n.size() - 18)].bias_combined_fwd = (float*)ptr;
@@ -326,10 +326,10 @@ void Weights::assign_v2_fp16_pointers() {
     }
 
     // Lookup helpers
-    auto f16 = [&](const std::string& base) -> __half* {
+    auto f16 = [&](const std::string& base) -> rokoko::Half* {
         auto it = v2.find(base); return it != v2.end() ? it->second.f16 : nullptr;
     };
-    auto nhwc16 = [&](const std::string& base) -> __half* {
+    auto nhwc16 = [&](const std::string& base) -> rokoko::Half* {
         auto it = v2.find(base);
         if (it == v2.end()) return nullptr;
         if (it->second.nhwc_f16) return it->second.nhwc_f16;
@@ -497,18 +497,18 @@ Weights Weights::prefetch(const void* data, size_t size) {
 }
 
 // ---------------------------------------------------------------------------
-// Weights::upload — cudaMalloc + cudaMemcpy from prefetched data, assign ptrs.
+// Weights::upload — rokoko::device::allocate + rokoko::device::copy from prefetched data, assign ptrs.
 // ---------------------------------------------------------------------------
 
-void Weights::upload(cudaStream_t stream) {
-    CUDA_CHECK(cudaMalloc(&gpu_data, gpu_data_size));
+void Weights::upload(rokoko::Stream stream) {
+    CUDA_CHECK(rokoko::device::allocate(&gpu_data, gpu_data_size));
     if (stream) {
-        CUDA_CHECK(cudaMemcpyAsync(gpu_data, prefetch_base, gpu_data_size,
-                                    cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(rokoko::device::copy_async(gpu_data, prefetch_base, gpu_data_size,
+                                    rokoko::device::host_to_device, stream));
+        CUDA_CHECK(rokoko::device::synchronize(stream));
     } else {
-        CUDA_CHECK(cudaMemcpy(gpu_data, prefetch_base, gpu_data_size,
-                               cudaMemcpyHostToDevice));
+        CUDA_CHECK(rokoko::device::copy(gpu_data, prefetch_base, gpu_data_size,
+                               rokoko::device::host_to_device));
     }
 
     // Free mmap only if we own it (file-based prefetch)
@@ -527,7 +527,7 @@ void Weights::upload(cudaStream_t stream) {
 // Weights::load — convenience: prefetch + upload in one call.
 // ---------------------------------------------------------------------------
 
-Weights Weights::load(const std::string& path, cudaStream_t stream) {
+Weights Weights::load(const std::string& path, rokoko::Stream stream) {
     Weights w = prefetch(path);
     w.upload(stream);
     return w;
@@ -540,7 +540,7 @@ Weights Weights::load(const std::string& path, cudaStream_t stream) {
 void Weights::free() {
     if (mmap_ptr) { munmap(mmap_ptr,mmap_size);mmap_ptr=nullptr;mmap_size=0;prefetch_base=nullptr; }
     if (gpu_data) {
-        cudaFree(gpu_data);
+        rokoko::device::release(gpu_data);
         gpu_data = nullptr;
         gpu_data_size = 0;
     }

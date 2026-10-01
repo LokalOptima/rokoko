@@ -31,7 +31,7 @@ struct AlbertBuffers {
     float* temp = nullptr;      // [T, 768] temporary buffer
     int* token_ids = nullptr;   // [T] int32 token IDs
 
-    void alloc(int T, GpuArena& arena) {
+    void alloc(int T, InferenceArena& arena) {
         emb        = arena.alloc<float>(T * 128);
         hidden     = arena.alloc<float>(T * 768);
         qkv        = arena.alloc<float>(T * 3 * 768);
@@ -49,7 +49,7 @@ struct TextEncoderBuffers {
     float* conv_out = nullptr;  // [T, 512] conv output / working buffer
     float* lstm_out = nullptr;  // [T, 512] LSTM output
 
-    void alloc(int T, GpuArena& arena) {
+    void alloc(int T, InferenceArena& arena) {
         emb      = arena.alloc<float>(T * 512);
         conv_out = arena.alloc<float>(T * 512);
         lstm_out = arena.alloc<float>(T * 512);

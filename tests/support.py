@@ -21,7 +21,10 @@ def sha256(path):
     return h.hexdigest()
 
 def command(args):
-    p = subprocess.run(args, cwd=ROOT, text=True, capture_output=True, timeout=30)
+    try:
+        p = subprocess.run(args, cwd=ROOT, text=True, capture_output=True, timeout=30)
+    except OSError as e:
+        return 'unavailable: '+str(e)
     return p.stdout.strip() if p.returncode == 0 else p.stderr.strip()
 
 def provenance(binary=None, bundled=False):
@@ -31,10 +34,12 @@ def provenance(binary=None, bundled=False):
         '--query-gpu=name,driver_version,memory.total,temperature.gpu,clocks.sm,utilization.gpu,power.draw',
         '--format=csv,noheader']))
     result['command_line']=__import__('sys').argv
+    result['cpu']=command(['lscpu'])
+    result['cpu_threads']=os.environ.get('ROKOKO_CPU_THREADS','default')
     files=[]
-    for folder in ('src','tests','scripts','assets'):
+    for folder in ('src','tests','scripts','assets','cmake'):
         for path in sorted((ROOT/folder).rglob('*')):
-            if path.is_file() and path.suffix in ('.cpp','.cu','.h','.py','.json','.tsv','.txt') and not any(x in path.parts for x in ('results','probe','models','__pycache__')):
+            if path.is_file() and path.suffix in ('.cpp','.cu','.h','.py','.json','.tsv','.txt','.cmake') and not any(x in path.parts for x in ('results','probe','models','__pycache__')):
                 files.append((str(path.relative_to(ROOT)),sha256(path)))
     files += [(name,sha256(ROOT/name)) for name in ('Makefile','CMakeLists.txt')]
     result['source_files']=dict(files)

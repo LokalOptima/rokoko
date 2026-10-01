@@ -1,10 +1,10 @@
-// cutlass_gemm_f16.cu — Cutlass FP16 GEMM kernels for mixed-precision inference
+// backend_gemm_f16.cu — Cutlass FP16 GEMM kernels for mixed-precision inference
 //
 // Weights (A): half_t.  Activations (B): half_t (caller casts from FP32).
 // Accumulator: float.  Output (C/D): float.
 // MMA instruction: 16×8×16 FP16 TensorOp on SM80+.
 //
-// Same layout combinations as cutlass_gemm.cu (TN, NT, NN, batched, bias).
+// Same layout combinations as backend_gemm.cu (TN, NT, NN, batched, bias).
 // Separate operator caches from the TF32 variants.
 
 #include <cuda_runtime.h>
@@ -233,14 +233,14 @@ static bool fp16_align8(int K) { return (K % 8 == 0); }
 static bool epilogue_align4(int M) { return (M % 4 == 0); }
 
 // ---------------------------------------------------------------------------
-// cutlass_gemm_tn_f16: C = alpha * A^T * B + beta * C
+// backend_gemm_tn_f16: C = alpha * A^T * B + beta * C
 //   A: half_t [K, M] col-major → RowMajor [M, K]
 //   B: half_t [K, N] col-major → ColumnMajor [K, N]
 //   C: float [M, N] col-major → ColumnMajor [M, N]
 // ---------------------------------------------------------------------------
 
 extern "C"
-int cutlass_gemm_tn_f16(int M, int N, int K,
+int backend_gemm_tn_f16(int M, int N, int K,
                           const cutlass::half_t* A, int lda,
                           const cutlass::half_t* B, int ldb,
                           float* C, int ldc,
@@ -279,11 +279,11 @@ int cutlass_gemm_tn_f16(int M, int N, int K,
 }
 
 // ---------------------------------------------------------------------------
-// cutlass_gemm_tn_bias_f16: D = A^T * B + bias  (bias fused via stride-0 C)
+// backend_gemm_tn_bias_f16: D = A^T * B + bias  (bias fused via stride-0 C)
 // ---------------------------------------------------------------------------
 
 extern "C"
-int cutlass_gemm_tn_bias_f16(int M, int N, int K,
+int backend_gemm_tn_bias_f16(int M, int N, int K,
                                const cutlass::half_t* A, int lda,
                                const cutlass::half_t* B, int ldb,
                                float* D, int ldd,
@@ -325,11 +325,11 @@ int cutlass_gemm_tn_bias_f16(int M, int N, int K,
 }
 
 // ---------------------------------------------------------------------------
-// cutlass_gemm_nn_f16: C = alpha * A * B + beta * C
+// backend_gemm_nn_f16: C = alpha * A * B + beta * C
 // ---------------------------------------------------------------------------
 
 extern "C"
-int cutlass_gemm_nn_f16(int M, int N, int K,
+int backend_gemm_nn_f16(int M, int N, int K,
                           const cutlass::half_t* A, int lda,
                           const cutlass::half_t* B, int ldb,
                           float* C, int ldc,
@@ -368,7 +368,7 @@ int cutlass_gemm_nn_f16(int M, int N, int K,
     return dispatch_gemm<GemmNN_FP16_SIMT>(s_f16_nn_simt, key, args, workspace, workspace_bytes, stream);
 }
 
-extern "C" void clear_cutlass_gemm_f16_cache() {
+extern "C" void clear_backend_gemm_f16_cache() {
     s_f16_tn_large.clear();
     s_f16_tn_small.clear();
     s_f16_tn_align1.clear();

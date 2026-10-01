@@ -4,7 +4,7 @@
 
 # Rokoko
 
-Fast text-to-speech on GPU. Neural G2P + Kokoro TTS in a single CUDA binary.
+Native text-to-speech on NVIDIA GPUs or x86-64 CPUs. Neural G2P + Kokoro TTS in one bundled executable.
 
 This is the consolidated home for inference, G2P training, model export and
 regression tests. The executable embeds its weights, G2P model and `af_heart`
@@ -13,13 +13,14 @@ at runtime.
 
 ## Build
 
-Requires an NVIDIA GPU, its driver, the CUDA toolkit, a C++17 compiler, GNU binutils
-and Python 3 (standard library only, for build-time asset preparation).
+Both backends require Linux x86-64, a C++17 compiler, GNU binutils and Python 3
+(standard library only, for build-time asset preparation). The default CUDA build
+also requires an NVIDIA GPU, its driver and the CUDA toolkit.
 The verified setup is Linux x86-64, CUDA 13.1, CUTLASS 4.4.1, and an RTX 5070 Ti.
-The default build targets the local CPU and GPU. There is no CPU inference backend.
-There is one inference implementation: FP16 weights and matrix/convolution kernels,
-with FP32 intermediate values and operations where required. The legacy runtime
-has been removed; no precision flag or separate `rokoko.fp16` executable is needed.
+The CUDA build targets the local GPU. Both backends share the model forward pass,
+FP16 weight assets, G2P V11 and the fixed `af_heart` voice. CUDA uses mixed precision;
+CPU uses FP32 arithmetic after unpacking the same half weights. There is no separate
+FP32 model asset or precision switch.
 CUTLASS (headers only) isn't in the repo:
 
 ```bash
@@ -43,6 +44,42 @@ Asset downloads happen during the build, not CMake configuration.
 ```bash
 cmake -S . -B build/cmake -DCMAKE_BUILD_TYPE=Release
 cmake --build build/cmake -j2
+```
+
+### CPU build
+
+The CPU backend requires **AVX2, FMA and F16C** (tested on an Intel i7-12700).
+It needs CMake 3.24+ and GNU Make, and does not need CUDA, an NVIDIA driver,
+CUTLASS or a GPU. OpenBLAS 0.3.30 is downloaded into the build directory with a
+pinned SHA-256 and linked statically. It supplies AVX2/FMA matrix kernels;
+F16C accelerates half-weight conversion. Convolutions use bounded im2col tiles.
+
+```bash
+make cpu
+./rokoko.cpu "Hello from the CPU." --say
+./rokoko.cpu --serve 8080
+```
+
+Or build directly with CMake (the resulting executable is `build/cpu/rokoko`):
+
+```bash
+cmake -S . -B build/cpu -DCMAKE_BUILD_TYPE=Release -DROKOKO_BACKEND=CPU
+cmake --build build/cpu -j4
+```
+
+The CPU build has the same CLI, HTTP and library interfaces. Backend selection
+happens at build time; the default `rokoko` Make target remains CUDA.
+OpenBLAS uses up to eight threads by default. Set `ROKOKO_CPU_THREADS=1..64` to
+choose a different count; more threads are not always faster.
+
+For a fresh offline CPU build, provide approved model assets and the pinned
+OpenBLAS source archive:
+
+```bash
+cmake -S . -B build/cpu -DROKOKO_BACKEND=CPU -DCMAKE_BUILD_TYPE=Release \
+  -DROKOKO_OFFLINE=ON -DROKOKO_ASSET_SOURCE=/path/to/models \
+  -DROKOKO_OPENBLAS_URL=/path/to/OpenBLAS-0.3.30.tar.gz
+cmake --build build/cpu -j4
 ```
 
 Library callers now use `context.init()` and
@@ -88,11 +125,13 @@ The assembler embeds the raw bytes in read-only sections. The loaders read those
 bytes directly; there is no extraction into a cache or temporary directory.
 After building, copy just `rokoko` (about 202 MB with the tested Make toolchain).
 You can delete the build directory. Moving the executable still requires a
-compatible CPU/GPU, NVIDIA driver, CUDA runtime and Linux system libraries.
+compatible CPU and Linux system libraries. The CUDA executable additionally
+requires a compatible NVIDIA GPU, its driver and the CUDA runtime. The CPU
+executable has no CUDA or dynamic OpenBLAS dependency and can also be moved alone.
 Model updates require rebuilding the executable.
 
-`./rokoko --build-info` prints the identities of the embedded assets without
-initializing CUDA. File-based export and evaluation tools remain available for
+`--build-info` prints the selected backend and embedded asset identities without
+initializing inference. File-based export and evaluation tools remain available for
 development; model paths and voice selection are no longer production CLI options.
 
 ## Usage
@@ -119,6 +158,7 @@ The supported voice is **`af_heart`**, the highest-graded English voice in [Koko
 ## Acknowledgments
 
 - **[Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)** by hexgrad — the original TTS model that this project reimplements in C++/CUDA (Apache 2.0 License)
+- **[OpenBLAS](https://github.com/OpenMathLib/OpenBLAS)** — statically linked SIMD CPU matrix operations ([BSD 3-Clause license](third_party/OpenBLAS-LICENSE)). Include this notice when distributing CPU binaries.
 - **[CUTLASS](https://github.com/NVIDIA/cutlass)** by NVIDIA — CUDA GEMM templates (BSD-3-Clause License, Copyright 2017-2026 NVIDIA Corporation & Affiliates)
 - **[cpp-httplib](https://github.com/yhirose/cpp-httplib)** by yhirose — HTTP server for web UI (MIT License)
 
@@ -131,7 +171,7 @@ The supported voice is **`af_heart`**, the highest-graded English voice in [Koko
 --stdout            Write WAV to stdout
 --serve [port]      HTTP server with web UI (default: 8080)
 --host <addr>       Server bind address (default: 0.0.0.0)
--v                  Verbose output (timings, IPA, GPU info)
+-v                  Verbose output (model loading details)
 --build-info        Print embedded asset identities (JSON)
 --help              Show help
 ```

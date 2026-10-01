@@ -1,7 +1,7 @@
-// weights.h — Weight loading + CUDA inference for Rokoko-82M TTS
+// weights.h — Weight loading + CPU/CUDA inference for Rokoko-82M TTS
 //
 // Defines:
-//   Weights  — pointers into GPU weight allocation (loaded from weights.fp16.bin)
+//   Weights  — pointers into backend weight allocation (loaded from weights.fp16.bin)
 
 #pragma once
 #include "artifact_format.h"
@@ -13,8 +13,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include "device.h"
+
 
 // ---------------------------------------------------------------------------
 // Verbosity control (defined in main.cu, default false = quiet)
@@ -29,10 +29,10 @@ extern bool g_verbose;
 
 #define CUDA_CHECK(call)                                                       \
     do {                                                                       \
-        cudaError_t err = (call);                                              \
-        if (err != cudaSuccess) {                                              \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,  \
-                    cudaGetErrorString(err));                                   \
+        rokoko::device::Status err = (call);                                              \
+        if (err != rokoko::device::success) {                                              \
+            fprintf(stderr, "Compute error at %s:%d: %s\n", __FILE__, __LINE__,  \
+                    rokoko::device::error_string(err));                                   \
             std::exit(1);                                                      \
         }                                                                      \
     } while (0)
@@ -40,22 +40,22 @@ extern bool g_verbose;
 namespace rokoko {
 
 // ---------------------------------------------------------------------------
-// GPU scratch arena: single allocation, bump pointer, reset per inference
+// Backend scratch arena: single allocation, bump pointer, reset per inference
 // ---------------------------------------------------------------------------
 
-struct GpuArena {
+struct InferenceArena {
     char* base = nullptr;
     size_t capacity = 0;
     size_t offset = 0;
 
     void init(size_t bytes) {
-        CUDA_CHECK(cudaMalloc(&base, bytes));
+        CUDA_CHECK(rokoko::device::allocate(&base, bytes));
         capacity = bytes;
         offset = 0;
     }
 
     void destroy() {
-        if (base) { cudaFree(base); base = nullptr; }
+        if (base) { rokoko::device::release(base); base = nullptr; }
         capacity = 0;
         offset = 0;
     }
@@ -66,7 +66,7 @@ struct GpuArena {
     void* alloc(size_t bytes) {
         size_t aligned = (offset + 255) & ~(size_t)255;
         if (aligned + bytes > capacity) {
-            fprintf(stderr, "GpuArena OOM: need %zu + %zu, have %zu\n",
+            fprintf(stderr, "InferenceArena OOM: need %zu + %zu, have %zu\n",
                     aligned, bytes, capacity);
             abort();
         }
@@ -134,12 +134,12 @@ static constexpr int PRED_F0N_BLOCKS = 3;      // F0/N AdainResBlk1d blocks
 static constexpr int SAMPLE_RATE     = 24000;
 
 // ---------------------------------------------------------------------------
-// Weights struct — all model weights on GPU
+// Weights struct — all model weights in backend memory
 // ---------------------------------------------------------------------------
 
 struct Weights {
     int format_version = 0;
-    void* gpu_data = nullptr;        // single contiguous GPU allocation
+    void* gpu_data = nullptr;        // single contiguous backend allocation
     size_t gpu_data_size = 0;
 
     // Prefetch state (temporary — cleared after upload)
@@ -169,7 +169,7 @@ struct Weights {
     // Embedding → hidden projection
     float *bert_proj_w = nullptr;           // [768, 128]
     float *bert_proj_b = nullptr;           // [768]
-    __half *bert_proj_w_f16 = nullptr;
+    rokoko::Half *bert_proj_w_f16 = nullptr;
 
     // Shared attention layer (looped 6 times)
     struct AlbertLayer {
@@ -185,9 +185,9 @@ struct Weights {
         float *ffn_ln_w = nullptr, *ffn_ln_b = nullptr;   // [768]
 
         // FP16 companions (v2)
-        __half *q_w_f16 = nullptr, *k_w_f16 = nullptr, *v_w_f16 = nullptr;
-        __half *dense_w_f16 = nullptr;
-        __half *ffn_w_f16 = nullptr, *ffn_out_w_f16 = nullptr;
+        rokoko::Half *q_w_f16 = nullptr, *k_w_f16 = nullptr, *v_w_f16 = nullptr;
+        rokoko::Half *dense_w_f16 = nullptr;
+        rokoko::Half *ffn_w_f16 = nullptr, *ffn_out_w_f16 = nullptr;
     } albert;
 
     // Pooler (may not be needed for inference, but load anyway)
@@ -199,7 +199,7 @@ struct Weights {
     // -----------------------------------------------------------------------
     float *bert_enc_w = nullptr;            // [512, 768]
     float *bert_enc_b = nullptr;            // [512]
-    __half *bert_enc_w_f16 = nullptr;
+    rokoko::Half *bert_enc_w_f16 = nullptr;
 
     // -----------------------------------------------------------------------
     // Text encoder: 3 conv blocks + bidirectional LSTM
@@ -211,7 +211,7 @@ struct Weights {
         float *conv_b = nullptr;            // [512]
         float *ln_w = nullptr;              // [512] (gamma)
         float *ln_b = nullptr;              // [512] (beta)
-        __half *conv_wv_nhwc_f16 = nullptr; // v2: NHWC FP16 for Cutlass conv
+        rokoko::Half *conv_wv_nhwc_f16 = nullptr; // v2: NHWC FP16 for Cutlass conv
     } text_conv[TEXT_N_CONV];
 
     // Bidirectional LSTM (1 layer)
@@ -225,10 +225,10 @@ struct Weights {
     float *text_lstm_bhh_rev = nullptr;     // [1024]
     float *text_lstm_bias_fwd = nullptr;    // precomputed bih+bhh [1024]
     float *text_lstm_bias_rev = nullptr;    // precomputed bih+bhh [1024]
-    __half *text_lstm_wih_fwd_f16 = nullptr;
-    __half *text_lstm_whh_fwd_f16 = nullptr;
-    __half *text_lstm_wih_rev_f16 = nullptr;
-    __half *text_lstm_whh_rev_f16 = nullptr;
+    rokoko::Half *text_lstm_wih_fwd_f16 = nullptr;
+    rokoko::Half *text_lstm_whh_fwd_f16 = nullptr;
+    rokoko::Half *text_lstm_wih_rev_f16 = nullptr;
+    rokoko::Half *text_lstm_whh_rev_f16 = nullptr;
 
     // -----------------------------------------------------------------------
     // Prosody predictor
@@ -241,15 +241,15 @@ struct Weights {
         float *wih_rev = nullptr, *whh_rev = nullptr;
         float *bih_rev = nullptr, *bhh_rev = nullptr;
         float *bias_fwd = nullptr, *bias_rev = nullptr; // precomputed bih+bhh [4H]
-        __half *wih_fwd_f16 = nullptr, *whh_fwd_f16 = nullptr;
-        __half *wih_rev_f16 = nullptr, *whh_rev_f16 = nullptr;
+        rokoko::Half *wih_fwd_f16 = nullptr, *whh_fwd_f16 = nullptr;
+        rokoko::Half *wih_rev_f16 = nullptr, *whh_rev_f16 = nullptr;
     };
 
     // AdaLayerNorm: fc(style) -> gamma, beta; then (1+gamma)*LN(x)+beta
     struct AdaLayerNormWeights {
         float *fc_w = nullptr;   // [2*D, style_dim=128]
         float *fc_b = nullptr;   // [2*D]
-        __half *fc_w_f16 = nullptr;
+        rokoko::Half *fc_w_f16 = nullptr;
     };
 
     // AdaIN1d: InstanceNorm(affine=True) + style FC
@@ -258,7 +258,7 @@ struct Weights {
         float *norm_b = nullptr;  // [C] InstanceNorm bias
         float *fc_w = nullptr;    // [2*C, style_dim=128]
         float *fc_b = nullptr;    // [2*C]
-        __half *fc_w_f16 = nullptr;
+        rokoko::Half *fc_w_f16 = nullptr;
     };
 
     // AdainResBlk1d: 2 conv + 2 AdaIN + optional shortcut + optional upsample pool
@@ -273,9 +273,9 @@ struct Weights {
         bool has_shortcut = false;
         bool has_upsample = false;
         // FP16 companions (v2)
-        __half *conv1_wv_nhwc_f16 = nullptr;  // NHWC FP16 for K=3 conv
-        __half *conv2_wv_nhwc_f16 = nullptr;
-        __half *conv1x1_wv_nhwc_f16 = nullptr; // K=1 NHWC FP16 (identity layout)
+        rokoko::Half *conv1_wv_nhwc_f16 = nullptr;  // NHWC FP16 for K=3 conv
+        rokoko::Half *conv2_wv_nhwc_f16 = nullptr;
+        rokoko::Half *conv1x1_wv_nhwc_f16 = nullptr; // K=1 NHWC FP16 (identity layout)
         int conv1_c_in_pad = 0;               // padded C_in for conv1 (0 = unpadded)
         int conv1x1_c_in_pad = 0;             // padded C_in for conv1x1 (0 = unpadded)
     };
@@ -288,7 +288,7 @@ struct Weights {
     BiLSTMWeights dur_lstm;
     float *dur_proj_w = nullptr;   // [50, 512]
     float *dur_proj_b = nullptr;   // [50]
-    __half *dur_proj_w_f16 = nullptr;
+    rokoko::Half *dur_proj_w_f16 = nullptr;
 
     // Shared LSTM (F0/N prediction)
     BiLSTMWeights shared_lstm;
@@ -311,9 +311,9 @@ struct Weights {
     // 3 rounds of: adain1 → Snake → dilated conv → adain2 → Snake → conv → residual add
     struct AdaINResBlock1Weights {
         // convs1[0..2]: dilated conv (d=1,3,5), weight_norm
-        struct { float *wg, *wv, *b; __half *wv_nhwc_f16 = nullptr; } convs1[3];
+        struct { float *wg, *wv, *b; rokoko::Half *wv_nhwc_f16 = nullptr; } convs1[3];
         // convs2[0..2]: conv (d=1), weight_norm
-        struct { float *wg, *wv, *b; __half *wv_nhwc_f16 = nullptr; } convs2[3];
+        struct { float *wg, *wv, *b; rokoko::Half *wv_nhwc_f16 = nullptr; } convs2[3];
         // adain1[0..2], adain2[0..2]: AdaIN1d
         AdaIN1dWeights adain1[3], adain2[3];
         // alpha1[0..2], alpha2[0..2]: Snake learnable params [C]
@@ -328,7 +328,7 @@ struct Weights {
 
     // asr_res: Conv1d(512,64,k=1) with weight_norm
     float *dec_asr_res_wg = nullptr, *dec_asr_res_wv = nullptr, *dec_asr_res_b = nullptr;
-    __half *dec_asr_res_wv_f16 = nullptr;
+    rokoko::Half *dec_asr_res_wv_f16 = nullptr;
 
     // encode: AdainResBlk1d(514→1024)
     AdainResBlk1dWeights dec_encode;
@@ -348,10 +348,10 @@ struct Weights {
     static constexpr int GEN_HAR_CH = GEN_N_FFT + 2;  // 22
 
     // ups[0..1]: ConvTranspose1d (non-depthwise) with weight_norm
-    struct { float *wg, *wv, *b; __half *wv_f16 = nullptr; } gen_ups[GEN_N_UPS];
+    struct { float *wg, *wv, *b; rokoko::Half *wv_f16 = nullptr; } gen_ups[GEN_N_UPS];
 
     // noise_convs[0..1]: regular Conv1d (no weight_norm)
-    struct { float *w, *b; __half *w_f16 = nullptr; __half *w_nhwc_f16 = nullptr; int c_in_pad = 0; } gen_noise_convs[GEN_N_UPS];
+    struct { float *w, *b; rokoko::Half *w_f16 = nullptr; rokoko::Half *w_nhwc_f16 = nullptr; int c_in_pad = 0; } gen_noise_convs[GEN_N_UPS];
 
     // noise_res[0..1]: AdaINResBlock1
     AdaINResBlock1Weights gen_noise_res[GEN_N_UPS];
@@ -361,7 +361,7 @@ struct Weights {
 
     // conv_post: Conv1d(128→22,k=7,p=3) with weight_norm
     float *gen_conv_post_wg = nullptr, *gen_conv_post_wv = nullptr, *gen_conv_post_b = nullptr;
-    __half *gen_conv_post_wv_f16 = nullptr;  // for im2col+GEMM (C_out=22 misaligned)
+    rokoko::Half *gen_conv_post_wv_f16 = nullptr;  // for im2col+GEMM (C_out=22 misaligned)
 
     // m_source.l_linear: Linear(9→1)
     float *gen_source_w = nullptr, *gen_source_b = nullptr;
@@ -372,17 +372,17 @@ struct Weights {
 
     static Weights prefetch(const std::string& path);
     static Weights prefetch(const void* data, size_t size);
-    void upload(cudaStream_t stream = nullptr);
-    static Weights load(const std::string& path, cudaStream_t stream = nullptr);
+    void upload(rokoko::Stream stream = nullptr);
+    static Weights load(const std::string& path, rokoko::Stream stream = nullptr);
     void free();
 
-    /// Get a GPU pointer for a named tensor (nullptr if not found).
+    /// Get a backend pointer for a named tensor (nullptr if not found).
     float* get(const std::string& name) const;
 
     /// Get shape for a named tensor.
     const std::vector<int>* get_shape(const std::string& name) const;
 
-    /// Populate __half* fields from v2 tensor names (.f16, .nhwc_f16, etc.)
+    /// Populate rokoko::Half* fields from v2 tensor names (.f16, .nhwc_f16, etc.)
     void assign_v2_fp16_pointers();
 
     void print_info() const;
@@ -413,7 +413,7 @@ void release_inference_state(Weights& weights);
 /// Run Kokoro inference: phoneme token IDs + style vector → audio samples.
 std::vector<float> rokoko_infer(const Weights& w,
     const int* token_ids, int T, const float* style_vec,
-    cudaStream_t stream, GpuArena& arena, GpuArena& decode_arena,
+    rokoko::Stream stream, InferenceArena& arena, InferenceArena& decode_arena,
     float* d_workspace, size_t workspace_bytes, InferenceTrace* trace = nullptr);
 
 /// Write audio samples to a WAV file (16-bit PCM). path="-" writes to stdout.
@@ -425,6 +425,6 @@ void write_wav_to_(std::ostream& f, const float* audio,
     int n_samples, int sample_rate);
 
 /// Prepare converted weight pointers and inference scratch (once after upload).
-void initialize_inference(Weights& w, cudaStream_t stream);
+void initialize_inference(Weights& w, rokoko::Stream stream);
 
 } // namespace rokoko

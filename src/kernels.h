@@ -4,36 +4,36 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include "device.h"
+
 
 namespace rokoko {
 
 // ---------------------------------------------------------------------------
 // FP32→FP16 cast: dst[i] = __float2half(src[i])
 // ---------------------------------------------------------------------------
-void cast_f32_to_f16(const float* src, __half* dst, int N, cudaStream_t stream);
+void cast_f32_to_f16(const float* src, rokoko::Half* dst, int N, rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // GEMV FP16 weights: y[M] = alpha * A[K,M]^T * x[K] + beta * y[M]
 //   A: half_t col-major [K, M], x: float, y: float
 // ---------------------------------------------------------------------------
-void gemv_tn_f16(const __half* A, int lda, const float* x,
+void gemv_tn_f16(const rokoko::Half* A, int lda, const float* x,
                   float* y, int M, int K, float alpha, float beta,
-                  cudaStream_t stream);
+                  rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Embedding gather: y[i, :] = table[ids[i], :]
 //   table: [V, D], ids: [N], y: [N, D]
 // ---------------------------------------------------------------------------
 void embedding_gather(const float* table, const int* ids, float* y,
-                      int N, int D, cudaStream_t stream);
+                      int N, int D, rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Element-wise add: y = a + b  (N elements)
 // ---------------------------------------------------------------------------
 void add_f32(const float* a, const float* b, float* y, int N,
-             cudaStream_t stream);
+             rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // LayerNorm: y = gamma * (x - mean) / sqrt(var + eps) + beta
@@ -41,7 +41,7 @@ void add_f32(const float* a, const float* b, float* y, int N,
 //   gamma, beta: [D]
 // ---------------------------------------------------------------------------
 void layer_norm_f32(const float* x, const float* gamma, const float* beta,
-                    float* y, int N, int D, float eps, cudaStream_t stream);
+                    float* y, int N, int D, float eps, rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Fused Residual + LayerNorm: y = LayerNorm(a + b; gamma, beta, eps)
@@ -50,39 +50,39 @@ void layer_norm_f32(const float* x, const float* gamma, const float* beta,
 void residual_layer_norm_f32(const float* a, const float* b,
                               const float* gamma, const float* beta,
                               float* y, int N, int D, float eps,
-                              cudaStream_t stream);
+                              rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // GELU (tanh approx): y = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 //   Matches PyTorch's gelu_new / approximate='tanh'.
 // ---------------------------------------------------------------------------
-void gelu_f32(const float* x, float* y, int N, cudaStream_t stream);
+void gelu_f32(const float* x, float* y, int N, rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // LeakyReLU: y = x > 0 ? x : alpha * x
 // ---------------------------------------------------------------------------
 void leaky_relu_f32(const float* x, float* y, int N, float alpha,
-                    cudaStream_t stream);
+                    rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Softmax over last dimension: y[n, :] = softmax(x[n, :])
 //   x, y: [N, D]
 // ---------------------------------------------------------------------------
-void softmax_f32(const float* x, float* y, int N, int D, cudaStream_t stream);
+void softmax_f32(const float* x, float* y, int N, int D, rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Bias add: y[n, d] = x[n, d] + bias[d]
 //   x, y: [N, D], bias: [D]
 // ---------------------------------------------------------------------------
 void bias_add_f32(const float* x, const float* bias, float* y, int N, int D,
-                  cudaStream_t stream);
+                  rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Transpose 2D: y[j, i] = x[i, j]
 //   x: [M, N], y: [N, M]
 // ---------------------------------------------------------------------------
 void transpose_f32(const float* x, float* y, int M, int N,
-                   cudaStream_t stream);
+                   rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Conv1d: y[t, c_out] = sum_{c_in, k} w[c_out, c_in, k] * x[t+k-pad, c_in] + b[c_out]
@@ -91,14 +91,14 @@ void transpose_f32(const float* x, float* y, int M, int N,
 // ---------------------------------------------------------------------------
 void conv1d_f32(const float* x, const float* w, const float* bias,
                 float* y, int C_in, int C_out, int T, int K,
-                cudaStream_t stream);
+                rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Weight norm: w[o, i, k] = wg[o] * wv[o, i, k] / ||wv[o]||_2
 //   wg: [C_out, 1, 1], wv: [C_out, C_in, K], w: [C_out, C_in, K]
 // ---------------------------------------------------------------------------
 void weight_norm_f32(const float* wg, const float* wv, float* w,
-                     int C_out, int fan_in, cudaStream_t stream);
+                     int C_out, int fan_in, rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // LayerNorm across channels: normalize across C at each time position
@@ -108,7 +108,7 @@ void weight_norm_f32(const float* wg, const float* wv, float* w,
 void layer_norm_channels_first_f32(const float* x, const float* gamma,
                                     const float* beta, float* y,
                                     int C, int T, float eps,
-                                    cudaStream_t stream);
+                                    rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Fused InstanceNorm + StyleAffine: single-pass AdaIN
@@ -120,7 +120,7 @@ void instance_norm_style_affine_f32(const float* x, const float* norm_w,
                                       const float* beta, float* y,
                                       float* workspace,  // [2*C] reduction buffer
                                       int C, int T, float eps,
-                                      cudaStream_t stream,
+                                      rokoko::Stream stream,
                                       const float* snake_alpha = nullptr);
 
 // ---------------------------------------------------------------------------
@@ -130,7 +130,7 @@ void instance_norm_style_affine_f32(const float* x, const float* norm_w,
 // ---------------------------------------------------------------------------
 void ada_layer_norm_f32(const float* x, const float* gamma, const float* beta,
                          float* y, int N, int D, float eps,
-                         cudaStream_t stream);
+                         rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Depthwise transposed Conv1d: x[T_in, C] -> y[T_out, C]
@@ -140,39 +140,39 @@ void ada_layer_norm_f32(const float* x, const float* gamma, const float* beta,
 void conv_transpose1d_depthwise_f32(const float* x, const float* w, const float* bias,
                                       float* y, int C, int T_in, int K,
                                       int stride, int pad, int out_pad,
-                                      cudaStream_t stream);
+                                      rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Nearest-neighbor 2x upsampling: x[T, C] -> y[2*T, C]
 // ---------------------------------------------------------------------------
 void upsample_nearest_1d_2x_f32(const float* x, float* y, int C, int T,
-                                  cudaStream_t stream);
+                                  rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Scale: y = x * scalar
 // ---------------------------------------------------------------------------
 void scale_f32(const float* x, float* y, int N, float scalar,
-               cudaStream_t stream);
+               rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Fused sigmoid + sum reduce over last dim: y[n] = sum_d sigmoid(x[n,d])
 //   x: [N, D], y: [N]
 // ---------------------------------------------------------------------------
 void sigmoid_sum_f32(const float* x, float* y, int N, int D,
-                      cudaStream_t stream);
+                      rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Tile 1D: broadcast x[C] to y[T, C]  (y[t,c] = x[c] for all t)
 // ---------------------------------------------------------------------------
 void tile_1d_f32(const float* x, float* y, int C, int T,
-                  cudaStream_t stream);
+                  rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Channel bias add: y[t, c] += bias[c]  for all t
 //   y: [T, C], bias: [C]
 // ---------------------------------------------------------------------------
 void channel_bias_add_f32(float* y, const float* bias, int C, int T,
-                            cudaStream_t stream);
+                            rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Generalized Conv1d with stride, dilation, explicit padding
@@ -183,7 +183,7 @@ void channel_bias_add_f32(float* y, const float* bias, int C, int T,
 void conv1d_general_f32(const float* x, const float* w, const float* bias,
                         float* y, int C_in, int C_out, int T_in, int K,
                         int stride, int padding, int dilation,
-                        cudaStream_t stream);
+                        rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Reflection pad 1D: pad left by pad_left, right by pad_right
@@ -191,17 +191,17 @@ void conv1d_general_f32(const float* x, const float* w, const float* bias,
 // ---------------------------------------------------------------------------
 void reflection_pad_1d_f32(const float* x, float* y, int C, int T,
                             int pad_left, int pad_right,
-                            cudaStream_t stream);
+                            rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Element-wise exp: y = exp(x)
 // ---------------------------------------------------------------------------
-void exp_f32(const float* x, float* y, int N, cudaStream_t stream);
+void exp_f32(const float* x, float* y, int N, rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Element-wise sin: y = sin(x)
 // ---------------------------------------------------------------------------
-void sin_f32(const float* x, float* y, int N, cudaStream_t stream);
+void sin_f32(const float* x, float* y, int N, rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // STFT forward: compute magnitude and phase spectrograms
@@ -211,7 +211,7 @@ void sin_f32(const float* x, float* y, int N, cudaStream_t stream);
 // ---------------------------------------------------------------------------
 void stft_f32(const float* x, float* mag, float* phase,
               int T_signal, int n_fft, int hop_length,
-              cudaStream_t stream, float* scratch = nullptr);
+              rokoko::Stream stream, float* scratch = nullptr);
 
 // ---------------------------------------------------------------------------
 // iSTFT inverse: reconstruct time-domain signal from magnitude and phase
@@ -221,7 +221,7 @@ void stft_f32(const float* x, float* mag, float* phase,
 // ---------------------------------------------------------------------------
 void istft_f32(const float* mag, const float* phase, float* y,
                int n_frames, int n_fft, int hop_length, int T_signal,
-               cudaStream_t stream, float* scratch = nullptr);
+               rokoko::Stream stream, float* scratch = nullptr);
 
 // ---------------------------------------------------------------------------
 // LSTM gate activation: apply sigmoid/tanh to pre-computed gates
@@ -229,7 +229,7 @@ void istft_f32(const float* mag, const float* phase, float* y,
 // ---------------------------------------------------------------------------
 void lstm_gates_f32(const float* gates, const float* c_prev,
                      float* c_out, float* h_out, int H,
-                     cudaStream_t stream);
+                     rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // GEMV: y[M] = A[K, M]^T * x[K]  (A stored col-major [K, M])
@@ -238,7 +238,7 @@ void lstm_gates_f32(const float* gates, const float* c_prev,
 void gemv_tn_f32(const float* A, int lda, const float* x,
                   float* y, int M, int K,
                   float alpha, float beta,
-                  cudaStream_t stream);
+                  rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // im2col for 1D convolution: x[T_in, C_in] → col[T_out, C_in*K]
@@ -247,7 +247,7 @@ void gemv_tn_f32(const float* A, int lda, const float* x,
 void im2col_1d_f32(const float* x, float* col,
                     int C_in, int T_in, int K,
                     int stride, int padding, int dilation, int T_out,
-                    cudaStream_t stream);
+                    rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // col2im for 1D transposed convolution: col[T_in, C_out*K] → y[T_out, C_out]
@@ -257,21 +257,21 @@ void im2col_1d_f32(const float* x, float* col,
 void col2im_1d_f32(const float* col, float* y,
                     int C_out, int K, int T_in,
                     int stride, int padding, int T_out,
-                    cudaStream_t stream);
+                    rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Concatenate along channels for [T, C] layout
 //   a: [T, Ca], b: [T, Cb] → y: [T, Ca+Cb]
 // ---------------------------------------------------------------------------
 void concat_channels_f32(const float* a, const float* b, float* y,
-                           int T, int Ca, int Cb, cudaStream_t stream);
+                           int T, int Ca, int Cb, rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Concatenate 3 tensors along channels: a[T,Ca] + b[T,Cb] + c[T,Cc] → y[T,Ca+Cb+Cc]
 // ---------------------------------------------------------------------------
 void concat3_channels_f32(const float* a, const float* b, const float* c,
                             float* y, int T, int Ca, int Cb, int Cc,
-                            cudaStream_t stream);
+                            rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Concatenate 4 tensors along channels: a[T,Ca]+b[T,Cb]+c[T,Cc]+d[T,Cd] → y[T,Ca+Cb+Cc+Cd]
@@ -280,27 +280,27 @@ void concat4_channels_f32(const float* a, const float* b,
                             const float* c, const float* d,
                             float* y,
                             int T, int Ca, int Cb, int Cc, int Cd,
-                            cudaStream_t stream);
+                            rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // FP32→FP16 cast with channel zero-padding: [T, C_old] → [T, C_new]
 // ---------------------------------------------------------------------------
-void cast_f32_to_f16_pad(const float* src, __half* dst,
-                           int T, int C_old, int C_new, cudaStream_t stream);
+void cast_f32_to_f16_pad(const float* src, rokoko::Half* dst,
+                           int T, int C_old, int C_new, rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Pad blocks: copy n_blocks of old_block_size, zero-fill to new_block_size.
 // ---------------------------------------------------------------------------
 void pad_blocks_f32(const float* src, float* dst,
                       int n_blocks, int old_block_size, int new_block_size,
-                      cudaStream_t stream);
+                      rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // SineGen phase computation: f0[L2] → phase_low[L2 * 9]
 //   Sequential cumulative sum per harmonic (9 threads)
 // ---------------------------------------------------------------------------
 void sinegen_phase_f32(const float* f0, const float* rand_ini,
-                        float* phase_low, int L2, cudaStream_t stream);
+                        float* phase_low, int L2, rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // SineGen source generation: phase_low[L2*9] + f0[L2] → har_source[T_audio]
@@ -310,7 +310,7 @@ void sinegen_phase_f32(const float* f0, const float* rand_ini,
 void sinegen_source_f32(const float* phase_low, const float* f0,
                          const float* l_linear_w, const float* l_linear_b,
                          float* har_source, int L2, int T_audio,
-                         unsigned int seed, cudaStream_t stream);
+                         unsigned int seed, rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Round+clamp durations on GPU, compute total L
@@ -318,13 +318,13 @@ void sinegen_source_f32(const float* phase_low, const float* f0,
 //   L_out: [1] (output, total frames = sum of int_durations)
 // ---------------------------------------------------------------------------
 void round_clamp_durations_f32(const float* durations, int* int_durations,
-                                int* L_out, int T, cudaStream_t stream);
+                                int* L_out, int T, rokoko::Stream stream);
 
 // ---------------------------------------------------------------------------
 // Build alignment matrix on GPU from int durations
 //   int_durations: [T], alignment: [T, L] (output, zeroed + filled)
 // ---------------------------------------------------------------------------
 void build_alignment_f32(const int* int_durations, float* alignment,
-                          int T, int L, cudaStream_t stream);
+                          int T, int L, rokoko::Stream stream);
 
 } // namespace rokoko

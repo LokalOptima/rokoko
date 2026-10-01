@@ -34,7 +34,7 @@ def verify_identity(args):
             else: raise AssertionError('V8 substitution escaped identity check')
     return manifest
 
-def compare_runs(root,voices):
+def compare_runs(root,voices,graphs=True):
     vocab=json.loads((ROOT/'tests/fixtures/vocab.json').read_text())['vocab']
     for case in root.glob('*/*/stats.json'):
         d=case.parent; ps=(d/'phonemes.txt').read_text()
@@ -52,7 +52,8 @@ def compare_runs(root,voices):
         return dict(same_samples=len(x)==len(y),max_abs=float(np.max(np.abs(x-y))) if len(x)==len(y) else None,
                     rms=float(np.sqrt(np.mean((x.astype(float)-y)**2))) if len(x)==len(y) else None)
     first=root/'first';a=first/'a0'
-    assert json.loads((first/'a1/stats.json').read_text())['decode_hits']>json.loads((a/'stats.json').read_text())['decode_hits'],'replay exercised'
+    if graphs:
+        assert json.loads((first/'a1/stats.json').read_text())['decode_hits']>json.loads((a/'stats.json').read_text())['decode_hits'],'replay exercised'
     report={name:difference(a,first/name) for name in ('a1','a2','a3','a4','b','style_change','aba','isolated','after_growth')}
     report['recreated']=difference(a,root/'recreated/a0')
     for name in ('key_b','key_style','key_aba'):

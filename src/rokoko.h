@@ -38,10 +38,10 @@ namespace rokoko {
 
 struct TtsPipeline {
     Weights& weights;
-    G2PModelCuda& g2p;
-    cudaStream_t stream;
-    GpuArena& encode_arena;
-    GpuArena& decode_arena;
+    G2PModel& g2p;
+    rokoko::Stream stream;
+    InferenceArena& encode_arena;
+    InferenceArena& decode_arena;
     float* d_workspace;
     size_t ws_bytes;
     const float* voice;
@@ -114,7 +114,7 @@ struct TtsPipeline {
 };
 
 // ---------------------------------------------------------------------------
-// TTS Context — owns all GPU resources, provides TtsPipeline
+// TTS Context — owns all inference resources, provides TtsPipeline
 // ---------------------------------------------------------------------------
 
 static constexpr size_t ENCODE_ARENA_BYTES = 64 * 1024 * 1024;
@@ -127,10 +127,10 @@ struct TtsContext {
     bool owns_backend=false;
     std::string last_error;
     Weights weights;
-    G2PModelCuda g2p;
-    cudaStream_t stream = nullptr;
-    GpuArena encode_arena;
-    GpuArena decode_arena;
+    G2PModel g2p;
+    rokoko::Stream stream = nullptr;
+    InferenceArena encode_arena;
+    InferenceArena decode_arena;
     float* d_workspace = nullptr;
     const float* voice = nullptr;
 
@@ -143,18 +143,22 @@ struct TtsContext {
         if (!context_active.compare_exchange_strong(expected,true)) { last_error="only one live TtsContext is supported"; return false; }
         owns_backend=true;last_error.clear();
         try {
+#ifdef ROKOKO_CPU
+            if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma") || !__builtin_cpu_supports("f16c"))
+                throw std::runtime_error("CPU backend requires AVX2, FMA and F16C");
+#endif
             if (!assets.voice.data || assets.voice.size!=510*256*sizeof(float) ||
                 reinterpret_cast<uintptr_t>(assets.voice.data)%alignof(float))
                 throw std::runtime_error("invalid af_heart style data");
             voice=reinterpret_cast<const float*>(assets.voice.data);
             weights=Weights::prefetch(assets.weights.data,assets.weights.size);
-            CUDA_CHECK(cudaStreamCreate(&stream));
+            CUDA_CHECK(rokoko::device::create_stream(&stream));
             weights.upload(stream);
             initialize_inference(weights,stream);
             if (!g2p.load(assets.g2p.data,assets.g2p.size,stream))
                 throw std::runtime_error("invalid or truncated G2P model");
             encode_arena.init(ENCODE_ARENA_BYTES);
-            CUDA_CHECK(cudaMalloc(&d_workspace,WORKSPACE_BYTES));
+            CUDA_CHECK(rokoko::device::allocate(&d_workspace,WORKSPACE_BYTES));
             auto pipe=pipeline();std::vector<float> warmup;
             auto err=pipe.synthesize("Warmup.",warmup);
             if (!err.empty()) throw std::runtime_error(err);
@@ -171,15 +175,15 @@ struct TtsContext {
 
     void destroy() {
         if (!owns_backend) return;
-        if (stream) cudaStreamSynchronize(stream);
+        if (stream) rokoko::device::synchronize(stream);
         release_inference_state(weights);
-        if (d_workspace) { cudaFree(d_workspace); d_workspace = nullptr; }
+        if (d_workspace) { rokoko::device::release(d_workspace); d_workspace = nullptr; }
         decode_arena.destroy();
         encode_arena.destroy();
         voice=nullptr;
         g2p.free();
         weights.free();
-        if (stream) { cudaStreamDestroy(stream); stream = nullptr; }
+        if (stream) { rokoko::device::destroy_stream(stream); stream = nullptr; }
         owns_backend=false;context_active=false;
     }
 

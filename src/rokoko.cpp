@@ -1,4 +1,4 @@
-// rokoko.cpp — FP16 TTS CUDA inference (pre-baked FP16 weights from v2 file)
+// rokoko.cpp — Shared CPU/CUDA forward pass using the bundled v2 FP16 weights
 //
 // Provides rokoko_infer(), initialize_inference().
 
@@ -13,46 +13,13 @@
 #include <stdexcept>
 #include <vector>
 
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include "backend_ops.h"
+
 #include "rokoko_common.h"
 #include "kernels.h"
-
-// ---------------------------------------------------------------------------
-// Cutlass GEMM — FP32 (activation-only NT, stays FP32)
-// ---------------------------------------------------------------------------
-extern "C" int cutlass_gemm_nt(int M, int N, int K,
-    const float* A, int lda, const float* B, int ldb,
-    float* C, int ldc, float alpha, float beta,
-    float* workspace, size_t workspace_bytes, cudaStream_t stream);
-extern "C" int cutlass_gemm_batched_tn(int M, int N, int K,
-    const float* A, int lda, long long strideA,
-    const float* B, int ldb, long long strideB,
-    float* C, int ldc, long long strideC,
-    int batch_count, float alpha, float beta,
-    float* workspace, size_t workspace_bytes, cudaStream_t stream);
-extern "C" int cutlass_gemm_batched_nn(int M, int N, int K,
-    const float* A, int lda, long long strideA,
-    const float* B, int ldb, long long strideB,
-    float* C, int ldc, long long strideC,
-    int batch_count, float alpha, float beta,
-    float* workspace, size_t workspace_bytes, cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Cutlass GEMM — FP16 (extern, defined in cutlass_gemm_f16.cu)
-// ---------------------------------------------------------------------------
-extern "C" int cutlass_gemm_tn_f16(int M, int N, int K,
-    const __half* A, int lda, const __half* B, int ldb,
-    float* C, int ldc, float alpha, float beta,
-    float* workspace, size_t workspace_bytes, cudaStream_t stream);
-extern "C" int cutlass_gemm_tn_bias_f16(int M, int N, int K,
-    const __half* A, int lda, const __half* B, int ldb,
-    float* D, int ldd, const float* bias,
-    float* workspace, size_t workspace_bytes, cudaStream_t stream);
-extern "C" int cutlass_gemm_nn_f16(int M, int N, int K,
-    const __half* A, int lda, const __half* B, int ldb,
-    float* C, int ldc, float alpha, float beta,
-    float* workspace, size_t workspace_bytes, cudaStream_t stream);
+#ifdef ROKOKO_CPU
+#include "cpu/math.h"
+#endif
 
 namespace rokoko {
 
@@ -61,7 +28,7 @@ static float* s_workspace = nullptr;
 static size_t s_workspace_bytes = 0;
 
 // FP16 activation staging buffer (pre-allocated, reused across all GEMM/Conv calls)
-static __half* s_fp16_buf = nullptr;
+static rokoko::Half* s_fp16_buf = nullptr;
 static size_t s_fp16_buf_size = 0;  // in bytes
 
 // ---------------------------------------------------------------------------
@@ -70,17 +37,17 @@ static size_t s_fp16_buf_size = 0;  // in bytes
 
 // C = alpha * A^T * B + beta * C  (A is FP16 weight, B is FP32 activation)
 static void sgemm_tn(int m, int n, int k,
-                      const __half* A, int lda,
+                      const rokoko::Half* A, int lda,
                       const float* B, int ldb,
                       float* C, int ldc,
-                      cudaStream_t stream,
+                      rokoko::Stream stream,
                       float alpha = 1.0f, float beta = 0.0f) {
     if (n == 1) {
         gemv_tn_f16(A, lda, B, C, m, k, alpha, beta, stream);
         return;
     }
     cast_f32_to_f16(B, s_fp16_buf, n * k, stream);
-    cutlass_gemm_tn_f16(m, n, k, A, lda, s_fp16_buf, ldb,
+    backend_gemm_tn_f16(m, n, k, A, lda, s_fp16_buf, ldb,
                          C, ldc, alpha, beta, s_workspace, s_workspace_bytes, stream);
 }
 
@@ -89,46 +56,35 @@ static void sgemm_nt(int m, int n, int k,
                       const float* A, int lda,
                       const float* B, int ldb,
                       float* C, int ldc,
-                      cudaStream_t stream,
+                      rokoko::Stream stream,
                       float alpha = 1.0f, float beta = 0.0f) {
-    cutlass_gemm_nt(m, n, k, A, lda, B, ldb, C, ldc,
+    backend_gemm_nt(m, n, k, A, lda, B, ldb, C, ldc,
                      alpha, beta, s_workspace, s_workspace_bytes, stream);
 }
 
 // C = alpha * A * B + beta * C  (A is FP16 weight, B is FP32 activation)
 static void sgemm_nn(int m, int n, int k,
-                      const __half* A, int lda,
+                      const rokoko::Half* A, int lda,
                       const float* B, int ldb,
                       float* C, int ldc,
-                      cudaStream_t stream,
+                      rokoko::Stream stream,
                       float alpha = 1.0f, float beta = 0.0f) {
     cast_f32_to_f16(B, s_fp16_buf, n * k, stream);
-    cutlass_gemm_nn_f16(m, n, k, A, lda, s_fp16_buf, ldb,
+    backend_gemm_nn_f16(m, n, k, A, lda, s_fp16_buf, ldb,
                          C, ldc, alpha, beta, s_workspace, s_workspace_bytes, stream);
 }
 
 // C = A^T * B + bias  (A is FP16 weight)
 static void sgemm_bias(int m, int n, int k,
-                        const __half* A, int lda,
+                        const rokoko::Half* A, int lda,
                         const float* B, int ldb,
                         float* C, int ldc,
                         const float* bias,
-                        cudaStream_t stream) {
+                        rokoko::Stream stream) {
     cast_f32_to_f16(B, s_fp16_buf, n * k, stream);
-    cutlass_gemm_tn_bias_f16(m, n, k, A, lda, s_fp16_buf, ldb,
+    backend_gemm_tn_bias_f16(m, n, k, A, lda, s_fp16_buf, ldb,
                               C, ldc, bias, s_workspace, s_workspace_bytes, stream);
 }
-
-// ---------------------------------------------------------------------------
-// Cutlass implicit GEMM Conv1d — FP16 (extern, defined in cutlass_conv_f16.cu)
-// ---------------------------------------------------------------------------
-extern "C" int cutlass_conv1d_fprop_f16(const __half* x, const __half* w,
-                                          const float* bias,
-                                          float* y, const float* residual,
-                                          float* workspace, size_t workspace_bytes,
-                                          int C_in, int C_out, int T_in, int K,
-                                          int stride, int padding, int dilation,
-                                          cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Conv1d forward: FP16 Cutlass (NHWC weights), K=1 falls back to GEMM.
@@ -137,11 +93,11 @@ extern "C" int cutlass_conv1d_fprop_f16(const __half* x, const __half* w,
 // gemm_conv1d: Conv1d forward.
 //   When residual != nullptr: y = conv(x,w) + residual, then bias_add(y, bias).
 //   When residual == nullptr: y = conv(x,w) + bias (fused in Cutlass epilogue).
-static void gemm_conv1d(const float* x, const __half* w, const float* bias,
+static void gemm_conv1d(const float* x, const rokoko::Half* w, const float* bias,
                          float* y, float* workspace, size_t workspace_bytes,
                          int C_in, int C_out, int T_in, int K,
                          int stride, int padding, int dilation,
-                         cudaStream_t stream,
+                         rokoko::Stream stream,
                          const float* residual = nullptr,
                          int C_in_pad = 0) {
     int T_out = (T_in + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
@@ -154,7 +110,7 @@ static void gemm_conv1d(const float* x, const __half* w, const float* bias,
         cast_f32_to_f16(x, s_fp16_buf, T_in * C_in, stream);
     }
     const float* cutlass_bias = residual ? nullptr : bias;
-    cutlass_conv1d_fprop_f16(s_fp16_buf, w, cutlass_bias, y, residual,
+    backend_conv1d_fprop_f16(s_fp16_buf, w, cutlass_bias, y, residual,
                               workspace, workspace_bytes,
                               actual_cin, C_out, T_in, K,
                               stride, padding, dilation, stream);
@@ -165,11 +121,11 @@ static void gemm_conv1d(const float* x, const __half* w, const float* bias,
 // im2col + GEMM ConvTranspose1d: GEMM + col2im
 //   x[T_in, C_in] * w[C_in, C_out, K] → y[T_out, C_out]
 //   T_out = (T_in - 1) * stride - 2*padding + K + output_padding
-static void gemm_conv_transpose1d(const float* x, const __half* w, const float* bias,
+static void gemm_conv_transpose1d(const float* x, const rokoko::Half* w, const float* bias,
                                     float* y, float* workspace, size_t workspace_bytes,
                                     int C_in, int C_out, int T_in, int K,
                                     int stride, int padding, int output_padding,
-                                    cudaStream_t stream) {
+                                    rokoko::Stream stream) {
     int T_out = (T_in - 1) * stride - 2 * padding + K + output_padding;
     int COK = C_out * K;
 
@@ -181,7 +137,7 @@ static void gemm_conv_transpose1d(const float* x, const __half* w, const float* 
     if (bias) {
         tile_1d_f32(bias, y, C_out, T_out, stream);
     } else {
-        cudaMemsetAsync(y, 0, (size_t)C_out * T_out * sizeof(float), stream);
+        rokoko::device::zero(y, 0, (size_t)C_out * T_out * sizeof(float), stream);
     }
 
     // col2im: scatter col[T_in, COK] → y[T_out, C_out] via atomicAdd
@@ -194,7 +150,7 @@ static void gemm_conv_transpose1d(const float* x, const __half* w, const float* 
 
 // Run ALBERT encoder: input_ids[T] -> hidden[T, 768]
 static void albert_forward(const Weights& w, AlbertBuffers& buf,
-                           cudaStream_t stream, int T) {
+                           rokoko::Stream stream, int T) {
     // Step 1: Embeddings
     embedding_gather(w.bert_word_embed, buf.token_ids, buf.emb, T, 128, stream);
     add_f32(buf.emb, w.bert_pos_embed, buf.emb, T * 128, stream);
@@ -225,7 +181,7 @@ static void albert_forward(const Weights& w, AlbertBuffers& buf,
         // Multi-head attention: 12 heads, 64 dim each
         // scores[h] = Q_h @ K_h^T / sqrt(64)
         float scale = 1.0f / sqrtf(64.0f);
-        cutlass_gemm_batched_tn(T, T, 64,
+        backend_gemm_batched_tn(T, T, 64,
             K, 768, 64,
             Q, 768, 64,
             buf.attn_scores, T, (long long)T * T,
@@ -236,7 +192,7 @@ static void albert_forward(const Weights& w, AlbertBuffers& buf,
         softmax_f32(buf.attn_scores, buf.attn_scores, 12 * T, T, stream);
 
         // Attn output: context = scores @ V per head
-        cutlass_gemm_batched_nn(64, T, T,
+        backend_gemm_batched_nn(64, T, T,
             V, 768, 64,
             buf.attn_scores, T, (long long)T * T,
             buf.attn_out, 768, 64,
@@ -273,16 +229,16 @@ static void albert_forward(const Weights& w, AlbertBuffers& buf,
 // ---------------------------------------------------------------------------
 
 // Forward declaration
-static void bilstm_gpu(const float* d_input, float* d_output,
+static void bilstm_forward(const float* d_input, float* d_output,
                         const Weights::BiLSTMWeights& lstm_w,
                         int T, int input_size, int hidden_size,
-                        cudaStream_t stream, GpuArena& arena);
+                        rokoko::Stream stream, InferenceArena& arena);
 
 // Run text encoder: input_ids[T] -> output[T, 512]
 static void text_encoder_forward(const Weights& w, TextEncoderBuffers& buf,
                                   const int* token_ids_gpu,
-                                  cudaStream_t stream,
-                                  int T, GpuArena& arena,
+                                  rokoko::Stream stream,
+                                  int T, InferenceArena& arena,
                                   float* workspace = nullptr,
                                   size_t workspace_bytes = 0) {
     // Step 1: Embedding lookup -> [T, 512] — already in [T, C] layout
@@ -327,11 +283,11 @@ static void text_encoder_forward(const Weights& w, TextEncoderBuffers& buf,
     te_lstm_w.whh_fwd_f16 = w.text_lstm_whh_fwd_f16;
     te_lstm_w.wih_rev_f16 = w.text_lstm_wih_rev_f16;
     te_lstm_w.whh_rev_f16 = w.text_lstm_whh_rev_f16;
-    bilstm_gpu(x, buf.lstm_out, te_lstm_w, T, 512, 256, stream, arena);
+    bilstm_forward(x, buf.lstm_out, te_lstm_w, T, 512, 256, stream, arena);
 
     // Copy LSTM output back to emb for downstream use
-    cudaMemcpyAsync(buf.emb, buf.lstm_out, T * 512 * sizeof(float),
-                    cudaMemcpyDeviceToDevice, stream);
+    rokoko::device::copy_async(buf.emb, buf.lstm_out, T * 512 * sizeof(float),
+                    rokoko::device::device_to_device, stream);
     // Final result is in buf.emb [T, 512]
 }
 
@@ -345,10 +301,10 @@ static void text_encoder_forward(const Weights& w, TextEncoderBuffers& buf,
 //   3) Both directions, then interleave into output
 // ---------------------------------------------------------------------------
 
-static void bilstm_gpu(const float* d_input, float* d_output,
+static void bilstm_forward(const float* d_input, float* d_output,
                         const Weights::BiLSTMWeights& lstm_w,
                         int T, int input_size, int hidden_size,
-                        cudaStream_t stream, GpuArena& arena) {
+                        rokoko::Stream stream, InferenceArena& arena) {
     int G = 4 * hidden_size;  // gate_size
     int H = hidden_size;
 
@@ -361,7 +317,7 @@ static void bilstm_gpu(const float* d_input, float* d_output,
     float* d_h_zero  = arena.alloc<float>(H);
 
     // Helper: run one direction (FP16 weights directly)
-    auto run_direction = [&](const __half* wih_f16, const __half* whh_f16,
+    auto run_direction = [&](const rokoko::Half* wih_f16, const rokoko::Half* whh_f16,
                               const float* bias_combined,
                               float* d_h_all, bool reverse) {
         // Step 1: Pre-compute input gates for all timesteps (Cutlass GEMM)
@@ -372,8 +328,8 @@ static void bilstm_gpu(const float* d_input, float* d_output,
         bias_add_f32(d_ig, bias_combined, d_ig, T, G, stream);
 
         // Step 2: Per-timestep LSTM using GEMV for Whh @ h
-        CUDA_CHECK(cudaMemsetAsync(d_c, 0, H * sizeof(float), stream));
-        CUDA_CHECK(cudaMemsetAsync(d_h_zero, 0, H * sizeof(float), stream));
+        CUDA_CHECK(rokoko::device::zero(d_c, 0, H * sizeof(float), stream));
+        CUDA_CHECK(rokoko::device::zero(d_h_zero, 0, H * sizeof(float), stream));
 
         for (int step = 0; step < T; step++) {
             int t = reverse ? (T - 1 - step) : step;
@@ -395,16 +351,16 @@ static void bilstm_gpu(const float* d_input, float* d_output,
                   lstm_w.bias_rev, d_h_rev, true);
 
     // Interleave: d_output[t, 0:H] = h_fwd[t], d_output[t, H:2H] = h_rev[t]
-    CUDA_CHECK(cudaMemcpy2DAsync(
+    CUDA_CHECK(rokoko::device::copy_2d(
         d_output, 2 * H * sizeof(float),
         d_h_fwd, H * sizeof(float),
         H * sizeof(float), T,
-        cudaMemcpyDeviceToDevice, stream));
-    CUDA_CHECK(cudaMemcpy2DAsync(
+        rokoko::device::device_to_device, stream));
+    CUDA_CHECK(rokoko::device::copy_2d(
         d_output + H, 2 * H * sizeof(float),
         d_h_rev, H * sizeof(float),
         H * sizeof(float), T,
-        cudaMemcpyDeviceToDevice, stream));
+        rokoko::device::device_to_device, stream));
 
     arena.restore(arena_save);
 }
@@ -422,7 +378,7 @@ static void adain_1d_forward(const float* x, const float* style,
                               const Weights::AdaIN1dWeights& ain_w,
                               float* y, float* fc_buf, float* norm_ws,
                               int C, int T, int style_dim,
-                              cudaStream_t stream,
+                              rokoko::Stream stream,
                               const float* snake_alpha = nullptr) {
     sgemm_tn(2*C, 1, style_dim,
              ain_w.fc_w_f16, style_dim, style, style_dim, fc_buf, 2*C, stream);
@@ -446,7 +402,7 @@ static void adain_resblk1d_forward(const float* x, const float* style,
                                      float* fc_buf, float* y,
                                      int dim_in, int dim_out, int T,
                                      int style_dim,
-                                     cudaStream_t stream,
+                                     rokoko::Stream stream,
                                      float* workspace = nullptr,
                                      size_t workspace_bytes = 0) {
     int T_out = blk.has_upsample ? 2 * T : T;
@@ -461,15 +417,15 @@ static void adain_resblk1d_forward(const float* x, const float* style,
     if (blk.has_upsample) {
         conv_transpose1d_depthwise_f32(residual_buf, blk.pool_wv, blk.pool_b,
                                          shortcut_buf, dim_in, T, 3, 2, 1, 1, stream);
-        cudaMemcpyAsync(residual_buf, shortcut_buf, dim_in * T_out * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
+        rokoko::device::copy_async(residual_buf, shortcut_buf, dim_in * T_out * sizeof(float),
+                        rokoko::device::device_to_device, stream);
     }
 
     gemm_conv1d(residual_buf, blk.conv1_wv_nhwc_f16, blk.conv1_b, y,
                  workspace, workspace_bytes, dim_in, dim_out, T_out, 3,
                  1, 1, 1, stream, nullptr, blk.conv1_c_in_pad);
-    cudaMemcpyAsync(residual_buf, y, dim_out * T_out * sizeof(float),
-                    cudaMemcpyDeviceToDevice, stream);
+    rokoko::device::copy_async(residual_buf, y, dim_out * T_out * sizeof(float),
+                    rokoko::device::device_to_device, stream);
 
     norm_ws = fc_buf + 2 * dim_out;
     adain_1d_forward(residual_buf, style, blk.norm2, residual_buf, fc_buf, norm_ws,
@@ -484,16 +440,16 @@ static void adain_resblk1d_forward(const float* x, const float* style,
     if (blk.has_upsample) {
         upsample_nearest_1d_2x_f32(x, shortcut_buf, dim_in, T, stream);
     } else {
-        cudaMemcpyAsync(shortcut_buf, x, dim_in * T * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
+        rokoko::device::copy_async(shortcut_buf, x, dim_in * T * sizeof(float),
+                        rokoko::device::device_to_device, stream);
     }
 
     if (blk.has_shortcut) {
         gemm_conv1d(shortcut_buf, blk.conv1x1_wv_nhwc_f16, nullptr, residual_buf,
                      workspace, workspace_bytes, dim_in, dim_out, T_out, 1,
                      1, 0, 1, stream, nullptr, blk.conv1x1_c_in_pad);
-        cudaMemcpyAsync(shortcut_buf, residual_buf, dim_out * T_out * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
+        rokoko::device::copy_async(shortcut_buf, residual_buf, dim_out * T_out * sizeof(float),
+                        rokoko::device::device_to_device, stream);
     }
 
     // ---- Combine: (residual + shortcut) / sqrt(2) ----
@@ -637,7 +593,7 @@ static void adain_resblock1_forward(float* x, const float* style,
                                       float* xt_buf, float* conv_out_buf,
                                       float* fc_buf,
                                       int T, int style_dim,
-                                      cudaStream_t stream,
+                                      rokoko::Stream stream,
                                       float* workspace = nullptr,
                                       size_t workspace_bytes = 0) {
     int C = rb.channels;
@@ -670,6 +626,7 @@ static void adain_resblock1_forward(float* x, const float* style,
 // use the same device pointers on replay.
 // ---------------------------------------------------------------------------
 
+#ifndef ROKOKO_CPU
 static std::unordered_map<int, cudaGraphExec_t> s_encode_graph_cache;
 
 // Decode-phase CUDA graph cache: keyed by (T << 32 | L).
@@ -681,30 +638,35 @@ struct DecodeGraph {
     size_t audio_offset;  // byte offset of d_audio from decode_arena.base
 };
 static std::unordered_map<int64_t, DecodeGraph> s_decode_graph_cache;
+#endif
 static float* s_d_rand_ini = nullptr;  // persistent rand_ini on GPU (seed=42)
 
-extern "C" void clear_cutlass_gemm_cache();
-extern "C" void clear_cutlass_gemm_f16_cache();
-extern "C" void clear_cutlass_conv_f16_cache();
 static InferenceStats s_stats;
 static constexpr size_t MAX_GRAPHS = 64;
 InferenceStats inference_stats() {
-    auto out=s_stats; out.encode_graphs=s_encode_graph_cache.size();
-    out.decode_graphs=s_decode_graph_cache.size(); return out;
+    auto out=s_stats;
+#ifndef ROKOKO_CPU
+    out.encode_graphs=s_encode_graph_cache.size();
+    out.decode_graphs=s_decode_graph_cache.size();
+#endif
+    return out;
 }
 void clear_inference_graphs() {
+#ifndef ROKOKO_CPU
     for (auto& kv:s_encode_graph_cache) cudaGraphExecDestroy(kv.second);
     for (auto& kv:s_decode_graph_cache) cudaGraphExecDestroy(kv.second.exec);
-    s_encode_graph_cache.clear(); s_decode_graph_cache.clear(); ++s_stats.invalidations;
+    s_encode_graph_cache.clear(); s_decode_graph_cache.clear();
+#endif
+    ++s_stats.invalidations;
 }
 void release_inference_state(Weights& w) {
-    clear_cutlass_gemm_cache();
-    clear_cutlass_gemm_f16_cache();
-    clear_cutlass_conv_f16_cache();
+    clear_backend_gemm_cache();
+    clear_backend_gemm_f16_cache();
+    clear_backend_conv_f16_cache();
 
     clear_inference_graphs();
-    cudaFree(s_d_rand_ini); s_d_rand_ini=nullptr;
-    cudaFree(s_fp16_buf); s_fp16_buf=nullptr; s_fp16_buf_size=0;
+    rokoko::device::release(s_d_rand_ini); s_d_rand_ini=nullptr;
+    rokoko::device::release(s_fp16_buf); s_fp16_buf=nullptr; s_fp16_buf_size=0;
     s_workspace=nullptr; s_workspace_bytes=0; s_stats={};
 }
 
@@ -715,9 +677,9 @@ void release_inference_state(Weights& w) {
 std::vector<float> rokoko_infer(const Weights& w,
                                 const int* token_ids, int T,
                                 const float* style_vec,  // [256] on host
-                                cudaStream_t stream,
-                                GpuArena& arena,
-                                GpuArena& decode_arena,
+                                rokoko::Stream stream,
+                                InferenceArena& arena,
+                                InferenceArena& decode_arena,
                                 float* d_workspace,
                                 size_t workspace_bytes, InferenceTrace* trace) {
     if (T<3 || T>512) throw std::invalid_argument("token count outside 3..512");
@@ -754,12 +716,15 @@ std::vector<float> rokoko_infer(const Weights& w,
     int*   d_L             = arena.alloc<int>(1);
 
     // ---- H2D uploads (async, stream-ordered before encode graph) ----
-    CUDA_CHECK(cudaMemcpyAsync(d_token_ids, token_ids, T * sizeof(int),
-                                cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_ref_s, style_vec, 256 * sizeof(float),
-                                cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(rokoko::device::copy_async(d_token_ids, token_ids, T * sizeof(int),
+                                rokoko::device::host_to_device, stream));
+    CUDA_CHECK(rokoko::device::copy_async(d_ref_s, style_vec, 256 * sizeof(float),
+                                rokoko::device::host_to_device, stream));
 
     // ---- Encode phase: CUDA graph capture/replay ----
+#ifdef ROKOKO_CPU
+    { ++s_stats.encode_misses;
+#else
     auto git = s_encode_graph_cache.find(T);
     if (git == s_encode_graph_cache.end()) {
         ++s_stats.encode_misses;
@@ -769,9 +734,10 @@ std::vector<float> rokoko_infer(const Weights& w,
         }
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
 
+#endif
         // ALBERT encoder
-        cudaMemcpyAsync(albert_buf.token_ids, d_token_ids, T * sizeof(int),
-                        cudaMemcpyDeviceToDevice, stream);
+        rokoko::device::copy_async(albert_buf.token_ids, d_token_ids, T * sizeof(int),
+                        rokoko::device::device_to_device, stream);
         albert_forward(w, albert_buf, stream, T);
 
         // bert_encoder: Linear 768->512 -> d_en [T, 512]
@@ -788,7 +754,7 @@ std::vector<float> rokoko_infer(const Weights& w,
         concat_channels_f32(d_en, d_style_tiled, d_cat_buf, T, 512, 128, stream);
 
         for (int layer_i = 0; layer_i < 3; layer_i++) {
-            bilstm_gpu(d_cat_buf, d_lstm_out, w.dur_enc_lstm[layer_i],
+            bilstm_forward(d_cat_buf, d_lstm_out, w.dur_enc_lstm[layer_i],
                        T, 640, 256, stream, arena);
 
             auto& aln = w.dur_enc_aln[layer_i];
@@ -802,7 +768,7 @@ std::vector<float> rokoko_infer(const Weights& w,
         }
 
         // Duration LSTM + projection
-        bilstm_gpu(d_cat_buf, d_dur_lstm_out, w.dur_lstm,
+        bilstm_forward(d_cat_buf, d_dur_lstm_out, w.dur_lstm,
                    T, 640, 256, stream, arena);
         sgemm_bias(50, T, 512,
                    w.dur_proj_w_f16, 512, d_dur_lstm_out, 512, d_dur_proj, 50,
@@ -810,6 +776,7 @@ std::vector<float> rokoko_infer(const Weights& w,
         sigmoid_sum_f32(d_dur_proj, d_durations, T, 50, stream);
         round_clamp_durations_f32(d_durations, d_int_durations, d_L, T, stream);
 
+#ifndef ROKOKO_CPU
         cudaGraph_t graph;
         CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
         cudaGraphExec_t exec;
@@ -822,18 +789,21 @@ std::vector<float> rokoko_infer(const Weights& w,
         CUDA_CHECK(cudaGraphLaunch(git->second, stream));
     }
 
+#else
+    }
+#endif
     // Sync for L only (4 bytes) -- needed for decode arena sizing
     int L;
-    CUDA_CHECK(cudaMemcpyAsync(&L, d_L, sizeof(int), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(rokoko::device::copy_async(&L, d_L, sizeof(int), rokoko::device::device_to_host, stream));
+    CUDA_CHECK(rokoko::device::synchronize(stream));
     if (trace) {
         trace->durations.resize(T); trace->rounded.resize(T);
-        CUDA_CHECK(cudaMemcpy(trace->durations.data(),d_durations,T*sizeof(float),cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(trace->rounded.data(),d_int_durations,T*sizeof(int),cudaMemcpyDeviceToHost));
+        CUDA_CHECK(rokoko::device::copy(trace->durations.data(),d_durations,T*sizeof(float),rokoko::device::device_to_host));
+        CUDA_CHECK(rokoko::device::copy(trace->rounded.data(),d_int_durations,T*sizeof(int),rokoko::device::device_to_host));
         if (trace->force_frames) {
             if (trace->force_frames<T || trace->force_frames>10000) throw std::invalid_argument("invalid diagnostic frame count");
             trace->rounded.assign(T,1); trace->rounded[T/2]+=trace->force_frames-T; L=trace->force_frames;
-            CUDA_CHECK(cudaMemcpyAsync(d_int_durations,trace->rounded.data(),T*sizeof(int),cudaMemcpyHostToDevice,stream));
+            CUDA_CHECK(rokoko::device::copy_async(d_int_durations,trace->rounded.data(),T*sizeof(int),rokoko::device::host_to_device,stream));
         }
     }
     if (L<1 || L>25600) throw std::runtime_error("invalid predicted frame count");
@@ -848,9 +818,11 @@ std::vector<float> rokoko_infer(const Weights& w,
     size_t decode_bytes = compute_decode_bytes(T, L);
     if (decode_arena.capacity < decode_bytes) {
         // Arena grows -- invalidate all cached decode graphs
+#ifndef ROKOKO_CPU
         for (auto& [k, dg] : s_decode_graph_cache)
             CUDA_CHECK(cudaGraphExecDestroy(dg.exec));
         s_decode_graph_cache.clear();
+#endif
         ++s_stats.invalidations;
         decode_arena.destroy();
         decode_arena.init(decode_bytes);
@@ -866,11 +838,12 @@ std::vector<float> rokoko_infer(const Weights& w,
         std::mt19937 rng_ri(42);
         std::uniform_real_distribution<float> uni_ri(0.0f, 1.0f);
         for (int h = 1; h < 9; h++) ri[h] = uni_ri(rng_ri);
-        CUDA_CHECK(cudaMalloc(&s_d_rand_ini, 9 * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(s_d_rand_ini, ri, 9 * sizeof(float),
-                               cudaMemcpyHostToDevice));
+        CUDA_CHECK(rokoko::device::allocate(&s_d_rand_ini, 9 * sizeof(float)));
+        CUDA_CHECK(rokoko::device::copy(s_d_rand_ini, ri, 9 * sizeof(float),
+                               rokoko::device::host_to_device));
     }
 
+#ifndef ROKOKO_CPU
     // Decode graph cache: replay if available
     int64_t decode_key = ((int64_t)T << 32) | (int64_t)(unsigned int)L;
     auto dgit = s_decode_graph_cache.find(decode_key);
@@ -878,15 +851,15 @@ std::vector<float> rokoko_infer(const Weights& w,
         ++s_stats.decode_hits;
         float* d_audio = (float*)(decode_arena.base + dgit->second.audio_offset);
         CUDA_CHECK(cudaGraphLaunch(dgit->second.exec, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(rokoko::device::synchronize(stream));
         std::vector<float> audio(T_audio_actual);
-        cudaMemcpy(audio.data(), d_audio, T_audio_actual * sizeof(float),
-                   cudaMemcpyDeviceToHost);
+        rokoko::device::copy(audio.data(), d_audio, T_audio_actual * sizeof(float),
+                   rokoko::device::device_to_host);
 
         if (trace) {
             trace->f0.resize(L2);trace->noise.resize(L2);
-            CUDA_CHECK(cudaMemcpy(trace->f0.data(),decode_arena.base+dgit->second.f0_offset,L2*sizeof(float),cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(trace->noise.data(),decode_arena.base+dgit->second.noise_offset,L2*sizeof(float),cudaMemcpyDeviceToHost));
+            CUDA_CHECK(rokoko::device::copy(trace->f0.data(),decode_arena.base+dgit->second.f0_offset,L2*sizeof(float),rokoko::device::device_to_host));
+            CUDA_CHECK(rokoko::device::copy(trace->noise.data(),decode_arena.base+dgit->second.noise_offset,L2*sizeof(float),rokoko::device::device_to_host));
         }
         return audio;
     }
@@ -899,6 +872,9 @@ std::vector<float> rokoko_infer(const Weights& w,
     // First time for (T, L): capture decode graph
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
 
+#else
+    ++s_stats.decode_misses;
+#endif
     // Decode workspace (first alloc, matches compute_decode_bytes order)
     int har_frames_ws = (L2 * 300) / 5 + 1;
     size_t dec_ws_floats = (size_t)128 * 11 * har_frames_ws;
@@ -923,7 +899,7 @@ std::vector<float> rokoko_infer(const Weights& w,
 
     // Shared LSTM: d_en_expanded [L, 640] already row-major -- no transpose
     float* d_shared_out = decode_arena.alloc<float>(L * 512);
-    bilstm_gpu(d_en_expanded, d_shared_out, w.shared_lstm,
+    bilstm_forward(d_en_expanded, d_shared_out, w.shared_lstm,
                L, 640, 256, stream, decode_arena);
 
     // F0 and N prediction chains
@@ -939,8 +915,8 @@ std::vector<float> rokoko_infer(const Weights& w,
         float* d_fx = decode_arena.alloc<float>(512 * L2);
         float* d_fo = decode_arena.alloc<float>(512 * L2);
         // d_shared_out is [L, 512] -- already [T, C] layout, no transpose
-        cudaMemcpyAsync(d_fx, d_shared_out, L * 512 * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
+        rokoko::device::copy_async(d_fx, d_shared_out, L * 512 * sizeof(float),
+                        rokoko::device::device_to_device, stream);
 
         // block 0: [L, 512] -> [L, 512]
         adain_resblk1d_forward(d_fx, d_style_prosody, blocks[0],
@@ -948,15 +924,15 @@ std::vector<float> rokoko_infer(const Weights& w,
                                 512, 512, L, 128, stream,
                                 d_dec_workspace, dec_ws_bytes);
         // block 1: [L, 512] -> [2L, 256] (upsample)
-        cudaMemcpyAsync(d_fx, d_fo, 512 * L * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
+        rokoko::device::copy_async(d_fx, d_fo, 512 * L * sizeof(float),
+                        rokoko::device::device_to_device, stream);
         adain_resblk1d_forward(d_fx, d_style_prosody, blocks[1],
                                 d_res_buf, d_sc_buf, d_fc_buf, d_fo,
                                 512, 256, L, 128, stream,
                                 d_dec_workspace, dec_ws_bytes);
         // block 2: [2L, 256] -> [2L, 256]
-        cudaMemcpyAsync(d_fx, d_fo, 256 * L2 * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
+        rokoko::device::copy_async(d_fx, d_fo, 256 * L2 * sizeof(float),
+                        rokoko::device::device_to_device, stream);
         adain_resblk1d_forward(d_fx, d_style_prosody, blocks[2],
                                 d_res_buf, d_sc_buf, d_fc_buf, d_fo,
                                 256, 256, L2, 128, stream,
@@ -1027,8 +1003,8 @@ std::vector<float> rokoko_infer(const Weights& w,
             concat4_channels_f32(d_dec_x, d_asr_res, d_f0_down, d_n_down,
                                   d_dec_in, T_blk, 1024, 64, 1, 1, stream);
         } else {
-            cudaMemcpyAsync(d_dec_in, d_dec_x, dim_in_sizes[bi] * T_blk * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
+            rokoko::device::copy_async(d_dec_in, d_dec_x, dim_in_sizes[bi] * T_blk * sizeof(float),
+                            rokoko::device::device_to_device, stream);
         }
 
         int T_blk_out = w.dec_decode[bi].has_upsample ? 2 * T_blk : T_blk;
@@ -1094,8 +1070,8 @@ std::vector<float> rokoko_infer(const Weights& w,
     // Copy generator input into slot0
     float* d_gen_x = slot0;
     int T_gen = L2;
-    cudaMemcpyAsync(d_gen_x, d_dec_x, 512 * T_gen * sizeof(float),
-                    cudaMemcpyDeviceToDevice, stream);
+    rokoko::device::copy_async(d_gen_x, d_dec_x, 512 * T_gen * sizeof(float),
+                    rokoko::device::device_to_device, stream);
 
     int T_loop = T_gen;
     int gen_channels[] = {512, 256, 128};
@@ -1148,8 +1124,8 @@ std::vector<float> rokoko_infer(const Weights& w,
             reflection_pad_1d_f32(d_gen_tmp, d_gen_x, C_out, T_ups, 1, 0, stream);
             T_ups += 1;
         } else {
-            cudaMemcpyAsync(d_gen_x, d_gen_tmp, C_out * T_ups * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
+            rokoko::device::copy_async(d_gen_x, d_gen_tmp, C_out * T_ups * sizeof(float),
+                            rokoko::device::device_to_device, stream);
         }
 
         // Merge: x += src
@@ -1157,12 +1133,12 @@ std::vector<float> rokoko_infer(const Weights& w,
 
         // ResBlocks: reuse slot1 as rb_avg
         float* d_rb_avg = slot1;
-        CUDA_CHECK(cudaMemsetAsync(d_rb_avg, 0, C_out * T_ups * sizeof(float), stream));
+        CUDA_CHECK(rokoko::device::zero(d_rb_avg, 0, C_out * T_ups * sizeof(float), stream));
 
         for (int j = 0; j < 3; j++) {
             int rb_idx = i * 3 + j;
-            cudaMemcpyAsync(d_gen_tmp, d_gen_x, C_out * T_ups * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
+            rokoko::device::copy_async(d_gen_tmp, d_gen_x, C_out * T_ups * sizeof(float),
+                            rokoko::device::device_to_device, stream);
             adain_resblock1_forward(d_gen_tmp, d_style_acoustic, w.gen_resblocks[rb_idx],
                                     d_gen_xt, d_gen_co, d_gen_fc,
                                     T_ups, 128, stream,
@@ -1185,9 +1161,9 @@ std::vector<float> rokoko_infer(const Weights& w,
         int CK = 128 * 7;
         size_t col_floats = (size_t)CK * T_loop;
         // Cast im2col FP32 output to FP16 after the FP32 data in the workspace
-        __half* col_f16 = (__half*)(d_dec_workspace + col_floats);
+        rokoko::Half* col_f16 = (rokoko::Half*)(d_dec_workspace + col_floats);
         cast_f32_to_f16(d_dec_workspace, col_f16, (int)col_floats, stream);
-        cutlass_gemm_tn_f16(22, T_loop, CK, w.gen_conv_post_wv_f16, CK,
+        backend_gemm_tn_f16(22, T_loop, CK, w.gen_conv_post_wv_f16, CK,
                              col_f16, CK, d_gen_tmp, 22, 1.0f, 0.0f,
                              s_workspace, s_workspace_bytes, stream);
     }
@@ -1207,6 +1183,7 @@ std::vector<float> rokoko_infer(const Weights& w,
     float* d_audio = decode_arena.alloc<float>(T_audio);
     istft_f32(d_gen_tmp, d_gen_tmp + n_freqs * T_loop, d_audio,
               T_loop, 20, 5, T_audio, stream, d_stft_scratch);
+#ifndef ROKOKO_CPU
     // End decode graph capture
     cudaGraph_t decode_graph;
     CUDA_CHECK(cudaStreamEndCapture(stream, &decode_graph));
@@ -1218,37 +1195,41 @@ std::vector<float> rokoko_infer(const Weights& w,
     s_decode_graph_cache[decode_key] = {decode_exec, size_t((char*)d_f0_pred-decode_arena.base), size_t((char*)d_n_pred-decode_arena.base), audio_offset};
 
     CUDA_CHECK(cudaGraphLaunch(decode_exec, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(rokoko::device::synchronize(stream));
 
+#endif
     // Download audio (actual length, not padded)
     std::vector<float> audio(T_audio_actual);
-    cudaMemcpy(audio.data(), d_audio, T_audio_actual * sizeof(float),
-               cudaMemcpyDeviceToHost);
+    rokoko::device::copy(audio.data(), d_audio, T_audio_actual * sizeof(float),
+               rokoko::device::device_to_host);
 
     if (trace) {
         trace->f0.resize(L2); trace->noise.resize(L2);
-        CUDA_CHECK(cudaMemcpy(trace->f0.data(),d_f0_pred,L2*sizeof(float),cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(trace->noise.data(),d_n_pred,L2*sizeof(float),cudaMemcpyDeviceToHost));
+        CUDA_CHECK(rokoko::device::copy(trace->f0.data(),d_f0_pred,L2*sizeof(float),rokoko::device::device_to_host));
+        CUDA_CHECK(rokoko::device::copy(trace->noise.data(),d_n_pred,L2*sizeof(float),rokoko::device::device_to_host));
     }
     return audio;
 }
 
 // ---------------------------------------------------------------------------
-// Precompute weight norms: v2 file has everything pre-baked.
+// Initialize inference: v2 file has weight norms and conversions pre-baked.
 // Just assign FP16 pointers and allocate staging buffer.
 // ---------------------------------------------------------------------------
 
-void initialize_inference(Weights& w, cudaStream_t stream) {
+void initialize_inference(Weights& w, rokoko::Stream stream) {
+#ifdef ROKOKO_CPU
+    cpu::configure();
+#endif
     if (w.format_version!=2) throw std::runtime_error("wrong weights version for this binary (expected 2)");
     w.assign_v2_fp16_pointers();
     // Staging buffer sized for largest activation cast: generator resblock conv
     // at max ~90k frames * 128 channels * sizeof(half) ≈ 23 MB. Allocate 64 MB.
     s_fp16_buf_size = 64 * 1024 * 1024;
-    CUDA_CHECK(cudaMalloc(&s_fp16_buf, s_fp16_buf_size));
+    CUDA_CHECK(rokoko::device::allocate(&s_fp16_buf, s_fp16_buf_size));
 
     // Verify FP16 pointers were populated
     int n_f16 = 0;
-    auto chk = [&](const __half* p) { if (p) n_f16++; };
+    auto chk = [&](const rokoko::Half* p) { if (p) n_f16++; };
     chk(w.bert_proj_w_f16);
     chk(w.albert.q_w_f16); chk(w.albert.k_w_f16); chk(w.albert.v_w_f16);
     chk(w.albert.dense_w_f16); chk(w.albert.ffn_w_f16); chk(w.albert.ffn_out_w_f16);

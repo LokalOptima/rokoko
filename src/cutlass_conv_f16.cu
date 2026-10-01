@@ -202,7 +202,7 @@ static int dispatch_conv(CacheMap& cache,
 }
 
 // ---------------------------------------------------------------------------
-// cutlass_conv1d_fprop_f16
+// backend_conv1d_fprop_f16
 //   x: half_t [1, 1, T_in, C_in] NHWC
 //   w: half_t [C_out, 1, K, C_in] NHWC
 //   bias: float [C_out] or nullptr
@@ -213,7 +213,7 @@ static int dispatch_conv(CacheMap& cache,
 static constexpr int SM_COUNT = 70;  // RTX 5070 Ti
 
 extern "C"
-int cutlass_conv1d_fprop_f16(const __half* x, const __half* w, const float* bias,
+int backend_conv1d_fprop_f16(const __half* x, const __half* w, const float* bias,
                                float* y, const float* residual,
                                float* workspace, size_t workspace_bytes,
                                int C_in, int C_out, int T_in, int K,
@@ -272,7 +272,7 @@ int cutlass_conv1d_fprop_f16(const __half* x, const __half* w, const float* bias
         layout_x, layout_w, layout_y, layout_bias, stream);
 }
 
-extern "C" void clear_cutlass_conv_f16_cache() {
+extern "C" void clear_backend_conv_f16_cache() {
     s_fp16_large_cache.clear();
     s_fp16_small_cache.clear();
 }

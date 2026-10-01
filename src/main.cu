@@ -16,7 +16,7 @@
 #include <thread>
 #include <vector>
 
-#include <cuda_runtime.h>
+
 
 #include "rokoko.h"
 #include "server.h"
@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
             "  --stdout            Write WAV to stdout\n"
             "  --serve [port]      HTTP server with web UI (default: 8080)\n"
             "  --host <addr>       Server bind address (default: 0.0.0.0)\n"
-            "  -v                  Verbose output (timings, IPA, GPU info)\n"
+            "  -v                  Verbose output (model loading details)\n"
             "  --build-info        Print embedded asset identities (JSON)\n"
             "  --help              Show this help\n"
             "\n"

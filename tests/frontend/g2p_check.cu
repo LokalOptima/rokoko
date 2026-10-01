@@ -4,7 +4,10 @@
 #include <cstring>
 #include <iostream>
 #include <string>
-#include <cuda_runtime.h>
+#include "device.h"
+#ifdef ROKOKO_CPU
+#include "cpu/math.h"
+#endif
 
 bool g_verbose = false;
 #define vlog(...) do { if (g_verbose) fprintf(stderr, __VA_ARGS__); } while (0)
@@ -15,9 +18,12 @@ bool g_verbose = false;
 int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s model.bin [--normalize]\n", argv[0]); return 1; }
     bool normalize = argc > 2 && std::strcmp(argv[2], "--normalize") == 0;
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-    rokoko::G2PModelCuda g2p;
+#ifdef ROKOKO_CPU
+    rokoko::cpu::configure();
+#endif
+    rokoko::Stream stream;
+    rokoko::device::create_stream(&stream);
+    rokoko::G2PModel g2p;
     if (!g2p.load(argv[1], stream)) { fprintf(stderr, "load failed: %s\n", argv[1]); return 1; }
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -25,6 +31,6 @@ int main(int argc, char** argv) {
         printf("%s\n", text.empty() ? "" : g2p.infer(text, stream).c_str());
     }
     g2p.free();
-    cudaStreamDestroy(stream);
+    rokoko::device::destroy_stream(stream);
     return 0;
 }

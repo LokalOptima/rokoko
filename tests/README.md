@@ -77,6 +77,44 @@ Reports include source/binary hashes, artifact identities, inputs, settings and
 commands. Archive that directory to retain a run; ordinary reruns overwrite
 reports, never expected fixtures. `REPORT.md` records this implementation run.
 
+## CPU inference and CPU/CUDA comparison
+
+The fast `make test` helper checks remain independent of model inference. The
+CPU backend has separate numerical and integration checks:
+
+```sh
+make test-cpu-inference REFERENCE_PYTHON=.venv-tests/bin/python
+make test-cpu-parity REFERENCE_PYTHON=.venv-tests/bin/python
+python3 tests/bench.py --binary ./rokoko --binary ./rokoko.cpu --mixed 0 --repeats 5
+```
+
+`test-cpu-inference` needs a compiler, CMake, the pinned static OpenBLAS build,
+model assets, NumPy and `strace`. It does not require CUDA. It covers all half
+encodings and conversion tails, independent scalar/double matrix oracles,
+noncontiguous/batched layouts, convolution padding/stride/dilation/residuals,
+normalization, duration rounding and STFT roundtrips. Integration checks cover
+corrupt assets, exact frame boundaries, changed inputs/styles, arena growth,
+context recreation, deterministic repeat output, invalid requests, HTTP and
+streaming cancellation/recovery. The copied executable is exercised with no
+model files, blocked network access, unavailable caches and empty PATH.
+
+`test-cpu-parity` additionally needs the CUDA build and NumPy. It checks G2P pronunciation on 100 evenly sampled corpus sentences, then runs the 12
+existing quality fixtures and three benchmark texts through both backends,
+requiring identical normalization, phonemes, tokens, styles and rounded durations.
+It also checks finite output and exact sample counts. Engineering regression
+limits are: maximum duration difference 0.02 frames; F0 RMSE 0.25 Hz; noise RMSE
+0.01; audio RMS ratio 0.9–1.1; and relative L2 magnitude-spectrogram error <= 0.1
+(1024-sample Hann windows, 256-sample hop). Silence and half-amplitude negative
+controls must fail. These limits are explicit regression guards, not a listening
+study or proof of perceptual equivalence. Waveform correlation/differences are
+reported separately because small pitch changes accumulate phase differences.
+
+CPU/GPU reports and paired WAVs are in `tests/results/cpu-parity/`. Open its
+`index.html` for listening. CPU runtime contract evidence is in
+`tests/results/cpu-inference/`. Use `--cpu-runtime`/`--runtime` to select a custom
+CMake build directory. CPU weight conversion caches hold only model tensors and
+are cleared on context destruction; convolution scratch is bounded to 128 frames.
+
 ## Interface and lifetime contracts
 
 - Normalize text, then split into ordered UTF-8 spans before G2P. Trim boundary
@@ -89,20 +127,20 @@ reports, never expected fixtures. `REPORT.md` records this implementation run.
   generation and STFT. Cached STFT scratch belongs to the decode arena.
 - WAV is mono, 24 kHz, little-endian PCM16: clamp to [-1,1], multiply by 32767,
   truncate toward zero. Streaming emits finite little-endian float32 samples.
-  These describe this supported little-endian CUDA platform.
+  These describe the supported little-endian x86-64 CPU/CUDA platforms.
 - HTTP accepts a JSON object of string fields (`text` and optional
   `input: "phonemes"`). An obsolete `voice` field is rejected, including `af_heart`. Invalid requests return 400 before streaming
   starts. Later inference/write failures terminate the stream without a
   successful chunk terminator. A client must treat incomplete transfers as errors.
 - One live `TtsContext` and serialized calls are supported. A second live
   context is rejected explicitly. Sequential destruction/recreation is tested.
-  Each encode/decode/G2P graph cache holds at most 64 entries and clears when
+  On CUDA, each encode/decode/G2P graph cache holds at most 64 entries and clears when
   full; decode-arena growth also invalidates its captured graphs. The arena
   retains its largest allocation until context destruction.
 
 ## Limits of the results
 
-No waveform-tolerance gate is invented. Repeated audio differs slightly;
+The official-reference checks do not claim waveform equivalence. Repeated GPU audio differs slightly;
 reports expose this separately from exact tokens, styles, durations, shapes
 and stale-output checks. Atomic reductions remain a plausible source of
 variation, not a proven complete explanation. Reference captures are tested
