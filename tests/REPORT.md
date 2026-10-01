@@ -1,5 +1,66 @@
 # Implementation report — 2026-09-30
 
+## Experimental INT8 vocoder — evaluated 2026-10-01
+
+An isolated build quantizes the generator residual convolutions using INT8
+weights per output channel and dynamic INT8 activations per tensor. oneDNN
+verbose output confirms `brg_conv_fwd:avx2_vnni` with unsigned-byte activations
+and signed-byte weights. The rest of the pipeline retains FP32 arithmetic.
+Production inference sources, bundled assets and `rokoko.cpu` are unchanged;
+the experiment lives under `tests/experiments/` and builds into `build/int8/`.
+The executable still embeds FP16 assets and quantizes weights during preparation,
+so this trial measures compute changes, not a smaller download.
+
+Five accepted warm requests per build/text were alternated on the same i7-12700,
+eight workers, one request in flight and no affinity pinning. The existing guard
+waits for/rejects more than 0.5 competing CPU core. These are paired results from
+this run; compare the two columns rather than baselines from an earlier session.
+
+| Speech length | FP32 CPU | Experimental INT8 | INT8 RTFx | Less time |
+|---|---:|---:|---:|---:|
+| 1.575 s | 176.0 ms | 139.8 ms | 11.27× | 20.6% |
+| 5.725 s | 548.9 ms | 423.2 ms | 13.53× | 22.9% |
+| 18.825 s | 1972.1 ms | 1533.3 ms | 12.28× | 22.3% |
+
+The first request at the medium sentence length took 736.3 ms with INT8 versus
+830.5 ms with FP32. These are single observations of new-shape overhead, excluded
+from warm medians; INT8 still does not guarantee a half-second first response.
+
+Quality and correctness:
+
+- Pre-vocoder normalization, tokens, styles, raw/rounded durations, F0 and noise
+  match the FP32 CPU traces byte for byte on all 15 cases. Audio is finite and
+  sample counts are unchanged.
+- **Two of 15 cases fail the existing INT8/GPU spectral-error limit of 0.1:**
+  `reviewed_4` (0.11392) and the long benchmark (0.16294). Against FP32 CPU audio,
+  the long benchmark also exceeds 0.1 (0.14809). No thresholds were relaxed.
+- Local ASR produces identical FP32/INT8 transcripts on all 15 cases: each has
+  8 word errors out of 181 reference words. On the original 12 quality fixtures,
+  both have 8/103. This small diagnostic set does not establish perceptual
+  equivalence; ASR does not measure timbre or audio artifacts. No human listening
+  judgment has been made by this implementation.
+- Independent integer-oracle tests cover zero tensors/channels, tails, worker
+  boundaries, padding, dilation, stride, output guards, residual aliasing,
+  changed weights after cleanup and nonfinite-input/exception recovery. Release
+  tests pass with eight workers; ASan/UBSan pass with three. External static
+  libraries themselves were not sanitizer-instrumented.
+- The experimental binary passes the existing library lifecycle, frame-boundary,
+  deterministic repeat, context-recreation, invalid-asset, CLI/HTTP and streaming
+  recovery checks. Its per-weight plan cache retains only the current shape and
+  is cleared with the context.
+
+Conclusion: this selective INT8 trial saves about 21–23% of warm request time,
+but has **not passed the existing audio regression limits**. Keep FP32 as the
+default. Listening and further calibration or narrower layer selection are
+needed before deciding whether the speed/quality tradeoff is acceptable.
+
+Reproduction: `tests/experiments/README.md`. Evidence:
+`tests/results/int8-quality/report.json` and `index.html` (paired listening),
+`int8-bench/report.json` (all timing attempts and WAVs), `int8-inference/`, and
+`int8-validation/`. `build/int8/build.json` records the experimental sources,
+linked libraries and binary hashes. The build is checked to reproduce the
+measured binaries exactly.
+
 ## Direct CPU convolutions and shared workers — verified 2026-10-01
 
 The CPU forward pass now uses statically linked oneDNN 3.10.2 direct AVX2
