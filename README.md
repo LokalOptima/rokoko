@@ -13,6 +13,18 @@ at runtime.
 
 ## Build
 
+Choose the backend by building and running its executable:
+
+| Backend | Build | Run |
+|---|---|---|
+| NVIDIA GPU (CUDA, mixed precision) | `make rokoko` | `./rokoko "Hello world." --say` |
+| CPU (FP32 arithmetic) | `make cpu` | `./rokoko.cpu "Hello world." --say` |
+
+Both executables can coexist. Each has its backend built in; there is no runtime
+backend flag or automatic CPU/GPU fallback. For server mode, launch the chosen
+executable with `--serve 8080`; to switch, stop that server and start the other
+executable on the same port. `--build-info` reports an executable's backend.
+
 Both backends require Linux x86-64, a C++17 compiler, GNU binutils and Python 3
 (standard library only, for build-time asset preparation). The default CUDA build
 also requires an NVIDIA GPU, its driver and the CUDA toolkit.
