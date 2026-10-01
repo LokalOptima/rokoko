@@ -15,6 +15,9 @@ static void require(bool v, const char *msg) {
         throw std::runtime_error(msg);
 }
 static void close(float a, double b, double tol = 2e-5) {
+    if (!(std::isfinite(a) && std::abs(a - b) <= tol * (1 + std::abs(b))))
+        std::cerr << "actual=" << a << " expected=" << b << " difference=" << a - b
+                  << " tolerance=" << tol * (1 + std::abs(b)) << '\n';
     require(std::isfinite(a) && std::abs(a - b) <= tol * (1 + std::abs(b)), "numeric mismatch");
 }
 static float sample(int i) { return float((i * 37 % 101) - 50) / 53; }
@@ -180,6 +183,88 @@ static void convolutions() {
     for (int i = 0; i < 24; ++i)
         close(y[i], ref[i]);
 }
+static void style_normalization() {
+    // Independent two-pass statistics and scalar sine check vector lanes, tails,
+    // unaligned rows and in-place output, with and without the Snake activation.
+    for (int C : {1, 7, 8, 9, 15, 16, 17, 64})
+        for (int T : {1, 3, 33, 513})
+            for (bool snake : {false, true}) {
+                constexpr float eps = 1e-5f, guard = -123456.f;
+                std::vector<float> x(C * T + 2, guard), nw(C), nb(C), g(C), b(C), a(C);
+                for (int c = 0; c < C; ++c) {
+                    nw[c] = .8f + sample(c) * .3f;
+                    nb[c] = sample(c + 7);
+                    g[c] = sample(c + 3) * .2f;
+                    b[c] = sample(c + 9);
+                    a[c] = (c % 2 ? -1.f : 1.f) * (.1f + (c % 5) * 3.f);
+                    // Exercise range reduction beyond the small-angle sine path.
+                    if (c % 4 == 3)
+                        nb[c] += 10000.f;
+                    for (int t = 0; t < T; ++t)
+                        x[1 + t * C + c] = T == 1 ? 0.f : sample(t * C + c) + 3.f;
+                }
+                std::vector<float> expected(C * T);
+                for (int c = 0; c < C; ++c) {
+                    double mean = 0, variance = 0;
+                    for (int t = 0; t < T; ++t)
+                        mean += double(x[1 + t * C + c]) / T;
+                    for (int t = 0; t < T; ++t) {
+                        double d = x[1 + t * C + c] - mean;
+                        variance += d * d / T;
+                    }
+                    float inv = 1.f / std::sqrt(float(variance) + eps);
+                    float scale = (1 + g[c]) * nw[c] * inv;
+                    float bias =
+                        std::fma(1 + g[c], std::fma(-nw[c] * float(mean), inv, nb[c]), b[c]);
+                    for (int t = 0; t < T; ++t) {
+                        float v = std::fma(scale, x[1 + t * C + c], bias);
+                        if (snake) {
+                            float z = std::sin(a[c] * v);
+                            v += z * z / a[c];
+                        }
+                        expected[t * C + c] = v;
+                    }
+                }
+                for (bool inplace : {false, true}) {
+                    auto input = x;
+                    std::vector<float> output(x.size(), guard);
+                    float *y = (inplace ? input.data() : output.data()) + 1;
+                    instance_norm_style_affine_f32(input.data() + 1, nw.data(), nb.data(), g.data(),
+                                                   b.data(), y, nullptr, C, T, eps, nullptr,
+                                                   snake ? a.data() : nullptr);
+                    for (int i = 0; i < C * T; ++i) {
+                        try {
+                            close(y[i], expected[i], 3e-6);
+                        } catch (...) {
+                            std::cerr << "style normalization: C=" << C << " T=" << T
+                                      << " snake=" << snake << " inplace=" << inplace
+                                      << " index=" << i << '\n';
+                            throw;
+                        }
+                    }
+                    require(y[-1] == guard && y[C * T] == guard, "normalization wrote guards");
+                    if (!inplace)
+                        require(input == x, "normalization changed input");
+                }
+            }
+    // A nonfinite style must remain visible to the pipeline's rejection check;
+    // bad SIMD lanes must not contaminate adjacent finite channels.
+    constexpr int C = 17, T = 3;
+    for (int lane : {0, 7, 8, 16})
+        for (float bad :
+             {std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(),
+              std::numeric_limits<float>::quiet_NaN()}) {
+            std::vector<float> x(C * T, 0), zeros(C, 0), bias(C, 0), a(C, 1), y(C * T);
+            bias[lane] = bad;
+            instance_norm_style_affine_f32(x.data(), zeros.data(), zeros.data(), zeros.data(),
+                                           bias.data(), y.data(), nullptr, C, T, 1e-5f, nullptr,
+                                           a.data());
+            for (int t = 0; t < T; ++t)
+                for (int c = 0; c < C; ++c)
+                    require(c == lane ? !std::isfinite(y[t * C + c]) : y[t * C + c] == 0,
+                            "Snake nonfinite lane handling");
+        }
+}
 static void reductions_and_signal() {
     std::vector<float> x = {1000, 1001, 999, -1000, -999, -1001}, y(6), g = {1, 2, 3},
                        b = {.1f, .2f, .3f};
@@ -227,6 +312,7 @@ int main() {
         conversions();
         gemms();
         convolutions();
+        style_normalization();
         reductions_and_signal();
         std::cout << "PASS CPU SIMD conversions, BLAS layouts, convolution padding/residuals, "
                      "normalization and spectral roundtrip\n";

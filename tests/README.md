@@ -98,6 +98,11 @@ context recreation, deterministic repeat output, invalid requests, HTTP and
 streaming cancellation/recovery. The copied executable is exercised with no
 model files, blocked network access, unavailable caches and empty PATH.
 
+The style normalization/Snake checks compare SIMD results with a scalar sine
+oracle and independent two-pass statistics. They cover vector widths and tails,
+unaligned and in-place output, large sine arguments, guard regions, and isolated
+NaN/infinity lanes. No fast-math assumptions may hide nonfinite output.
+
 `test-cpu-parity` additionally needs the CUDA build and NumPy. It checks G2P pronunciation on 100 evenly sampled corpus sentences, then runs the 12
 existing quality fixtures and three benchmark texts through both backends,
 requiring identical normalization, phonemes, tokens, styles and rounded durations.
@@ -114,6 +119,23 @@ CPU/GPU reports and paired WAVs are in `tests/results/cpu-parity/`. Open its
 `tests/results/cpu-inference/`. Use `--cpu-runtime`/`--runtime` to select a custom
 CMake build directory. CPU weight conversion caches hold only model tensors and
 are cleared on context destruction; convolution scratch is bounded to 128 frames.
+
+For a CPU optimization, preserve the original executable before rebuilding and
+alternate requests between it and the new binary:
+
+```sh
+python3 tests/bench_cpu.py --before build/baseline.cpu --after ./rokoko.cpu \
+  --repeats 5 --output tests/results/cpu-comparison
+```
+
+This fixes the thread count (eight by default), clears inherited BLAS timeout
+overrides, excludes the first request for each text, and saves every WAV and
+timing. An equal 200 ms gap before each request lets either process's BLAS
+workers sleep before its competitor runs. Linux CPU counters make the driver
+wait for competing work to subside and reject affected request pairs; the
+default limit is 0.5 CPU core of other work. Rejected samples remain in the
+report. Use `--after-timeout` to test a wait policy separately. This reduces
+contamination, but cannot eliminate clock, temperature or scheduling variation.
 
 ## Interface and lifetime contracts
 

@@ -2,11 +2,15 @@
 #include "kernels.h"
 #include "cpu/math.h"
 #include <cblas.h>
+#include <immintrin.h>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <vector>
+// glibc's public x86 vector-function ABI (libmvec, linked through libm).
+// Explicit calls retain finite-value checks and avoid global fast-math flags.
+extern "C" __m256 _ZGVdN8v_sinf(__m256);
 namespace rokoko {
 static constexpr float pi = 3.14159265358979323846f;
 static float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
@@ -91,8 +95,20 @@ void instance_norm_style_affine_f32(const float *x, const float *nw, const float
         scale[c] = (1 + g[c]) * nw[c] * inv;
         bias[c] = (1 + g[c]) * (nb[c] - nw[c] * mean * inv) + b[c];
     }
-    for (int t = 0; t < T; ++t)
-        for (int c = 0; c < C; ++c) {
+    for (int t = 0; t < T; ++t) {
+        int c = 0;
+        for (; c + 8 <= C; c += 8) {
+            __m256 v =
+                _mm256_fmadd_ps(_mm256_loadu_ps(scale.data() + c), _mm256_loadu_ps(x + t * C + c),
+                                _mm256_loadu_ps(bias.data() + c));
+            if (snake) {
+                __m256 a = _mm256_loadu_ps(snake + c);
+                __m256 z = _ZGVdN8v_sinf(_mm256_mul_ps(a, v));
+                v = _mm256_add_ps(v, _mm256_div_ps(_mm256_mul_ps(z, z), a));
+            }
+            _mm256_storeu_ps(y + t * C + c, v);
+        }
+        for (; c < C; ++c) {
             float v = scale[c] * x[t * C + c] + bias[c];
             if (snake) {
                 float z = std::sin(snake[c] * v);
@@ -100,6 +116,7 @@ void instance_norm_style_affine_f32(const float *x, const float *nw, const float
             }
             y[t * C + c] = v;
         }
+    }
 }
 void gelu_f32(const float *x, float *y, int N, Stream) {
     for (int i = 0; i < N; ++i) {

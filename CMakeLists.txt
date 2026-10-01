@@ -44,6 +44,20 @@ set(ROKOKO_ASSET_DIR "${CMAKE_CURRENT_BINARY_DIR}/assets" CACHE PATH "Verified b
 set(ROKOKO_ASSET_SOURCE "" CACHE PATH "Optional local directory of approved model assets")
 option(ROKOKO_OFFLINE "Require local assets/dependencies; prohibit build downloads" OFF)
 if(ROKOKO_BACKEND STREQUAL "CPU")
+    include(CheckCXXSourceCompiles)
+    include(CMakePushCheckState)
+    cmake_push_check_state(RESET)
+    set(CMAKE_REQUIRED_FLAGS "-mavx2")
+    set(CMAKE_REQUIRED_LIBRARIES m)
+    check_cxx_source_compiles("
+        #include <immintrin.h>
+        extern \"C\" __m256 _ZGVdN8v_sinf(__m256);
+        int main() { return int(_mm256_cvtss_f32(_ZGVdN8v_sinf(_mm256_set1_ps(1.f)))); }
+    " ROKOKO_HAVE_VECTOR_SINE)
+    cmake_pop_check_state()
+    if(NOT ROKOKO_HAVE_VECTOR_SINE)
+        message(FATAL_ERROR "The CPU backend requires glibc libmvec with AVX2 vector sine support")
+    endif()
     include(cmake/OpenBLAS.cmake)
 endif()
 set(ASSET_ARGS --directory "${ROKOKO_ASSET_DIR}")

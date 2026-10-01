@@ -36,6 +36,7 @@ def provenance(binary=None, bundled=False):
     result['command_line']=__import__('sys').argv
     result['cpu']=command(['lscpu'])
     result['cpu_threads']=os.environ.get('ROKOKO_CPU_THREADS','default')
+    result['openblas_thread_timeout']=os.environ.get('OPENBLAS_THREAD_TIMEOUT','build default')
     files=[]
     for folder in ('src','tests','scripts','assets','cmake'):
         for path in sorted((ROOT/folder).rglob('*')):

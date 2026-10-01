@@ -48,11 +48,13 @@ cmake --build build/cmake -j2
 
 ### CPU build
 
-The CPU backend requires **AVX2, FMA and F16C** (tested on an Intel i7-12700).
+The CPU backend requires **AVX2, FMA and F16C** on Linux with glibc/libmvec
+(tested on an Intel i7-12700).
 It needs CMake 3.24+ and GNU Make, and does not need CUDA, an NVIDIA driver,
 CUTLASS or a GPU. OpenBLAS 0.3.30 is downloaded into the build directory with a
 pinned SHA-256 and linked statically. It supplies AVX2/FMA matrix kernels;
 F16C accelerates half-weight conversion. Convolutions use bounded im2col tiles.
+The sine-based activation uses glibc's AVX2 vector math, without fast-math flags.
 
 ```bash
 make cpu

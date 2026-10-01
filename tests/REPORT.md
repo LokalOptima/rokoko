@@ -1,5 +1,45 @@
 # Implementation report — 2026-09-30
 
+## AVX2 activation optimization — verified 2026-10-01
+
+The CPU style-affine/Snake loop now processes eight channels at once using AVX2
+and glibc's vector sine. Double-precision normalization statistics remain
+unchanged, scalar tails are retained, and fast-math remains disabled. The build
+checks for the vector-math ABI; the executable uses the system glibc/libmvec.
+The original OpenBLAS wait policy is retained. An experimental shorter wait
+was rejected after it caused substantial latency regressions under CPU
+contention; it is not part of the delivered executable.
+
+Validation passed: independent scalar/two-pass operator oracles, SIMD tails,
+unaligned and in-place output, nonfinite lanes, ASan/UBSan, all 15 CPU/CUDA
+synthesis cases, 100 G2P cases, deterministic lifecycle/frame-boundary tests,
+CLI/HTTP/streaming recovery, isolated standalone execution, and a separate CMake
+library consumer. The final default-policy build produced bit-identical
+intermediates and audio to the numerically validated wait-28 run.
+
+Direct comparison against the preserved original CPU build's 15 audio cases
+found a maximum relative magnitude-spectrogram error of 0.000378 (0.0378%).
+RMS ratios were 0.999983–1.000009; durations and sample counts were unchanged.
+The existing CPU/CUDA numerical limits also passed without alteration.
+
+Performance is measured on the i7-12700 with eight threads and one request in
+flight. The paired driver alternates builds, excludes initial requests, inserts
+an equal idle gap, and waits for/rejects competing CPU work above 0.5 core.
+Rejected attempts remain in the report; the earlier contended timing runs are
+not used for the reported speedup. Each result is the median of five accepted
+warm requests per build; startup and first-request latency are excluded.
+
+| Speech length | Before | SIMD | Less time |
+|---|---:|---:|---:|
+| 1.575 s | 417.2 ms | 269.9 ms | 35.3% |
+| 5.725 s | 1504.3 ms | 970.1 ms | 35.5% |
+| 18.825 s | 4941.1 ms | 3233.7 ms | 34.6% |
+
+Evidence: `tests/results/cpu-optimization-final/report.json` and its WAVs,
+`cpu-optimization-parity/`, `cpu-optimization-audio.json`,
+`cpu-optimization-inference/`, `cpu-optimization-default/`, and `cmake-cpu.json`.
+The original binary identity matches the saved pre-optimization audio report.
+
 ## SIMD CPU backend — verified 2026-10-01
 
 Added a CPU-only build alongside CUDA, sharing the forward pass, model parsing,
