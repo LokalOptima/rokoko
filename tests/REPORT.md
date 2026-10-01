@@ -1,5 +1,27 @@
 # Implementation report — 2026-09-30
 
+## Public build assets verified (2026-10-01)
+
+The approved G2P V11 bytes are now published as
+[`g2p.bin` in the `g2p-v11` release](https://github.com/LokalOptima/rokoko/releases/tag/g2p-v11)
+in the canonical public repository. The 34,630,156-byte asset has SHA-256
+`dfea20100c01c33d2ad3fa32e8ae09289b9ff3b3abf66ffe50686b4e44d7fd48`, matching
+the existing approval fixture and build manifest. The versioned weights and
+voice assets remain at their pinned `v2.0.1` URLs.
+
+A new CMake build directory, with no local asset source and no GitHub token
+environment variables, downloaded all three assets and built successfully.
+Downloaded sizes and SHA-256 hashes matched the manifest. The resulting binary
+passed the copied-executable CLI, HTTP and streaming checks with external
+connections denied, no model file reads and no extraction. The embedded ELF
+bytes also matched the approved hashes and occupied read-only aligned sections.
+Evidence is saved in `tests/results/release-assets.json`.
+
+The prior publication blocker is resolved. This was an asset-only release;
+its tag points to the existing public `v2.0.1` commit, and the latest software
+release remains unchanged. It does not publish the consolidated local source
+history or an executable.
+
 ## Single FP16 runtime (2026-10-01)
 
 The only maintained executable is now `rokoko`, using the former FP16 backend.
@@ -26,8 +48,8 @@ retained model are unchanged.
   exporter audit still passed against official Kokoro, and independent schema
   regeneration matched the checked-in FP16 schema byte for byte.
 - Orkestrator and the saved FP16/FP32 listening samples were left intact. The
-  previous G2P publication approval remains outstanding; local offline builds
-  work with the approved asset.
+  G2P publication was pending at that stage; it is resolved by the public
+  build-asset verification above.
 
 The sections below record earlier stages and historical two-runtime results.
 

@@ -65,9 +65,12 @@ Verified files are reused on subsequent builds. Corrupt files fail the build;
 the build never silently substitutes another model. Downloads are atomic and
 shared safely between parallel builds. `make clean` preserves downloaded assets.
 
-The canonical G2P release is staged for publication. Until it is published,
-fresh builds need the approved G2P file preseeded in the asset directory, or the
-local-source option below. The weights and voice download URLs are already verified.
+All three assets are public GitHub Release assets in this repository:
+[FP16 weights and af_heart](https://github.com/LokalOptima/rokoko/releases/tag/v2.0.1)
+and [G2P V11](https://github.com/LokalOptima/rokoko/releases/tag/g2p-v11).
+Build downloads need no GitHub account or token. A fresh CMake build with
+anonymous downloads and standalone synthesis has been verified; see the
+[test report](tests/REPORT.md#public-build-assets-verified-2026-10-01).
 
 To build from an existing directory of approved files, without downloads:
 
