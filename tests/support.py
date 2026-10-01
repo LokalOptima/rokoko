@@ -24,7 +24,7 @@ def command(args):
     p = subprocess.run(args, cwd=ROOT, text=True, capture_output=True, timeout=30)
     return p.stdout.strip() if p.returncode == 0 else p.stderr.strip()
 
-def provenance(binary=None):
+def provenance(binary=None, bundled=False):
     result = dict(date=command(['date', '-u', '+%FT%TZ']), commit=command(['git','rev-parse','HEAD']),
         dirty_patch_sha256=hashlib.sha256(command(['git','diff','HEAD']).encode()).hexdigest(),
         status=command(['git','status','--short']), gpu=command(['nvidia-smi',
@@ -32,30 +32,28 @@ def provenance(binary=None):
         '--format=csv,noheader']))
     result['command_line']=__import__('sys').argv
     files=[]
-    for folder in ('src','tests'):
+    for folder in ('src','tests','scripts','assets'):
         for path in sorted((ROOT/folder).rglob('*')):
             if path.is_file() and path.suffix in ('.cpp','.cu','.h','.py','.json','.tsv','.txt') and not any(x in path.parts for x in ('results','probe','models','__pycache__')):
                 files.append((str(path.relative_to(ROOT)),sha256(path)))
+    files += [(name,sha256(ROOT/name)) for name in ('Makefile','CMakeLists.txt')]
     result['source_files']=dict(files)
     if binary: result.update(binary=str(binary), binary_sha256=sha256(binary))
+    if binary and bundled: result['embedded_assets']=embedded_identity(binary)
     return result
 
 def model_args(parser):
-    cache = Path(os.environ.get('XDG_CACHE_HOME', str(Path.home()/'.cache'))) / 'rokoko'
+    cache = ROOT/'build/assets'
     parser.add_argument('--models', type=Path, default=cache)
     parser.add_argument('--g2p', type=Path)
     parser.add_argument('--voices', type=Path)
 
-def paths(args, binary):
-    return dict(weights=args.models / ('weights.fp16.bin' if 'fp16' in Path(binary).name else 'weights.bin'),
+def paths(args):
+    return dict(weights=args.models / 'weights.fp16.bin',
                 g2p=args.g2p or args.models/'g2p.bin', voices=args.voices or args.models/'voices')
 
-def model_flags(args, binary):
-    result=[]
-    for key, value in paths(args, binary).items():
-        if not value.exists(): raise FileNotFoundError(f'missing local {key}: {value}')
-        result += ['--'+key, str(value.resolve())]
-    return result
+def embedded_identity(binary):
+    return json.loads(subprocess.check_output([str(Path(binary).resolve()), '--build-info'], text=True))
 
 def idle_gpu():
     p = subprocess.run(['nvidia-smi','--query-compute-apps=pid,process_name', '--format=csv,noheader'],
@@ -83,15 +81,15 @@ def wav_info(data):
         return dict(samples=n, audio_seconds=n/24000, sha256=hashlib.sha256(data).hexdigest())
 
 @contextlib.contextmanager
-def server(binary, args, log, extra=()):
+def server(binary, args, log, extra=(), env=None, cwd=None, prefix=()):
     with socket.socket() as sock:
         sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]
     base=f'http://127.0.0.1:{port}'
     log.parent.mkdir(parents=True, exist_ok=True)
     start=time.perf_counter()
     with log.open('wb') as f:
-        process=subprocess.Popen([str(Path(binary).resolve()),'--serve',str(port),'--host','127.0.0.1',
-                                  *model_flags(args,binary), *extra],stdout=f,stderr=f)
+        process=subprocess.Popen([*prefix,str(Path(binary).resolve()),'--serve',str(port),'--host','127.0.0.1',
+                                  *extra],stdout=f,stderr=f,env=env,cwd=cwd)
         try:
             for _ in range(600):
                 if process.poll() is not None: raise RuntimeError(f'server exited {process.returncode}: {log.read_text()[-3000:]}')

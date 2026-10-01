@@ -29,11 +29,17 @@ frontend, pronunciation teacher, superseded runtime/normalizer copies, generated
 duplicate historical blog. Recovery bundles and source snapshots are kept
 outside this repository; these excluded paths are not supported features.
 
+The runtime now has one maintained FP16 implementation, `src/rokoko.cpp`,
+and one executable, `rokoko`. The older on-load conversion backend and its
+separate build/test paths were removed. FP32 export remains an offline input
+to the converter; official Kokoro remains the independent reference.
+
 The canonical source tree is organized as follows:
 
 - `src/`: native inference, text normalization, CLI, HTTP and library API.
 - `training/g2p/`: training, preparation, export and provenance.
-- `scripts/`: TTS weight export and FP16 conversion.
+- `assets/`: pinned build-download identities and locations.
+- `scripts/`: asset bundling, TTS weight export and FP16 conversion.
 - `tests/`: independent frontend, CPU, GPU, artifact and quality checks.
 
 There is one maintained branch, `main`. Upstream GitHub history has not been

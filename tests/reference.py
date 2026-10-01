@@ -43,25 +43,24 @@ def main():
     args=ap.parse_args();idle_gpu();model=load_model(args.official)
     report=dict(provenance=provenance(),torch=torch.__version__,cudnn_tf32=True,matmul_tf32=False,seed=42,
                 claim='Exact input/length assertions; numerical differences reported without an uncalibrated parity threshold.',cases=[])
-    for name in ('rokoko','rokoko.fp16'):
-        folders=[args.results/name/'library-af_heart/first'/x for x in ('a0','b','style_af_heart')]
-        for folder in folders:
-            ps=(folder/'phonemes.txt').read_text();voice=folder.name[6:] if folder.name.startswith('style_') else 'af_heart'
-            pack=torch.load(args.official/'voices'/(voice+'.pt'),map_location='cpu',weights_only=True)
-            style=pack[len(ps)-1].cuda()
-            assert np.array_equal(style.cpu().numpy().ravel(),np.fromfile(folder/'style.f32',dtype='<f4'))
-            plain=run(model,ps,style);captured=run(model,ps,style,True);reinjected=run(model,ps,style,True,captured)
-            assert np.array_equal(plain['audio'],captured['audio']), 'instrumentation changes official output'
-            assert np.array_equal(plain['audio'],reinjected['audio']), 're-injection changes official output'
-            row=dict(binary=name,case=folder.name,voice=voice,phonemes=ps,instrumentation='neutral; full prosody inputs re-injected',errors={})
-            for field,dtype in [('duration','<f4'),('rounded','<i4'),('f0','<f4'),('noise','<f4')]:
-                actual=np.fromfile(folder/(field+('.i32' if dtype=='<i4' else '.f32')),dtype=dtype);expected=captured[field]
-                row['errors'][field]=dict(rokoko_count=len(actual),official_count=len(expected))
-                if len(actual)==len(expected):
-                    delta=actual.astype(float)-expected.astype(float)
-                    row['errors'][field].update(max_abs=float(np.max(np.abs(delta))),rms=float(np.sqrt(np.mean(delta**2))))
-                    if field in ('duration','rounded'): row['errors'][field].update(rokoko=actual.tolist(),official=expected.tolist(),delta=delta.tolist())
-                expected.astype(dtype).tofile(folder/('official_'+field+('.i32' if dtype=='<i4' else '.f32')))
-            report['cases'].append(row)
+    folders=[args.results/'rokoko/library-af_heart/first'/x for x in ('a0','b','style_af_heart')]
+    for folder in folders:
+        ps=(folder/'phonemes.txt').read_text();voice=folder.name[6:] if folder.name.startswith('style_') else 'af_heart'
+        pack=torch.load(args.official/'voices'/(voice+'.pt'),map_location='cpu',weights_only=True)
+        style=pack[len(ps)-1].cuda()
+        assert np.array_equal(style.cpu().numpy().ravel(),np.fromfile(folder/'style.f32',dtype='<f4'))
+        plain=run(model,ps,style);captured=run(model,ps,style,True);reinjected=run(model,ps,style,True,captured)
+        assert np.array_equal(plain['audio'],captured['audio']), 'instrumentation changes official output'
+        assert np.array_equal(plain['audio'],reinjected['audio']), 're-injection changes official output'
+        row=dict(binary='rokoko',case=folder.name,voice=voice,phonemes=ps,instrumentation='neutral; full prosody inputs re-injected',errors={})
+        for field,dtype in [('duration','<f4'),('rounded','<i4'),('f0','<f4'),('noise','<f4')]:
+            actual=np.fromfile(folder/(field+('.i32' if dtype=='<i4' else '.f32')),dtype=dtype);expected=captured[field]
+            row['errors'][field]=dict(rokoko_count=len(actual),official_count=len(expected))
+            if len(actual)==len(expected):
+                delta=actual.astype(float)-expected.astype(float)
+                row['errors'][field].update(max_abs=float(np.max(np.abs(delta))),rms=float(np.sqrt(np.mean(delta**2))))
+                if field in ('duration','rounded'): row['errors'][field].update(rokoko=actual.tolist(),official=expected.tolist(),delta=delta.tolist())
+            expected.astype(dtype).tofile(folder/('official_'+field+('.i32' if dtype=='<i4' else '.f32')))
+        report['cases'].append(row)
     save_report(args.output,report);print('PASS reference instrumentation and exact styles. Numerical differences recorded, not waived.')
 if __name__=='__main__':main()

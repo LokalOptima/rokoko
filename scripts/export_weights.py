@@ -70,7 +70,7 @@ def export_weights(output_path: Path, official: Path) -> dict[str, np.ndarray]:
         count, nbytes = groups[prefix]
         print(f"  {prefix:20s} {count:4d} tensors  {nbytes / 1e6:8.1f} MB")
 
-    # The native FP32 runtime consumes the original FP32 state dict.
+    # Keep an exact FP32 intermediate for offline conversion to the runtime format.
     print("\nKeeping FP32 weights...")
     for name, arr in list(all_tensors.items()):
         if arr.dtype == np.float64:

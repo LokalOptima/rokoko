@@ -4,7 +4,7 @@
 // Filter weights: half_t (pre-converted at startup).
 // Accumulator: float.  Output: float.
 // MMA instruction: 16×8×16 FP16 TensorOp on SM80+.
-// Operator caching same as cutlass_conv.cu.
+// Operators are cached by problem shape and reuse their workspace.
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>

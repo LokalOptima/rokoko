@@ -1,4 +1,4 @@
-// rokoko_common.h — Shared code between rokoko.cpp (FP32) and rokoko_f16.cpp (FP16)
+// rokoko_common.h — Inference buffers and audio utilities
 //
 // Contains: AlbertBuffers, TextEncoderBuffers, write_wav, compute_decode_bytes.
 

@@ -1,5 +1,72 @@
 # Implementation report — 2026-09-30
 
+## Single FP16 runtime (2026-10-01)
+
+The only maintained executable is now `rokoko`, using the former FP16 backend.
+The old runtime converted many FP32 weights to FP16 during initialization; it was
+not an independent full-precision numerical reference. Official Kokoro remains
+the independent reference. FP32 intermediate values/operations used by the
+retained model are unchanged.
+
+- Removed the legacy inference backend, its unused TF32 convolution source,
+  v1 runtime schema, precision switches, duplicate executable/test targets and
+  their generated build outputs. `src/rokoko.cpp` is the one implementation.
+- Builds and ordinary GPU tests require exactly `weights.fp16.bin`, `g2p.bin`
+  and `voices/af_heart.bin`. The FP32 export is now optional offline tooling;
+  its approved identity is retained separately under `export_inputs`.
+- CPU checks passed (14 existing checks, bounded-reader check, 3 build-input
+  checks). The complete single-runtime GPU/reference/mutation target passed,
+  including all 585 independently derived converted tensors and long-input,
+  graph replay, style, lifecycle and HTTP coverage.
+- Make and CMake standalone checks passed with outbound connections denied and
+  no external model reads or extraction. A freshly built library-only consumer
+  initialized and synthesized without asset paths. The Make binary is
+  202,092,448 bytes on the recorded toolchain.
+- The native loader rejected the old valid v1 FP32 artifact. The optional offline
+  exporter audit still passed against official Kokoro, and independent schema
+  regeneration matched the checked-in FP16 schema byte for byte.
+- Orkestrator and the saved FP16/FP32 listening samples were left intact. The
+  previous G2P publication approval remains outstanding; local offline builds
+  work with the approved asset.
+
+The sections below record earlier stages and historical two-runtime results.
+
+## Embedded-asset update (2026-10-01)
+
+Rokoko now embeds one selected precision's weights, G2P V11 and af_heart, with
+no runtime model paths, downloads or voice selection. Orkestrator was left
+untouched at the user's request; its integration needs adapting separately.
+
+Validation for this update:
+
+- Make FP16/FP32 and CMake FP16/FP32 builds passed. A separate CMake project
+  linking only `rokoko_lib` initialized and synthesized without asset paths.
+- The actual embedded ELF bytes match the approved SHA-256 identities, are
+  4096-byte aligned and reside in read-only load segments. Binary sizes with
+  this toolchain are about 203 MB FP16 and 367 MB FP32.
+- Copied executables passed CLI, HTTP and streaming synthesis with an empty
+  PATH, unavailable HOME/cache directories and every outbound `connect` syscall
+  denied. File traces showed no external model reads or temporary extraction.
+- All 14 existing CPU checks, bounded byte-reader checks and 3 build-preparation
+  tests passed. Concurrent input preparation, checksum failures, atomic download
+  promotion and offline reuse are covered. A real Make invocation rejected a
+  corrupt asset despite an already-built executable. Unchanged Make and CMake
+  builds reverified inputs without recompiling or relinking.
+- Both GPU suites passed, including malformed memory inputs, styles, exact
+  lengths, graph replay, context recreation, cancellation and long inputs.
+- Independent audit passed all 688 FP32 and 585 converted tensors, af_heart,
+  vocabulary and G2P V11 identity. Reference instrumentation and both deliberate
+  production padding mutations passed their intended checks.
+- G2P evaluator results stayed at 980/1000 stress-sensitive matches and
+  991/1000 plain-sentence matches; normalizer 115/115 and reviewed snapshots
+  450/450. The same two handwritten end-to-end pronunciation misses remain.
+- Anonymous fresh downloads of FP16 weights and af_heart passed checksum
+  verification. The exact V11 G2P asset and release notes are staged locally;
+  public G2P download verification awaits permission to publish that asset.
+
+The historical measurements below are retained; no new perceptual equivalence
+claim or performance gate is introduced by bundling.
+
 Implemented on `test/regression-suite`, based on `fix/frontend`. The generated evidence is in `tests/results/`; commands and preparation are in [README.md](README.md).
 
 ## Voice scope update

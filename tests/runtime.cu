@@ -10,9 +10,9 @@ static void require(bool ok,const std::string& msg) {if(!ok) throw std::runtime_
 template<class T> void dump(const fs::path& p,const std::vector<T>& v) {
     std::ofstream f(p,std::ios::binary);f.write((const char*)v.data(),v.size()*sizeof(T));require(f.good(),"dump failed");
 }
-static void record(TtsPipeline& pipe,const Chunk& c,const std::string& voice,const fs::path& out,int frames=0) {
+static void record(TtsPipeline& pipe,const Chunk& c,const fs::path& out,int frames=0) {
     fs::create_directories(out);
-    auto style=pipe.style_for(c,voice);
+    auto style=pipe.style_for(c);
     dump(out/"tokens.i32",c.tokens);dump(out/"style.f32",std::vector<float>(style,style+256));
     std::ofstream(out/"phonemes.txt")<<c.phonemes;
     InferenceTrace trace;trace.force_frames=frames;
@@ -32,19 +32,30 @@ static void record(TtsPipeline& pipe,const Chunk& c,const std::string& voice,con
 }
 int main(int argc,char** argv) {
     try {
-        if(argc<5) throw std::runtime_error("runtime WEIGHTS G2P VOICES OUT [TEXT_FILE VOICE]");
-        fs::path root=argv[4];fs::create_directories(root);
-        for(int context=0;context<(argc>5?1:2);++context) {
-            TtsContext ctx;require(ctx.init(argv[1],argv[2],argv[3]),ctx.last_error);
-            require(ctx.voices.size()==1 && ctx.voices.count("af_heart"),"only af_heart must be loaded");
+        if (argc==5 && std::string(argv[1])=="--check-assets") {
+            std::vector<unsigned char> buffers[3];
+            for (int i=0;i<3;++i) {
+                std::ifstream f(argv[i+2],std::ios::binary);
+                require(bool(f),"missing asset");
+                buffers[i]=std::vector<unsigned char>(std::istreambuf_iterator<char>(f),{});
+            }
+            ModelAssets assets{{buffers[0].data(),buffers[0].size()},
+                {buffers[1].data(),buffers[1].size()},{buffers[2].data(),buffers[2].size()}};
+            TtsContext ctx;require(ctx.init(assets),ctx.last_error);
+            return 0;
+        }
+        if(argc<2 || argc>3) throw std::runtime_error("runtime OUT [TEXT_FILE] or --check-assets WEIGHTS G2P VOICE_FILE");
+        fs::path root=argv[1];fs::create_directories(root);
+        for(int context=0;context<(argc>2?1:2);++context) {
+            TtsContext ctx;require(ctx.init(),ctx.last_error);
             auto pipe=ctx.pipeline();
-            if(argc>5) {
-                std::ifstream f(argv[5]);require(bool(f),"missing input file");
+            if(argc>2) {
+                std::ifstream f(argv[2]);require(bool(f),"missing input file");
                 std::string text((std::istreambuf_iterator<char>(f)),{});
-                TtsPipeline::Prepared prepared;auto error=pipe.prepare(text,argv[6],prepared);require(error.empty(),error);
+                TtsPipeline::Prepared prepared;auto error=pipe.prepare(text,prepared);require(error.empty(),error);
                 std::ofstream(root/"normalized.txt")<<prepared.normalized;
                 std::ofstream spans(root/"spans.tsv");for(auto span:prepared.source_spans) spans<<span.begin<<'\t'<<span.end<<'\n';
-                for(size_t i=0;i<prepared.chunks.size();++i) record(pipe,prepared.chunks[i],argv[6],root/std::to_string(i));
+                for(size_t i=0;i<prepared.chunks.size();++i) record(pipe,prepared.chunks[i],root/std::to_string(i));
                 break;
             }
             fs::path out=root/((context==0)?"first":"recreated");
@@ -53,31 +64,27 @@ int main(int argc,char** argv) {
             // A repeated five times, changed input at identical T, changed style, A again.
             require(a.tokens.size()==b.tokens.size(),"same-key fixture token lengths");
             auto styled=a;styled.phonemes+="☃"; // Same tokens; next official style row before filtering.
-            for(int i=0;i<5;++i) record(pipe,a,"af_heart",out/("a"+std::to_string(i)));
-            record(pipe,b,"af_heart",out/"b");record(pipe,styled,"af_heart",out/"style_change");
-            record(pipe,a,"af_heart",out/"aba");
-            clear_inference_graphs();record(pipe,a,"af_heart",out/"isolated");
-            record(pipe,a,"af_heart",out/"key_a",64);
+            for(int i=0;i<5;++i) record(pipe,a,out/("a"+std::to_string(i)));
+            record(pipe,b,out/"b");record(pipe,styled,out/"style_change");
+            record(pipe,a,out/"aba");
+            clear_inference_graphs();record(pipe,a,out/"isolated");
+            record(pipe,a,out/"key_a",64);
             auto hits=inference_stats().decode_hits;
-            record(pipe,b,"af_heart",out/"key_b",64);
-            record(pipe,styled,"af_heart",out/"key_style",64);
-            record(pipe,a,"af_heart",out/"key_aba",64);
+            record(pipe,b,out/"key_b",64);
+            record(pipe,styled,out/"key_style",64);
+            record(pipe,a,out/"key_aba",64);
             require(inference_stats().decode_hits==hits+3,"changed-input decode replay not exercised");
-            for(int frames:{31,32,33,63,64,65,127,128,129}) record(pipe,a,"af_heart",out/("frames"+std::to_string(frames)),frames);
-            auto large=chunk_ipa(std::string(300,'a')).at(0);record(pipe,large,"af_heart",out/"grow");
-            record(pipe,a,"af_heart",out/"after_growth");
-            for(auto voice:{"af_heart"}) {
-                auto unknown=chunk_ipa("hɛlˈoʊ☃").at(0);record(pipe,unknown,voice,out/(std::string("style_")+voice));
-            }
-            std::vector<float> audio;require(!pipe.synthesize("  ","af_heart",audio).empty() && audio.empty(),"empty input must fail");
-            for (auto voice : {"absent", "af_bella", "af_nicole", "af_sky"})
-                require(!pipe.synthesize("hi",voice,audio).empty(),"unsupported voice must fail");
-            require(!pipe.synthesize("\xff","af_heart",audio).empty(),"invalid UTF-8 must fail");
-            require(!pipe.synthesize("☃","af_heart",audio,true).empty(),"all-unknown IPA must fail");
-            auto err=pipe.synthesize_streaming("Hello world.","af_heart",[](const float*,size_t){return false;});
+            for(int frames:{31,32,33,63,64,65,127,128,129}) record(pipe,a,out/("frames"+std::to_string(frames)),frames);
+            auto large=chunk_ipa(std::string(300,'a')).at(0);record(pipe,large,out/"grow");
+            record(pipe,a,out/"after_growth");
+            auto unknown=chunk_ipa("hɛlˈoʊ☃").at(0);record(pipe,unknown,out/"style_af_heart");
+            std::vector<float> audio;require(!pipe.synthesize("  ",audio).empty() && audio.empty(),"empty input must fail");
+            require(!pipe.synthesize("\xff",audio).empty(),"invalid UTF-8 must fail");
+            require(!pipe.synthesize("☃",audio,true).empty(),"all-unknown IPA must fail");
+            auto err=pipe.synthesize_streaming("Hello world.",[](const float*,size_t){return false;});
             require(err=="synthesis cancelled","cancellation must propagate");
-            require(pipe.synthesize("Hello again.","af_heart",audio).empty() && !audio.empty(),"request after cancellation");
-            TtsContext other;require(!other.init(argv[1],argv[2],argv[3]),"simultaneous contexts must be rejected");
+            require(pipe.synthesize("Hello again.",audio).empty() && !audio.empty(),"request after cancellation");
+            TtsContext other;require(!other.init(),"simultaneous contexts must be rejected");
         }
         std::cout<<"PASS library contracts and true frame boundaries\n";return 0;
     } catch(const std::exception& e) {std::cerr<<"FAIL: "<<e.what()<<'\n';return 1;}

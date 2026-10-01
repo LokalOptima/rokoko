@@ -3,7 +3,7 @@
 // Pipeline: text → preprocess → G2P infer → tokenize → chunk → TTS infer → WAV
 //
 // Build: make rokoko
-// Usage: ./rokoko "Hello world." -o output.wav --voice af_heart
+// Usage: ./rokoko "Hello world." -o output.wav
 //        ./rokoko --serve 8080
 
 #include <chrono>
@@ -14,15 +14,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
-
-#include <dirent.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <sys/mman.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 #include <cuda_runtime.h>
 
@@ -32,21 +24,6 @@
 bool g_verbose = false;
 
 using namespace rokoko;
-
-// Backend-specific: each binary provides its own weights filename + expected size
-extern const char* default_weights_filename();
-extern size_t default_weights_size();
-
-// Release base URL — single source of truth for all downloads
-static const char* RELEASE_BASE = "https://github.com/LokalOptima/rokoko/releases/download/v2.1.0/";
-
-static const char* G2P_FILENAME = "g2p.bin";
-static const size_t G2P_SIZE = 34630156;  // G2P V11 (md5 98dbb7bb697565d131a565ac644ae5da)
-static const size_t VOICE_SIZE = 522240;  // af_heart: 510 rows of 256 float32 values
-
-static std::string release_url(const std::string& filename) {
-    return std::string(RELEASE_BASE) + filename;
-}
 
 // ---------------------------------------------------------------------------
 // main
@@ -59,17 +36,14 @@ int main(int argc, char** argv) {
             "       %s --serve [port] [options]\n"
             "\n"
             "Options:\n"
-            "  --voice <name>      Voice (only: af_heart)\n"
             "  -o <file>           Output WAV (default: output.wav)\n"
             "  --phonemes          Treat input as IPA (bypass normalization/G2P)\n"
             "  --say               Play audio through speakers\n"
             "  --stdout            Write WAV to stdout\n"
             "  --serve [port]      HTTP server with web UI (default: 8080)\n"
             "  --host <addr>       Server bind address (default: 0.0.0.0)\n"
-            "  --weights <file>    TTS weight file (default: ~/.cache/rokoko/%s)\n"
-            "  --g2p <file>        G2P model file (default: ~/.cache/rokoko/g2p.bin)\n"
-            "  --voices <dir>      Voice directory (default: ~/.cache/rokoko/voices)\n"
             "  -v                  Verbose output (timings, IPA, GPU info)\n"
+            "  --build-info        Print embedded asset identities (JSON)\n"
             "  --help              Show this help\n"
             "\n"
             "Examples:\n"
@@ -77,27 +51,23 @@ int main(int argc, char** argv) {
             "  %s \"Hello world.\" --say\n"
             "  %s \"Hello world.\" --stdout | aplay\n"
             "  %s --serve 8080\n",
-            argv[0], argv[0], default_weights_filename(),
+            argv[0], argv[0],
             argv[0], argv[0], argv[0], argv[0]);
     };
 
     if (argc < 2) { print_usage(); return 1; }
 
     for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--build-info") {
+            auto info=embedded_build_info();
+            return fwrite(info.data,1,info.size,stdout)==info.size ? 0 : 1;
+        }
         if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
             print_usage(); return 0;
         }
     }
 
-    std::string cache = cache_dir();
-    std::string weights_path = cache + "/" + default_weights_filename();
-    std::string g2p_path = cache + "/" + G2P_FILENAME;
-    std::string voices_dir = cache + "/voices";
-    // Files given explicitly are used as-is: never size-checked, deleted or
-    // replaced by a download (a G2P model of a different size is not corrupt).
-    bool user_weights = false, user_g2p = false, user_voices = false;
     std::string text_input;
-    std::string voice_name = "af_heart";
     std::string output_path = "output.wav";
     bool say_mode = false, phonemes_mode = false;
     bool serve_mode = false;
@@ -106,11 +76,7 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--weights" && i + 1 < argc)      { weights_path = argv[++i]; user_weights = true; }
-        else if (arg == "--g2p" && i + 1 < argc)     { g2p_path = argv[++i]; user_g2p = true; }
-        else if (arg == "--voices" && i + 1 < argc)   { voices_dir = argv[++i]; user_voices = true; }
-        else if (arg == "--voice" && i + 1 < argc)    voice_name = argv[++i];
-        else if (arg == "-o" && i + 1 < argc)         output_path = argv[++i];
+        if (arg == "-o" && i + 1 < argc) output_path = argv[++i];
         else if (arg == "--phonemes") phonemes_mode = true;
         else if (arg == "--stdout")                    output_path = "-";
         else if (arg == "--say")                      say_mode = true;
@@ -135,43 +101,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // --- Auto-download missing or corrupt files ---
-    {
-        struct Download { std::string path; std::string url; std::string label; size_t expected_size; bool user_given; };
-        std::vector<Download> needed;
-        needed.push_back({weights_path, release_url(default_weights_filename()),
-                          "weights", default_weights_size(), user_weights});
-        needed.push_back({g2p_path, release_url(G2P_FILENAME), "g2p", G2P_SIZE, user_g2p});
-        needed.push_back({voices_dir + "/" + SUPPORTED_VOICE + ".bin",
-                          release_url(std::string(SUPPORTED_VOICE) + ".bin"),
-                          std::string("voice ") + SUPPORTED_VOICE, VOICE_SIZE, user_voices});
-
-        for (auto& f : needed) {
-            if (f.user_given) {
-                if (!file_ok(f.path)) {
-                    fprintf(stderr, "Error: %s file not found: %s\n", f.label.c_str(), f.path.c_str());
-                    return 1;
-                }
-                continue;
-            }
-            if (!file_ok(f.path, f.expected_size)) {
-                fprintf(stderr, "%s not found at %s — downloading...\n", f.label.c_str(), f.path.c_str());
-                if (!download_file(f.url, f.path)) {
-                    fprintf(stderr, "Error: failed to download %s\n", f.label.c_str());
-                    return 1;
-                }
-            }
-        }
-    }
-
     TtsContext ctx;
-    if (!ctx.init(weights_path,g2p_path,voices_dir)) {
+    if (!ctx.init()) {
         fprintf(stderr,"Error: %s\n",ctx.last_error.c_str());return 1;
     }
     auto pipeline=ctx.pipeline();
     if (serve_mode) { run_server(pipeline,serve_host,serve_port); return 0; }
     std::vector<float> audio;
-    auto err=pipeline.synthesize(text_input,voice_name,audio,phonemes_mode);
+    auto err=pipeline.synthesize(text_input,audio,phonemes_mode);
     if (!err.empty()) { fprintf(stderr,"Error: %s\n",err.c_str());return 1; }
     bool ok=say_mode?play_wav(audio.data(),audio.size(),24000):write_wav(output_path,audio.data(),audio.size(),24000);
     if (!ok) { fprintf(stderr,"Error: could not write audio output\n");return 1; }

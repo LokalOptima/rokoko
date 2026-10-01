@@ -11,7 +11,7 @@ import tempfile
 import time
 from pathlib import Path
 import numpy as np
-from support import ROOT, model_args, paths, model_flags, server, request, wav_info, save_report, provenance, sha256, idle_gpu
+from support import ROOT, model_args, paths, embedded_identity, server, request, wav_info, save_report, provenance, sha256, idle_gpu
 
 VOICES=('af_heart',)
 def verify_identity(args):
@@ -66,34 +66,23 @@ def compare_runs(root,voices):
     report['claim']='Functional/cache/length checks only. Waveform variation is measured, not an equivalence gate.'
     return report
 
-def invalid_artifacts(binary,args):
-    with tempfile.TemporaryDirectory() as d:
-        d=Path(d)
-        for flag in ('weights','g2p'):
-            for label,payload in [('empty',b''),('truncated',b'KOKO\1\0\0\0')]:
-                bad=d/(flag+label);bad.write_bytes(payload);before=sha256(bad)
-                flags=model_flags(args,binary);flags[flags.index('--'+flag)+1]=str(bad)
-                p=subprocess.run([str(binary),'Hello.',*flags,'-o',str(d/'out.wav')],capture_output=True,timeout=30)
-                assert p.returncode>0 and b'Error:' in p.stderr,(flag,p.returncode,p.stderr)
+def invalid_artifacts(runtime,binary,args):
+    # Exercise the same in-memory loaders using a development-only file adapter.
+    paths_ = paths(args)
+    good=[paths_['weights'],paths_['g2p'],paths_['voices']/'af_heart.bin']
+    with tempfile.TemporaryDirectory() as directory:
+        d=Path(directory)
+        for i,label in enumerate(('weights','g2p','voice')):
+            for suffix,payload in [('empty',b''),('truncated',good[i].read_bytes()[:128]),
+                                   ('short_payload',good[i].read_bytes()[:-4096])]:
+                bad=d/(label+suffix);bad.write_bytes(payload);before=sha256(bad)
+                files=good.copy();files[i]=bad
+                p=subprocess.run([str(runtime),'--check-assets',*map(str,files)],capture_output=True,timeout=60)
+                assert p.returncode==1 and b'FAIL:' in p.stderr,(label,suffix,p.returncode,p.stderr)
                 assert sha256(bad)==before,'explicit artifact overwritten'
-        flags=model_flags(args,binary);flags[1]=str(d/'missing')
-        p=subprocess.run([str(binary),'Hello.',*flags],capture_output=True,timeout=30)
-        assert p.returncode>0 and not (d/'missing').exists()
-        # No removed pack is needed, even when the old shared cache contains them.
-        only=d/'only-heart';only.mkdir();(only/'af_heart.bin').symlink_to((args.voices or args.models/'voices')/'af_heart.bin')
-        flags=model_flags(args,binary);flags[flags.index('--voices')+1]=str(only)
-        subprocess.run([str(binary),'Hello.',*flags,'-o',str(d/'one.wav')],capture_output=True,check=True,timeout=30)
-        wav_info((d/'one.wav').read_bytes())
-        (only/'af_bella.bin').symlink_to(only/'af_heart.bin')
-        p=subprocess.run([str(binary),'Hello.','--voice','af_bella',*flags],capture_output=True,timeout=30)
-        assert p.returncode>0 and b'voice' in p.stderr, 'retired cached voice accepted'
-        # A truncated selected voice cannot yield successful audio.
-        voices=d/'voices';voices.mkdir()
-        for v in VOICES: (voices/(v+'.bin')).symlink_to((args.voices or args.models/'voices')/(v+'.bin'))
-        (voices/'af_heart.bin').unlink();(voices/'af_heart.bin').write_bytes(b'\0'*16)
-        flags=model_flags(args,binary);flags[flags.index('--voices')+1]=str(voices)
-        p=subprocess.run([str(binary),'Hello.',*flags,'-o',str(d/'out.wav')],capture_output=True,timeout=30)
-        assert p.returncode>0 and b'Error:' in p.stderr
+        for flag in ('--weights','--g2p','--voices','--voice'):
+            p=subprocess.run([str(binary),'Hello.',flag,'obsolete'],capture_output=True,timeout=30)
+            assert p.returncode==1 and b'unknown option' in p.stderr,(flag,p.stderr)
 
 def http_checks(binary,args,out):
     results={}
@@ -101,7 +90,7 @@ def http_checks(binary,args,out):
         status,_,page,_=request(base,'/');assert status==200
         assert b'<select' not in page and b"$('voice')" not in page, 'obsolete voice selector'
         for endpoint in ('/synthesize','/synthesize/stream'):
-            for voice in ('af_bella','af_nicole','af_sky'):
+            for voice in ('af_heart','af_bella','af_nicole','af_sky'):
                 status,_,body,_=request(base,endpoint,{'text':'Hello.','voice':voice})
                 assert status==400 and 'voice' in json.loads(body)['error'], 'retired voice accepted'
         for endpoint in ('/synthesize','/synthesize/stream'):
@@ -114,7 +103,7 @@ def http_checks(binary,args,out):
         status,_,data,_=request(base,'/synthesize',raw=b'{"text":"h\\u025bl\\u02c8o\\u028a","input":"phonemes"}')
         assert status==200;wav_info(data)
         for voice in VOICES:
-            status,headers,data,ms=request(base,'/synthesize',{'text':'Hello world.','voice':voice});assert status==200
+            status,headers,data,ms=request(base,'/synthesize',{'text':'Hello world.'});assert status==200
             results[voice]=dict(wav_info(data),headers=headers,wall_ms=ms);(out/(voice+'.wav')).write_bytes(data)
         # Buffered PCM16 is clamp[-1,1], multiply32767, truncate toward zero.
         status,_,data,_=request(base,'/synthesize/stream',{'text':'Hello world.'});assert status==200
@@ -141,29 +130,31 @@ def main():
     if not args.skip_semantic:
         subprocess.run([sys.executable,str(ROOT/'tests/artifacts.py'),'--official',str(args.official),'--models',str(args.models),
                         *(['--g2p',str(args.g2p)] if args.g2p else []),*(['--voices',str(args.voices)] if args.voices else [])],check=True)
-    report=dict(provenance=provenance(),artifacts=manifest,variants={})
-    for name in ('rokoko','rokoko.fp16'):
-        binary=ROOT/name;runtime=ROOT/'tests'/('runtime.fp16' if 'fp16' in name else 'runtime');out=args.output.parent/name;out.mkdir(parents=True,exist_ok=True)
-        invalid_artifacts(binary,args)
-        subprocess.run([str(binary),'Hello world.',*model_flags(args,binary),'-o',str(out/'cli.wav')],check=True,timeout=30)
-        wav_info((out/'cli.wav').read_bytes())
-        p=paths(args,binary)
-        subprocess.run([str(runtime),str(p['weights']),str(p['g2p']),str(p['voices']),str(out/'library-af_heart')],check=True,timeout=120)
-        row=dict(provenance=provenance(binary),repeatability=compare_runs(out/'library-af_heart',p['voices']),http=http_checks(binary,args,out))
-        # Long normalized input, including raw abbreviations that expand past capacity.
-        row['long']=[]
-        for label,text in [('2047',('hello world '*171)[:2047]),('2048',('hello world '*171)[:2048]),('2049',('hello world '*171)[:2049]),('expand','Dr. Smith paid $123.45. '*120),
-                           ('5000',('Hello world. '*400)[:5000]+' Final words purple lantern.'),
-                           ('20000',('Hello world. '*1600)[:20000]+' Final words purple lantern.'),
-                           ('no_sentence_delimiters',('hello world '*1667)[:20000]+' final words purple lantern')]:
-            folder=out/label;folder.mkdir(exist_ok=True);source=folder/'input.txt';source.write_text(text)
-            subprocess.run([str(runtime),str(p['weights']),str(p['g2p']),str(p['voices']),str(folder),str(source),'af_heart'],check=True,timeout=240)
-            normalized=(folder/'normalized.txt').read_bytes();prev=0
-            for line in (folder/'spans.tsv').read_text().splitlines():
-                a,b=map(int,line.split());assert prev<=a<b<=len(normalized) and not normalized[prev:a].decode().strip();assert len(normalized[a:b].decode())<=2048;prev=b
-            assert not normalized[prev:].decode().strip()
-            chunks=sorted(folder.glob('*/phonemes.txt'),key=lambda x:int(x.parent.name));assert chunks
-            row['long'].append(dict(case=label,normalized_chars=len(normalized.decode()),chunks=len(chunks),last_phonemes=chunks[-1].read_text()))
-        report['variants'][name]=row;save_report(args.output,report)
+    report=dict(provenance=provenance(),artifacts=manifest)
+    binary=ROOT/'rokoko';runtime=ROOT/'tests/runtime';out=args.output.parent/'rokoko';out.mkdir(parents=True,exist_ok=True)
+    info=embedded_identity(binary)
+    assert info['files']==manifest['files'] and info['precision']=='fp16'
+    assert len(info['files'])==3 and info['voice']=='af_heart'
+    invalid_artifacts(runtime,binary,args)
+    subprocess.run([str(binary),'Hello world.','-o',str(out/'cli.wav')],check=True,timeout=30)
+    wav_info((out/'cli.wav').read_bytes())
+    p=paths(args)
+    subprocess.run([str(runtime),str(out/'library-af_heart')],check=True,timeout=120)
+    row=dict(provenance=provenance(binary,bundled=True),repeatability=compare_runs(out/'library-af_heart',p['voices']),http=http_checks(binary,args,out))
+    # Long normalized input, including raw abbreviations that expand past capacity.
+    row['long']=[]
+    for label,text in [('2047',('hello world '*171)[:2047]),('2048',('hello world '*171)[:2048]),('2049',('hello world '*171)[:2049]),('expand','Dr. Smith paid $123.45. '*120),
+                       ('5000',('Hello world. '*400)[:5000]+' Final words purple lantern.'),
+                       ('20000',('Hello world. '*1600)[:20000]+' Final words purple lantern.'),
+                       ('no_sentence_delimiters',('hello world '*1667)[:20000]+' final words purple lantern')]:
+        folder=out/label;folder.mkdir(exist_ok=True);source=folder/'input.txt';source.write_text(text)
+        subprocess.run([str(runtime),str(folder),str(source)],check=True,timeout=240)
+        normalized=(folder/'normalized.txt').read_bytes();prev=0
+        for line in (folder/'spans.tsv').read_text().splitlines():
+            a,b=map(int,line.split());assert prev<=a<b<=len(normalized) and not normalized[prev:a].decode().strip();assert len(normalized[a:b].decode())<=2048;prev=b
+        assert not normalized[prev:].decode().strip()
+        chunks=sorted(folder.glob('*/phonemes.txt'),key=lambda x:int(x.parent.name));assert chunks
+        row['long'].append(dict(case=label,normalized_chars=len(normalized.decode()),chunks=len(chunks),last_phonemes=chunks[-1].read_text()))
+    report['runtime']=row;save_report(args.output,report)
     print('PASS artifact identity, input/style/length, library lifecycle, CLI errors, HTTP and long-input coverage. Numerical/audio limitations remain in the report.')
 if __name__=='__main__':main()

@@ -1,7 +1,7 @@
 // server.h — HTTP server for Rokoko TTS (header-only, templated)
 //
 // PipelineT must expose:
-//   std::string synthesize(const std::string& text, const std::string& voice,
+//   std::string synthesize(const std::string& text,
 //                          std::vector<float>& audio_out)
 //   double last_preprocess_ms, last_g2p_ms, last_tts_ms
 #pragma once
@@ -210,8 +210,10 @@ $('text').addEventListener('keydown', e => {
             auto fields=parse_request(req.body);
             auto it=fields.find("text");
             if (it==fields.end()) {error(res,400,"missing text field");return false;}
-            auto voice=fields.count("voice")?fields.at("voice"):"af_heart";
-            auto err=pipeline.prepare(it->second,voice,speech,fields.count("input") && fields.at("input")=="phonemes");
+            if (fields.count("voice")) {
+                throw std::invalid_argument("voice selection is no longer supported; Rokoko uses af_heart");
+            }
+            auto err=pipeline.prepare(it->second,speech,fields.count("input") && fields.at("input")=="phonemes");
             if (!err.empty()) {error(res,400,err);return false;}
             return true;
         } catch (const std::exception& e) {error(res,400,e.what());return false;}

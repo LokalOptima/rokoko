@@ -1,7 +1,7 @@
 // weights.h — Weight loading + CUDA inference for Rokoko-82M TTS
 //
 // Defines:
-//   Weights  — pointers into GPU weight allocation (loaded from weights.bin)
+//   Weights  — pointers into GPU weight allocation (loaded from weights.fp16.bin)
 
 #pragma once
 #include "artifact_format.h"
@@ -371,6 +371,7 @@ struct Weights {
     // -----------------------------------------------------------------------
 
     static Weights prefetch(const std::string& path);
+    static Weights prefetch(const void* data, size_t size);
     void upload(cudaStream_t stream = nullptr);
     static Weights load(const std::string& path, cudaStream_t stream = nullptr);
     void free();
@@ -388,7 +389,7 @@ struct Weights {
 };
 
 // ---------------------------------------------------------------------------
-// Inference API (defined in rokoko.cpp / rokoko_f16.cpp)
+// Inference API (defined in rokoko.cpp)
 // ---------------------------------------------------------------------------
 
 /// Compute exact decode-arena bytes needed for given T (tokens) and L (frames).
@@ -423,7 +424,7 @@ bool write_wav(const std::string& path, const float* audio,
 void write_wav_to_(std::ostream& f, const float* audio,
     int n_samples, int sample_rate);
 
-/// Precompute weight norms (called once after weight upload).
-void precompute_weight_norms(Weights& w, cudaStream_t stream);
+/// Prepare converted weight pointers and inference scratch (once after upload).
+void initialize_inference(Weights& w, cudaStream_t stream);
 
 } // namespace rokoko

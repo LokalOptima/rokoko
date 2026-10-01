@@ -5,7 +5,7 @@
 """Evaluate rokoko's text frontend (normalizer + C++ G2P) on data that was
 written independently of the code. See README.md in this directory.
 
-    make test-frontend                      # evaluates ~/.cache/rokoko/g2p.bin
+    make test-frontend                      # evaluates build/assets/g2p.bin
     make test-frontend G2P=weights/g2p.bin  # any other G2P model
 
 Exit code is non-zero if any hard check fails.
@@ -36,7 +36,7 @@ def lenient(ph):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--g2p", default=str(Path.home() / ".cache/rokoko/g2p.bin"))
+    ap.add_argument("--g2p", default=str(HERE.parents[1] / "build/assets/g2p.bin"))
     a = ap.parse_args()
     norm_bin, g2p_bin = HERE / "normalize_cli", HERE / "g2p_check"
 

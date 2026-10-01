@@ -28,11 +28,11 @@ inline ArtifactIndex read_artifact_index(const void* data, size_t size) {
     auto p=static_cast<const uint8_t*>(data);
     uint32_t magic,version; uint64_t length;
     memcpy(&magic,p,4);memcpy(&version,p+4,4);memcpy(&length,p+8,8);
-    if (magic!=0x4f4b4f4b || (version!=1 && version!=2) || length>size-16 || length>1024*1024) fail();
+    if (magic!=0x4f4b4f4b || version!=2 || length>size-16 || length>1024*1024) fail();
     size_t start=(16+length+4095)&~size_t(4095);
     if (start>size) fail();
-    const TensorSpec* schema=version==1?MODEL_V1:MODEL_V2;
-    size_t count=version==1?std::size(MODEL_V1):std::size(MODEL_V2);
+    const TensorSpec* schema=MODEL_V2;
+    size_t count=std::size(MODEL_V2);
     std::unordered_map<std::string,const TensorSpec*> expected;
     for (size_t i=0;i<count;++i) expected.emplace(schema[i].name,schema+i);
     ArtifactIndex out{int(version),start,0,{}};

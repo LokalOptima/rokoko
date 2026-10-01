@@ -2,10 +2,6 @@
   "source": "hexgrad/Kokoro-82M",
   "source_revision": "f3ff3571791e39611d31c381e3a41a3af07b4987",
   "files": {
-    "weights.bin": {
-      "size": 327296512,
-      "sha256": "4e2ddd450efcd865bf0794bf6b2d34c4ab8c745e871f5da028491d31c305a018"
-    },
     "weights.fp16.bin": {
       "size": 163390976,
       "sha256": "92ac6de412110f7ace6a5b1426dabdaa9d204e420a8da12dbe2c99d545e48b14"
@@ -34,5 +30,11 @@
     }
   },
   "g2p_version": "V11",
-  "g2p_format": "G2P3"
+  "g2p_format": "G2P3",
+  "export_inputs": {
+    "weights.bin": {
+      "size": 327296512,
+      "sha256": "4e2ddd450efcd865bf0794bf6b2d34c4ab8c745e871f5da028491d31c305a018"
+    }
+  }
 }

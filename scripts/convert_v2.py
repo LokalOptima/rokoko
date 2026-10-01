@@ -354,18 +354,11 @@ def convert(tensors: dict[str, np.ndarray]) -> list[tuple[str, np.ndarray]]:
 
 def main():
     p = argparse.ArgumentParser(description="Convert FP32 weights.bin → FP16 weights.fp16.bin")
-    p.add_argument("--weights", type=str, help="Path to source weight file")
+    p.add_argument("--weights", type=str, required=True, help="Path to offline FP32 exporter output")
     p.add_argument("-o", "--output", type=str, required=True, help="Output path")
     args = p.parse_args()
 
     weights_path = args.weights
-    if not weights_path:
-        home = Path.home()
-        default = home / ".cache/rokoko/weights.bin"
-        if default.exists():
-            weights_path = str(default)
-        else:
-            p.error("Provide --weights or ensure ~/.cache/rokoko/weights.bin exists")
 
     print(f"Reading weights: {weights_path}")
     tensors = parse_koko(weights_path)

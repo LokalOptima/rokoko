@@ -36,13 +36,14 @@ def main():
     for c,ps in zip(cases,ps_lines):
         raw=subprocess.run([str(ROOT/'tests/helpers'),'chunks'],input=ps,text=True,capture_output=True,check=True).stdout
         c['rokoko_chunks']=[bytes.fromhex(line.split()[2]).decode() for line in raw.splitlines()];assert c['rokoko_chunks']
-    for system in ('rokoko','rokoko.fp16'):
-        with server(ROOT/system,args,out/(system+'.log')) as (base,startup):
-            for voice in VOICES:
-                for c in cases:
-                    status,h,data,ms=request(base,'/synthesize',dict(text=c['text'],voice=voice));assert status==200,(system,c,status,data)
-                    path=out/(system+'-'+voice+'-'+c['id']+'.wav');path.write_bytes(data)
-                    report['rows'].append(dict(system=system,voice=voice,id=c['id'],wav=str(path),wall_ms=ms,telemetry=h,**wav_info(data)))
+    report['rokoko']=provenance(ROOT/'rokoko',bundled=True)
+    system='rokoko'
+    with server(ROOT/system,args,out/(system+'.log')) as (base,startup):
+        for voice in VOICES:
+            for c in cases:
+                status,h,data,ms=request(base,'/synthesize',dict(text=c['text']));assert status==200,(system,c,status,data)
+                path=out/(system+'-'+voice+'-'+c['id']+'.wav');path.write_bytes(data)
+                report['rows'].append(dict(system=system,voice=voice,id=c['id'],wav=str(path),wall_ms=ms,telemetry=h,**wav_info(data)))
     model=load_model(args.official);pipeline=KPipeline(lang_code='a',model=model,repo_id='hexgrad/Kokoro-82M',trf=False)
     for voice in VOICES:
         pack=torch.load(args.official/'voices'/(voice+'.pt'),weights_only=True)
@@ -65,7 +66,7 @@ def main():
     by_id={c['id']:c for c in cases}
     for row,hyp in zip(report['rows'],transcripts):row.update(transcript=hyp,**score(by_id[row['id']]['spoken'],hyp))
     for voice in VOICES:
-        group={s:[r for r in report['rows'] if r['voice']==voice and r['system']==s] for s in ('rokoko','rokoko.fp16','kokoro','kokoro_same_phonemes')}
+        group={s:[r for r in report['rows'] if r['voice']==voice and r['system']==s] for s in ('rokoko','kokoro','kokoro_same_phonemes')}
         for system,rows in group.items():
             report['summary'][voice+'/'+system]=dict(errors=sum(r['errors'] for r in rows),words=sum(r['words'] for r in rows),
                 wer=sum(r['errors'] for r in rows)/sum(r['words'] for r in rows),sentence_errors=sum(r['errors']>0 for r in rows),sentences=len(rows),

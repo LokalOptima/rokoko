@@ -1,4 +1,6 @@
 #pragma once
+#include "byte_reader.h"
+#include <fstream>
 // g2p_model_cuda.h — CUDA inference for G2P V3 Conformer CTC model.
 //
 // Same binary format as g2p_model.h, but runs on GPU using Cutlass GEMM for
@@ -372,7 +374,8 @@ __global__ void g2p_bias_ctc_argmax_kernel(const float* __restrict__ logits,
 namespace rokoko {
 
 struct G2PModelCuda {
-    bool load(const char* path, cudaStream_t stream);
+    bool load(const char* path, cudaStream_t stream); // Development/export evaluator adapter.
+    bool load(const void* data, size_t size, cudaStream_t stream);
     std::string infer(const std::string& text, cudaStream_t stream) const;
     void free();
     int max_positions() const { return max_pos_; }
@@ -428,33 +431,44 @@ private:
     // Attention scale (value, not pointer — Cutlass uses value-based alpha/beta)
     float attn_scale_ = 0.0f;
 
-    bool load_from_file_(FILE* f, const char* label, cudaStream_t stream);
+    bool load_from_memory_(ByteReader& reader, cudaStream_t stream);
 };
 
 // ── Implementation ──────────────────────────────────────────────────────────
 
 inline bool G2PModelCuda::load(const char* path, cudaStream_t stream) {
     free();
-    FILE* f = fopen(path, "rb");
-    if (!f) return false;
-    bool ok = load_from_file_(f, path, stream);
-    fclose(f);
-    if (!ok) free();
-    return ok;
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) return false;
+    auto size=file.tellg();
+    if (size<0) return false;
+    std::vector<unsigned char> data(static_cast<size_t>(size));
+    file.seekg(0);
+    if (!file.read(reinterpret_cast<char*>(data.data()),size)) return false;
+    return load(data.data(),data.size(),stream);
 }
 
-inline bool G2PModelCuda::load_from_file_(FILE* f, const char* label, cudaStream_t stream) {
+inline bool G2PModelCuda::load(const void* data, size_t size, cudaStream_t stream) {
+    free();
+    ByteReader reader(data,size);
+    try {
+        if (load_from_memory_(reader,stream)) return true;
+    } catch (...) { free(); throw; }
+    free();
+    return false;
+}
 
+inline bool G2PModelCuda::load_from_memory_(ByteReader& reader, cudaStream_t stream) {
     // Magic
     char magic[4];
-    if (fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "G2P3", 4) != 0) {
+    if (!reader.read(magic, sizeof(magic)) || std::memcmp(magic, "G2P3", 4) != 0) {
         fprintf(stderr, "g2p_cuda: expected G2P3 format\n");
         return false;
     }
 
     // Header
     uint32_t hdr[10];
-    if (fread(hdr, 4, 10, f) != 10) { return false; }
+    if (!reader.read(hdr, sizeof(hdr))) { return false; }
     d_ = hdr[0]; heads_ = hdr[1]; n_layers_ = hdr[2]; ff_ = hdr[3]; up_ = hdr[4];
     n_chars_ = hdr[5]; n_phones_ = hdr[6];
     uint32_t flags = hdr[9];
@@ -478,20 +492,20 @@ inline bool G2PModelCuda::load_from_file_(FILE* f, const char* label, cudaStream
 
     // Char vocab
     uint32_t n_cv;
-    if (fread(&n_cv, 4, 1, f) != 1 || n_cv>uint32_t(n_chars_)) { return false; }
+    if (!reader.read(&n_cv, sizeof(n_cv)) || n_cv>uint32_t(n_chars_)) { return false; }
     for (uint32_t i = 0; i < n_cv; i++) {
         uint32_t pair[2];
-        if (fread(pair, 4, 2, f) != 2) { return false; }
+        if (!reader.read(pair, sizeof(pair))) { return false; }
         if (pair[1]>=uint32_t(n_chars_)) return false;
         char2id_[pair[0]] = pair[1];
     }
 
     // Phone vocab
     uint32_t n_pv;
-    if (fread(&n_pv, 4, 1, f) != 1 || n_pv>uint32_t(n_phones_)) { return false; }
+    if (!reader.read(&n_pv, sizeof(n_pv)) || n_pv>uint32_t(n_phones_)) { return false; }
     for (uint32_t i = 0; i < n_pv; i++) {
         uint32_t pair[2];
-        if (fread(pair, 4, 2, f) != 2) { return false; }
+        if (!reader.read(pair, sizeof(pair))) { return false; }
         if (pair[1]>=uint32_t(n_phones_)) return false;
         id2phone_[pair[1]] = pair[0];
     }
@@ -513,11 +527,7 @@ inline bool G2PModelCuda::load_from_file_(FILE* f, const char* label, cudaStream
     total_floats += d_ * up_ * d_ + d_ * up_;           // up_w, up_b
     total_floats += n_phones_ * d_ + n_phones_;          // head_w, head_b
 
-    long payload=ftell(f);
-    if (payload<0 || fseek(f,0,SEEK_END)) return false;
-    long end=ftell(f);
-    if (end<payload || size_t(end-payload)!=(total_floats-size_t(max_pos_)*d2*2)*sizeof(float)) return false;
-    if (fseek(f,payload,SEEK_SET)) return false;
+    if (reader.remaining() != (total_floats-size_t(max_pos_)*d2*2)*sizeof(float)) return false;
     total_bytes_ = total_floats * sizeof(float);
 
     // Allocate GPU memory (single contiguous block)
@@ -533,7 +543,7 @@ inline bool G2PModelCuda::load_from_file_(FILE* f, const char* label, cudaStream
     float* ptr = staging.data();
     auto read_w = [&](int n) -> float* {
         float* p = ptr;
-        if (fread(p, sizeof(float), n, f) != (size_t)n) return nullptr;
+        if (!reader.read(p, size_t(n)*sizeof(float))) return nullptr;
         ptr += n;
         return p;
     };
@@ -676,7 +686,7 @@ inline bool G2PModelCuda::load_from_file_(FILE* f, const char* label, cudaStream
     cudaStreamSynchronize(stream);
 
     vlog("g2p_cuda: loaded %s (d=%d, %d layers, %d heads, %d ff, %dx up, %.1f MB, ws=%.1f MB)\n",
-         label, d_, n_layers_, heads_, ff_, up_,
+         "memory", d_, n_layers_, heads_, ff_, up_,
          total_bytes_ / (1024.0f * 1024.0f), workspace_bytes_ / (1024.0f * 1024.0f));
     return true;
 }

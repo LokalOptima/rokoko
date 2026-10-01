@@ -3,7 +3,7 @@ import argparse
 import statistics
 import json
 from pathlib import Path
-from support import ROOT, idle_gpu, model_args, model_flags, paths, provenance, request, save_report, server, sha256, wav_info
+from support import ROOT, idle_gpu, model_args, paths, provenance, request, save_report, server, sha256, wav_info
 
 TEXTS = ['Hello world.',
 'The quick brown fox jumps over the lazy dog and then runs back home again through the meadow.',
@@ -25,10 +25,10 @@ def main():
     idle_gpu()
     report=dict(kind='descriptive benchmark; no perceptual equivalence claim', workloads=[])
     mixed=(ROOT/'tests/frontend/plain_test.txt').read_text().splitlines()[:args.mixed]
-    for binary in args.binary or [ROOT/'rokoko',ROOT/'rokoko.fp16']:
+    for binary in args.binary or [ROOT/'rokoko']:
         artifact_dir=args.output.parent/(args.output.stem+'-'+binary.name)
         artifact_dir.mkdir(parents=True,exist_ok=True)
-        run=dict(provenance=provenance(binary), artifacts={k:sha256(v) for k,v in paths(args,binary).items() if v.is_file()}, requests=[])
+        run=dict(provenance=provenance(binary,bundled=True), artifacts={k:sha256(v) for k,v in paths(args).items() if v.is_file()}, requests=[])
         with server(binary,args,artifact_dir/'server.log') as (base,startup):
             run['startup_to_health_ms']=startup
             workload=[]
@@ -36,7 +36,7 @@ def main():
                 workload += [('first_request_'+str(i),text), *[('repeat_'+str(i),text) for _ in range(args.repeats)]]
             workload += [('mixed',text) for text in mixed]
             for i,(label,text) in enumerate(workload):
-                status,headers,data,wall=request(base,'/synthesize',dict(text=text,voice='af_heart'))
+                status,headers,data,wall=request(base,'/synthesize',dict(text=text))
                 if status != 200: raise RuntimeError(f'{label}: HTTP {status}: {data!r}')
                 info=wav_info(data); file=artifact_dir/f'{i:04d}.wav'; file.write_bytes(data)
                 row=dict(index=i,workload=label,text=text,voice='af_heart',wall_ms=wall,wav=str(file),**info,

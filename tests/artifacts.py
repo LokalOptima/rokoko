@@ -105,23 +105,25 @@ def main():
     ap.add_argument('--approve',action='store_true',help='write initial manifest only after independent semantic checks pass')
     ap.add_argument('--output',type=Path,default=ROOT/'tests/results/artifacts.json')
     ap.add_argument('--schema',type=Path,help='write independently derived C++ shape schema')
+    ap.add_argument('--exported-fp32',type=Path,help='also check an optional offline FP32 exporter intermediate')
     args=ap.parse_args();torch.set_num_threads(2)
     model=KModel(repo_id='hexgrad/Kokoro-82M',config=str(args.official/'config.json'),model=str(args.official/'kokoro-v1_0.pth')).eval()
-    fp32={k:(v.cpu().numpy(),v.cpu().numpy(),v.cpu().numpy(),'exact') for k,v in model.state_dict().items()}
     fp16=derive(model)
     report=dict(provenance=provenance(), torch=torch.__version__, files={}, checks={}, controls={})
-    schema=[]
-    for version,name,expected in [(1,'weights.bin',fp32),(2,'weights.fp16.bin',fp16)]:
-        path=args.models/name;ver,actual=read_koko(path); assert ver==version
-        report['checks'][name]=check_tensors(actual,expected)
-        report['files'][name]=dict(size=path.stat().st_size,sha256=sha256(path))
-        schema.append((version,expected))
-        # The semantic oracle must reject an independently chosen damaged copied tensor.
-        key='bert.embeddings.LayerNorm.bias'; broken=dict(actual);broken[key]=actual[key].copy();broken[key].flat[0]+=1
-        try: check_tensors(broken,expected)
-        except AssertionError as e:
-            assert str(e).startswith('value bound'),str(e);report['controls'][name+'_corruption']='detected'
-        else: raise AssertionError('semantic corruption was not detected')
+    path=args.models/'weights.fp16.bin';version,actual=read_koko(path);assert version==2
+    report['checks'][path.name]=check_tensors(actual,fp16)
+    report['files'][path.name]=dict(size=path.stat().st_size,sha256=sha256(path))
+    # Independently chosen damage must fail the semantic comparison.
+    key='bert.embeddings.LayerNorm.bias';broken=dict(actual);broken[key]=actual[key].copy();broken[key].flat[0]+=1
+    try: check_tensors(broken,fp16)
+    except AssertionError as e:
+        assert str(e).startswith('value bound'),str(e);report['controls']['tensor_corruption']='detected'
+    else: raise AssertionError('semantic corruption was not detected')
+    if args.exported_fp32:
+        fp32={k:(v.cpu().numpy(),v.cpu().numpy(),v.cpu().numpy(),'exact') for k,v in model.state_dict().items()}
+        version,exported=read_koko(args.exported_fp32);assert version==1
+        report['exported_fp32']=dict(checks=check_tensors(exported,fp32),
+            identity=dict(size=args.exported_fp32.stat().st_size,sha256=sha256(args.exported_fp32)))
     for voice in VOICES:
         path=(args.voices or args.models/'voices')/(voice+'.bin')
         official=torch.load(args.official/'voices'/(voice+'.pt'),map_location='cpu',weights_only=True).numpy()
@@ -138,21 +140,24 @@ def main():
     report['official']={f:dict(size=(args.official/f).stat().st_size,sha256=sha256(args.official/f)) for f in official_files}
     if args.approve:
         if args.manifest.exists(): raise RuntimeError('refusing to overwrite an approved manifest')
-        save_report(args.manifest,dict(source='hexgrad/Kokoro-82M',source_revision=json.loads((ROOT/'tests/fixtures/vocab.json').read_text())['source_revision'],files=report['files'],official=report['official']))
+        approved=dict(source='hexgrad/Kokoro-82M',source_revision=json.loads((ROOT/'tests/fixtures/vocab.json').read_text())['source_revision'],files=report['files'],official=report['official'])
+        if args.exported_fp32: approved['export_inputs']={'weights.bin':report['exported_fp32']['identity']}
+        save_report(args.manifest,approved)
     else:
         manifest=json.loads(args.manifest.read_text())
         assert manifest['files']==report['files'], 'artifact identity mismatch'
         assert manifest['official']==report['official'], 'official identity mismatch'
+        if args.exported_fp32:
+            assert report['exported_fp32']['identity']==manifest['export_inputs']['weights.bin'], 'exporter identity mismatch'
     if args.schema:
         lines=['// Derived from official KModel module shapes by tests/artifacts.py.','#pragma once','#include <initializer_list>',
                'namespace rokoko {','struct TensorSpec { const char* name; const char* dtype; std::initializer_list<int> shape; };']
-        for version,expected in schema:
-            lines.append(f'inline const TensorSpec MODEL_V{version}[] = {{')
-            for name,(arr,*_) in sorted(expected.items()):
-                lines.append('    {"'+name+'", "'+('fp16' if arr.dtype==np.float16 else 'fp32')+'", {'+', '.join(map(str,arr.shape))+'}},')
-            lines.append('};')
+        lines.append('inline const TensorSpec MODEL_V2[] = {')
+        for name,(arr,*_) in sorted(fp16.items()):
+            lines.append('    {"'+name+'", "'+('fp16' if arr.dtype==np.float16 else 'fp32')+'", {'+', '.join(map(str,arr.shape))+'}},')
+        lines.append('};')
         lines.append('} // namespace rokoko');args.schema.write_text('\n'.join(lines)+'\n')
     save_report(args.output,report)
-    print(f'PASS: {len(fp32)} FP32 tensors, {len(fp16)} converted tensors, af_heart, vocabulary, G2P V11; corruption controls detected.')
+    print(f'PASS: {len(fp16)} converted tensors, af_heart, vocabulary, G2P V11; corruption controls detected.')
 
 if __name__=='__main__': main()

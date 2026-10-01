@@ -1,6 +1,6 @@
 // weights.cpp — Weight loading for Rokoko-82M CUDA backend
 //
-// Loads a flat binary weight file (produced by scripts/export_weights.py)
+// Loads the converted FP16 weight format (produced by scripts/convert_v2.py)
 // into a single contiguous GPU allocation, then assigns struct field pointers
 // by matching tensor names from the file header.
 
@@ -19,18 +19,6 @@
 #include <unistd.h>
 
 using namespace rokoko;
-
-// ---------------------------------------------------------------------------
-// Helper: align up
-// ---------------------------------------------------------------------------
-
-static size_t align_up(size_t x, size_t alignment) {
-    return (x + alignment - 1) & ~(alignment - 1);
-}
-
-// ---------------------------------------------------------------------------
-// Parse header
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Weights: pointer assignment
@@ -490,13 +478,21 @@ Weights Weights::prefetch(const std::string& path) {
     close(fd);
     if (mapped==MAP_FAILED) throw std::runtime_error("cannot map weights: "+path);
     try {
-        auto index=read_artifact_index(mapped,size);
-        w.format_version=index.version;w.tensors=std::move(index.tensors);
-        for (size_t i=0;i<w.tensors.size();++i) w.name_to_idx[w.tensors[i].name]=i;
-        w.gpu_data_size=index.bytes;w.data_offset=index.start;
-        w.prefetch_base=static_cast<const uint8_t*>(mapped)+index.start;
+        w=Weights::prefetch(mapped,size);
         w.mmap_ptr=mapped;w.mmap_size=size;
     } catch (...) { munmap(mapped,size); throw; }
+    return w;
+}
+
+// Borrowed bytes must remain valid until upload() completes. Never unmapped here.
+Weights Weights::prefetch(const void* data, size_t size) {
+    if (!data) throw std::runtime_error("missing weights data");
+    auto index=read_artifact_index(data,size);
+    Weights w;
+    w.format_version=index.version;w.tensors=std::move(index.tensors);
+    for (size_t i=0;i<w.tensors.size();++i) w.name_to_idx[w.tensors[i].name]=i;
+    w.gpu_data_size=index.bytes;w.data_offset=index.start;
+    w.prefetch_base=static_cast<const uint8_t*>(data)+index.start;
     return w;
 }
 

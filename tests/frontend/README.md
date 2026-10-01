@@ -4,7 +4,7 @@ Checks for the part of rokoko that turns raw text into phonemes: the normalizer
 (`src/normalize.h`) and the neural G2P (`src/g2p.h`).
 
 ```bash
-make test-frontend                        # tests ~/.cache/rokoko/g2p.bin
+make test-frontend                        # tests build/assets/g2p.bin (build Rokoko first)
 make test-frontend G2P=path/to/g2p.bin    # tests another G2P model
 ```
 
@@ -24,7 +24,8 @@ weight file against a hardcoded size (V8's G2P size), and when a file passed wit
 printing only a warning to stderr. G2P V11 has a smaller phoneme vocabulary,
 so every attempt to run V11 silently replaced it with V8. That's why the "V11"
 export on disk was byte-identical to V8, and why "V11" sounded exactly like V8.
-Files passed explicitly with `--weights`/`--g2p`/`--voices` are now used as-is.
+The current executable embeds checksum-pinned assets at build time and has no
+runtime asset-path flags. Development evaluators read explicit files without replacing them.
 If you ever see identical results from two models, compare their checksums first.
 
 So every file here follows two rules:
@@ -97,7 +98,7 @@ The C++ G2P gives byte-identical phonemes to the Python checkpoint
 
 ### Audio round trip
 
-Speech from `rokoko.fp16` was transcribed with
+Speech from the FP16 implementation (now named `rokoko`) was transcribed with
 [paraketto](https://github.com/LokalOptima/paraketto) and compared with what should
 have been said (565 sentences: `norm_test.tsv` + `real_world.txt`; both sides
 normalized the same way, so "2:30" vs "two thirty" doesn't count as an error):
